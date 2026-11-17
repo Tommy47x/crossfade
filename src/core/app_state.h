@@ -54,7 +54,10 @@ struct AppState
     std::vector<SavedAlbum> saved_albums;
     std::vector<SavedArtist> saved_artists;
 
-    // YouTube account library (fetched from the backend). Main-thread only.
+    // YouTube account library (fetched from the backend). The track snapshot
+    // is atomic; the playlist vector, id/error strings and flags are guarded
+    // by youtube_mutex (draw_youtube_panel holds it for the frame).
+    mutable std::recursive_mutex youtube_mutex;
     std::vector<YouTubePlaylist> youtube_playlists;
     std::shared_ptr<const std::vector<Track>> youtube_playlist_tracks;
     std::string youtube_playlist_loaded_id;
@@ -249,11 +252,31 @@ struct AppState
 
     // Status / errors
     std::string status_text = "Loading...";
+    // Workers must not assign status_text (a UI-thread string). They set this
+    // flag instead and the main loop applies it on the UI thread.
+    std::atomic<bool> status_ready_pending{false};
     // Set by UI actions that must exit the process (e.g. import-after-exit).
     std::atomic<bool> quit_requested{false};
     // Last classified backend failure (kind + raw message). Persists until a
     // later success clears it, so Settings can always show what's wrong.
     BackendError backend_status;
+    mutable std::mutex backend_status_mutex;
+    // backend_status is copied by fetch workers and read by the UI. Every
+    // access goes through these helpers; g_data_mutex does not cover readers.
+    BackendError backend_status_snapshot() const
+    {
+        std::lock_guard<std::mutex> lock(backend_status_mutex);
+        return backend_status;
+    }
+    void set_backend_status(const BackendError &status)
+    {
+        std::lock_guard<std::mutex> lock(backend_status_mutex);
+        backend_status = status;
+    }
+    // Home / search / Studio inline error state: written by fetch workers,
+    // read by the drawer. One leaf mutex, never held across network or file
+    // I/O.
+    mutable std::mutex fetch_error_mutex;
     // Human-readable message shown inline by the tab that failed; kept in
     // sync with backend_status by the fetch workers.
     std::string current_title = "Nothing playing";
@@ -401,6 +424,10 @@ struct AppState
     std::vector<SongProject> studio_undo;
 
     // Podcasts (custom panel; loaded on demand).
+    // Workers publish the snapshot pointers atomically; the plain fields
+    // (selected show, tracks, loading flags) are guarded by podcast_mutex,
+    // which draw_podcasts_panel holds for the frame.
+    mutable std::recursive_mutex podcast_mutex;
     std::shared_ptr<const std::vector<PodcastShow>> podcast_shows;
     std::shared_ptr<const std::vector<PodcastShow>> podcast_search_results;
     std::shared_ptr<const std::vector<PodcastEpisode>> podcast_episodes;

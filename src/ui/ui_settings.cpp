@@ -2134,18 +2134,19 @@ void draw_settings_panel(AppState &state)
     // error themselves on their next successful fetch.
     BackendError backend_err = backend_error_snapshot();
     if (backend_err)
-        state.backend_status = backend_err;
-    if (state.backend_status)
+        state.set_backend_status(backend_err);
+    const BackendError status = state.backend_status_snapshot();
+    if (status)
     {
         ImGui::Dummy(ImVec2(0.0f, m.space_2));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.48f, 0.48f, 1.0f));
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextWrapped("%s", backend_error_user_message(state.backend_status).c_str());
+        ImGui::TextWrapped("%s", backend_error_user_message(status).c_str());
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleColor(ImGuiCol_Text, ui_c().text_muted);
-        ImGui::TextWrapped("Detail: %s", state.backend_status.message.c_str());
+        ImGui::TextWrapped("Detail: %s", status.message.c_str());
         ImGui::PopStyleColor();
         ImGui::PopTextWrapPos();
             settings_help("If this is an auth problem, refresh the auth file below, then restart crossfade.");

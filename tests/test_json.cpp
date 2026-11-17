@@ -219,6 +219,22 @@ int main()
               "error response ignored");
     }
 
+    {
+        // A malformed or absurd playlist count must not throw: std::stoi used
+        // to do exactly that inside a parser worker (uncaught throw = abort).
+        const std::string resp =
+            "{\"playlists\":["
+            "{\"playlistId\":\"PL1\",\"title\":\"A\",\"count\":\"999999999999999999999\"},"
+            "{\"playlistId\":\"PL2\",\"title\":\"B\",\"count\":\"abc\"},"
+            "{\"playlistId\":\"PL3\",\"title\":\"C\",\"count\":42}"
+            "]}";
+        auto playlists = parse_youtube_playlists_response(resp);
+        check(playlists.size() == 3, "youtube playlists parsed");
+        check(playlists[0].count == 1000000000, "huge count clamped");
+        check(playlists[1].count == 0, "non-numeric count becomes zero");
+        check(playlists[2].count == 42, "numeric count parses");
+    }
+
     if (testutil::failures == 0)
         std::printf("json: all checks passed\n");
     return testutil::failures == 0 ? 0 : 1;

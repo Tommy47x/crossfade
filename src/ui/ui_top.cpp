@@ -565,6 +565,7 @@ static void dispatch_search(AppState &state)
     }
     else if (state.current_tab == Tab::Podcasts)
     {
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
         if (query.empty())
         {
             state.podcast_search_loading = false;

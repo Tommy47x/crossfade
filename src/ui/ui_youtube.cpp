@@ -13,6 +13,9 @@
 
 void draw_youtube_panel(AppState &state)
 {
+    // Playlist fetches publish from workers; hold the same lock for the frame
+    // so the vector and id/error strings cannot change mid-draw.
+    std::lock_guard<std::recursive_mutex> state_lock(state.youtube_mutex);
     const UiMetrics &m = ui_m();
 
     // Account playlists (the "Liked Music" auto-playlist is included).
@@ -36,14 +39,12 @@ void draw_youtube_panel(AppState &state)
         tasks::spawn("youtube", [&state]() {
             auto pls = fetch_youtube_playlists();
             BackendError err = take_backend_error();
-            if (!pls.empty())
-            {
-                state.youtube_playlists = std::move(pls);
-            }
-            else if (err)
-            {
+            const bool got = !pls.empty();
+            if (!got && err)
                 ui_notify_backend_error(err);
-            }
+            std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
+            if (got)
+                state.youtube_playlists = std::move(pls);
             // Mark loaded even on failure so the empty-state spinner stops;
             // the left pane shows "No playlists found." + retry instead.
             state.youtube_playlists_loaded = true;
@@ -58,17 +59,18 @@ void draw_youtube_panel(AppState &state)
         tasks::spawn("youtube", [&state]() {
             auto pls = fetch_youtube_playlists();
             BackendError err = take_backend_error();
-            if (!pls.empty())
-            {
-                state.youtube_playlists = std::move(pls);
-            }
-            else if (err)
+            const bool got = !pls.empty();
+            if (!got && err)
             {
                 // Keep the cached list on screen; just tell the user why the
                 // refresh didn't happen.
                 ui_notify_backend_error(err);
-                state.youtube_playlists_refreshed = false; // retry next visit
             }
+            std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
+            if (got)
+                state.youtube_playlists = std::move(pls);
+            else if (err)
+                state.youtube_playlists_refreshed = false; // retry next visit
             state.youtube_playlists_loading = false;
             state.repaint_requested = true;
         });
@@ -107,7 +109,10 @@ void draw_youtube_panel(AppState &state)
                     }
                 }
             }
-            state.youtube_playlist_contents_precached = true;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
+                state.youtube_playlist_contents_precached = true;
+            }
             state.youtube_playlist_contents_precaching = false;
             state.repaint_requested = true;
         });
@@ -232,8 +237,10 @@ void draw_youtube_panel(AppState &state)
             tasks::spawn("youtube-playlist", [&state, pid]() {
                 auto tracks = fetch_youtube_playlist(pid);
                 BackendError err = take_backend_error();
-                if (!tracks.empty() || !err)
+                const bool got = !tracks.empty() || !err;
+                if (got)
                 {
+                    std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
                     std::atomic_store(&state.youtube_playlist_tracks,
                                       std::make_shared<const std::vector<Track>>(std::move(tracks)));
                     state.youtube_playlist_loaded_id = pid;
@@ -242,17 +249,22 @@ void draw_youtube_panel(AppState &state)
                         state.youtube_playlist_failed_id.clear();
                         state.youtube_playlist_error_msg.clear();
                     }
+                    state.youtube_playlist_loading = false;
+                    state.repaint_requested = true;
                 }
                 else
                 {
-                    // Leave any cached tracks on screen; record the failure so
-                    // the UI can offer a retry instead of a bare spinner.
-                    state.youtube_playlist_failed_id = pid;
-                    state.youtube_playlist_error_msg = backend_error_user_message(err);
+                    {
+                        std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
+                        // Leave any cached tracks on screen; record the failure
+                        // so the UI can offer a retry instead of a bare spinner.
+                        state.youtube_playlist_failed_id = pid;
+                        state.youtube_playlist_error_msg = backend_error_user_message(err);
+                        state.youtube_playlist_loading = false;
+                        state.repaint_requested = true;
+                    }
                     ui_notify_backend_error(err);
                 }
-                state.youtube_playlist_loading = false;
-                state.repaint_requested = true;
             });
         }
         else if (state.youtube_playlist_loaded_id == pl.id && !state.youtube_playlist_loading.load() &&
@@ -265,25 +277,32 @@ void draw_youtube_panel(AppState &state)
             tasks::spawn("youtube-playlist", [&state, pid]() {
                 auto tracks = fetch_youtube_playlist(pid);
                 BackendError err = take_backend_error();
-                if (!tracks.empty())
+                const bool got = !tracks.empty();
+                bool notify = false;
                 {
-                    std::atomic_store(&state.youtube_playlist_tracks,
-                                      std::make_shared<const std::vector<Track>>(std::move(tracks)));
-                    state.youtube_playlist_loaded_id = pid;
-                    if (state.youtube_playlist_failed_id == pid)
+                    std::lock_guard<std::recursive_mutex> lock(state.youtube_mutex);
+                    if (got)
                     {
-                        state.youtube_playlist_failed_id.clear();
-                        state.youtube_playlist_error_msg.clear();
+                        std::atomic_store(&state.youtube_playlist_tracks,
+                                          std::make_shared<const std::vector<Track>>(std::move(tracks)));
+                        state.youtube_playlist_loaded_id = pid;
+                        if (state.youtube_playlist_failed_id == pid)
+                        {
+                            state.youtube_playlist_failed_id.clear();
+                            state.youtube_playlist_error_msg.clear();
+                        }
                     }
+                    else if (err)
+                    {
+                        // Offline refresh: keep showing the saved tracks.
+                        state.youtube_playlist_refreshed_id.clear(); // retry next visit
+                        notify = true;
+                    }
+                    state.youtube_playlist_loading = false;
+                    state.repaint_requested = true;
                 }
-                else if (err)
-                {
-                    // Offline refresh: keep showing the saved tracks.
+                if (notify)
                     ui_notify_backend_error(err);
-                    state.youtube_playlist_refreshed_id.clear(); // retry next visit
-                }
-                state.youtube_playlist_loading = false;
-                state.repaint_requested = true;
             });
         }
 

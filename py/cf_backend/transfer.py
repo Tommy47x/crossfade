@@ -22,6 +22,12 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
+# A backup is user-chosen, and the audio section is legitimately multi-GB, so
+# extraction itself is not size-capped. The manifest and entry count are
+# metadata, though, and a crafted archive could use them as a zip bomb.
+MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+ARCHIVE_MAX_ENTRIES = 200000
+
 SECTIONS = {
     "settings": {
         "files": ["settings.json", "session.json", "imgui.ini"],
@@ -95,10 +101,28 @@ def excluded(rel, include_logs):
     return False
 
 
+def iter_tree_files(root):
+    """Yield regular files under root without following symlinks.
+
+    A symlink inside a cache tree must not pull unrelated files into the
+    backup or create a walk loop. The section root itself may still be a
+    symlink (a cache on another disk), which os.walk() opens normally.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+        for name in filenames:
+            path = base / name
+            if not path.is_symlink():
+                yield path
+
+
 def collect(config, sections, library_snapshot, skipped):
     files, dirs = [], []
 
     def add_file(path, rel=None):
+        if path.is_symlink():
+            return
         rel = Path(rel) if rel is not None else path.relative_to(config)
         if excluded(rel, "logs" in sections):
             return
@@ -125,7 +149,7 @@ def collect(config, sections, library_snapshot, skipped):
                 skipped.append(name + "/")
                 continue
             dirs.append(name)
-            for path in root.rglob("*"):
+            for path in iter_tree_files(root):
                 if path.is_file():
                     add_file(path)
 
@@ -241,13 +265,20 @@ def import_archive(args):
             shutil.rmtree(temp)
         temp.mkdir(parents=True)
         with zipfile.ZipFile(zip_path) as zf:
+            infos = zf.infolist()
             if "manifest.json" not in zf.namelist():
                 raise RuntimeError("Not a crossfade backup (manifest.json missing)")
+            if len(infos) > ARCHIVE_MAX_ENTRIES:
+                raise RuntimeError(
+                    f"Backup has too many entries ({len(infos)} > {ARCHIVE_MAX_ENTRIES})")
+            manifest_info = zf.getinfo("manifest.json")
+            if manifest_info.file_size > MANIFEST_MAX_BYTES:
+                raise RuntimeError("Backup manifest is too large")
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             if manifest.get("app") != "crossfade":
                 raise RuntimeError("Not a crossfade backup")
             temp_root = temp.resolve()
-            for info in zf.infolist():
+            for info in infos:
                 if info.is_dir() or info.filename == "manifest.json":
                     continue
                 rel = safe_rel(info.filename)

@@ -234,6 +234,9 @@ static void record_backend_error(const std::string &response)
 // process (or a pipe that lost its reader) previously blocked fgets for good.
 // Everything up to kReadTimeoutSeconds, then a synthesized error response.
 static constexpr int kReadTimeoutSeconds = 45;
+// One backend reply is a single JSON line; anything larger is a bug (or a
+// wedged process) and must not grow a buffer without bound on either OS.
+static constexpr size_t kMaxBackendLine = 10 * 1024 * 1024;
 
 void set_ytdl_browser(const std::string &browser)
 {
@@ -447,6 +450,23 @@ static void backend_reader_thread(BackendChannel *ch)
             return;
         }
         pending.append(buf, (size_t)n);
+        if (pending.size() > kMaxBackendLine)
+        {
+            // Same bound as the POSIX reader: a reply that never terminates
+            // must not grow the buffer forever. The stream is desynced, so
+            // retire the channel after handing over the error.
+            fprintf(stderr, "ERROR: Backend response too large ( > %zu MB). Aborting read.\n",
+                    kMaxBackendLine / (1024 * 1024));
+            ch->dead = true;
+            {
+                std::lock_guard<std::mutex> lock(ch->q_mutex);
+                ch->lines.clear();
+                ch->lines.push_back("{\"error\":\"Response too large\",\"kind\":\"backend\"}");
+                ch->lines.push_back(""); // sentinel: dead, nothing more coming
+            }
+            ch->q_cv.notify_all();
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(ch->q_mutex);
             size_t pos;
@@ -493,10 +513,25 @@ static bool channel_write_line(BackendChannel &ch, const std::string &cmd)
 {
     if (ch.h_in_write == NULL)
         return false;
-    std::string buf = cmd + "\n";
-    DWORD written = 0;
-    return WriteFile(ch.h_in_write, buf.data(), (DWORD)buf.size(), &written, nullptr) &&
-           written == buf.size();
+    const std::string buf = cmd + "\n";
+    // WriteFile may write fewer bytes than requested on a pipe. A partial
+    // write already reached the backend, so returning false here would leave
+    // it waiting on a truncated command; finish the write instead.
+    size_t sent = 0;
+    while (sent < buf.size())
+    {
+        DWORD written = 0;
+        const DWORD chunk = (DWORD)std::min<size_t>(buf.size() - sent, 0x7fffffff);
+        if (!WriteFile(ch.h_in_write, buf.data() + sent, chunk, &written, nullptr) ||
+            written == 0)
+        {
+            // A failed/zero write mid-command desyncs the protocol.
+            ch.dead = true;
+            return false;
+        }
+        sent += written;
+    }
+    return true;
 }
 
 static void channel_close(BackendChannel &ch)
@@ -515,7 +550,6 @@ static std::string backend_read_line(BackendChannel &ch)
     // Raw fd reads (not fgets): stdio buffering hides data from poll(), which
     // would spuriously time out mid-line. One line per command; the backend
     // replies only after a command, so the fd is quiet between reads.
-    static const size_t MAX_LINE_SIZE = 10 * 1024 * 1024;
 
     if (!ch.out)
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
@@ -571,10 +605,10 @@ static std::string backend_read_line(BackendChannel &ch)
         }
         line.append(buf, (size_t)n);
         total_read += (size_t)n;
-        if (total_read > MAX_LINE_SIZE)
+        if (total_read > kMaxBackendLine)
         {
             fprintf(stderr, "ERROR: Backend response too large ( > %zu MB). Aborting read.\n",
-                    MAX_LINE_SIZE / (1024 * 1024));
+                    kMaxBackendLine / (1024 * 1024));
             return "{\"error\":\"Response too large\",\"kind\":\"backend\"}";
         }
     }
@@ -1724,6 +1758,26 @@ std::vector<Track> fetch_radio(const std::string &video_id)
     return tracks;
 }
 
+// Tolerant decimal parse for backend-provided counts. Never throws, stops at
+// the first non-digit and saturates instead of overflowing (std::stoi used to
+// throw on malformed/huge input, and an exception in a parser thread kills
+// the process).
+static int parse_bounded_count(const std::string &s, size_t begin, size_t end)
+{
+    int value = 0;
+    for (size_t i = begin; i < end && i < s.size() &&
+                       isdigit((unsigned char)s[i]); ++i)
+    {
+        if (value > 100000000)
+        {
+            value = 1000000000;
+            break;
+        }
+        value = value * 10 + (s[i] - '0');
+    }
+    return value;
+}
+
 std::vector<YouTubePlaylist> parse_youtube_playlists_response(const std::string &response)
 {
     std::vector<YouTubePlaylist> out;
@@ -1762,23 +1816,18 @@ std::vector<YouTubePlaylist> parse_youtube_playlists_response(const std::string 
             if (c != std::string::npos)
             {
                 size_t q = obj.find('"', c + 1);
-                if (q != std::string::npos && q < obj.size() - 1 && isdigit((unsigned char)obj[q + 1]))
+                if (q != std::string::npos && q + 1 < obj.size() &&
+                    isdigit((unsigned char)obj[q + 1]))
                 {
                     size_t q2 = obj.find('"', q + 1);
                     if (q2 != std::string::npos)
-                        p.count = std::stoi(obj.substr(q + 1, q2 - q - 1));
+                        p.count = parse_bounded_count(obj, q + 1, q2);
                 }
                 else
                 {
                     size_t d = c + 1;
                     while (d < obj.size() && isspace((unsigned char)obj[d])) d++;
-                    int val = 0;
-                    while (d < obj.size() && isdigit((unsigned char)obj[d]))
-                    {
-                        val = val * 10 + (obj[d] - '0');
-                        d++;
-                    }
-                    p.count = val;
+                    p.count = parse_bounded_count(obj, d, obj.size());
                 }
             }
         }

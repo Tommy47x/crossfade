@@ -102,8 +102,11 @@ void load_recommendations(bool force, bool quiet)
     {
         auto snapshot = std::make_shared<const std::vector<Track>>(std::move(tracks));
         std::atomic_store(&g_state.recommendations, snapshot);
-        g_state.home_failed = false;
-        g_state.home_error_msg.clear();
+        {
+            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+            g_state.home_failed = false;
+            g_state.home_error_msg.clear();
+        }
         // Publish the list first: the header spinner should stop as soon as
         // the new recommendations are on screen, not while we warm the first
         // few URLs in the background.
@@ -115,13 +118,14 @@ void load_recommendations(bool force, bool quiet)
     {
         // Nothing on screen (or the refresh failed): remember why, so the
         // Home tab can show an inline error + Retry instead of an empty list.
+        std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
         g_state.home_failed = true;
         g_state.home_error_msg = backend_error_user_message(err);
     }
-    std::lock_guard<std::mutex> lock(g_data_mutex);
-    g_state.status_text = "Ready.";
+    // status_text is a UI-thread string; ask the main loop to apply it.
+    g_state.status_ready_pending = true;
     g_state.home_refreshing = false;
-    g_state.backend_status = err;
+    g_state.set_backend_status(err);
     g_state.repaint_requested = true;
 }
 
@@ -145,10 +149,7 @@ void artist_search_and_update(const std::string &query, int expect_id)
     BackendError err = take_backend_error();
     if (err)
         ui_notify_backend_error(err);
-    {
-        std::lock_guard<std::mutex> lock(g_data_mutex);
-        g_state.backend_status = err;
-    }
+    g_state.set_backend_status(err);
     g_state.repaint_requested = true;
 }
 
@@ -283,6 +284,7 @@ void search_all_and_update(const std::string &query, int expect_id)
         // (no hits) keeps search_failed false so "no results" stays honest.
         if (ok)
         {
+            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
             g_state.search_failed = false;
             g_state.search_error_msg.clear();
         }
@@ -293,16 +295,18 @@ void search_all_and_update(const std::string &query, int expect_id)
         ui_notify_backend_error(err);
         if (g_state.search_id == expect_id)
         {
-            g_state.search_failed = true;
-            g_state.search_error_msg = backend_error_user_message(err);
+            {
+                std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                g_state.search_failed = true;
+                g_state.search_error_msg = backend_error_user_message(err);
+            }
             // A failed query has no card; don't leave the previous query's
             // top result above an error state.
             std::atomic_store(&g_state.search_top,
                               std::make_shared<const TopResult>());
         }
     }
-    std::lock_guard<std::mutex> lock(g_data_mutex);
-    g_state.backend_status = err;
+    g_state.set_backend_status(err);
     g_state.repaint_requested = true;
 }
 
@@ -358,10 +362,7 @@ void search_category_and_update(const std::string &query, int category, int expe
         ui_notify_backend_error(err);
     if (g_state.search_id == expect_id)
         g_state.search_loading = false;
-    {
-        std::lock_guard<std::mutex> lock(g_data_mutex);
-        g_state.backend_status = err;
-    }
+    g_state.set_backend_status(err);
     g_state.repaint_requested = true;
 }
 

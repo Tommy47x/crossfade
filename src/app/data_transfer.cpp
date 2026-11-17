@@ -218,7 +218,7 @@ bool export_async(const std::string &zip_path, const Sections &sections, std::st
     }
     set_export_result("");
 
-    tasks::spawn("data-export", [zip_path, sections]() {
+    auto export_job = [zip_path, sections]() {
         const std::string snapshot = p100_config_path(".export-library.db");
         std::string snapshot_error;
         bool have_snapshot = false;
@@ -267,7 +267,19 @@ bool export_async(const std::string &zip_path, const Sections &sections, std::st
             ui_notify(UiNotifyType::Error, "Backup failed", msg, 9.0f);
         }
         g_export_running.store(false);
-    });
+    };
+    try
+    {
+        tasks::spawn("data-export", std::move(export_job));
+    }
+    catch (...)
+    {
+        // Thread creation failed: report it instead of leaving the export
+        // spinner stuck (or letting the exception escape the UI frame).
+        g_export_running.store(false);
+        error = "Could not start the export worker.";
+        return false;
+    }
     return true;
 }
 

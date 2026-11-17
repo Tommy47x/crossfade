@@ -466,8 +466,9 @@ static std::string app_context_summary()
         << " auth=" << st.auth_mode
         << " day_mode=" << (st.day_mode ? 1 : 0)
         << " ui_scale=" << st.ui_scale << "\n";
-    if (g_state.backend_status)
-        out << "backend_error: " << g_state.backend_status.message << "\n";
+    const BackendError status = g_state.backend_status_snapshot();
+    if (status)
+        out << "backend_error: " << status.message << "\n";
     if (party_running())
     {
         const PartyStatus ps = party_status();
@@ -953,21 +954,32 @@ int app_run(int argc, char **argv)
         // on "backend not running" until the app was restarted.
         const bool want_start = boot_state < 0 || (warm_keep == 2 && !boot_pending) ||
                                 (!boot_pending && !backend_running());
+        bool home_failed_now = false;
+        {
+            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+            home_failed_now = g_state.home_failed;
+        }
         if (want_start)
         {
             set_backend_deferred(false);
             start_backend_async(warm_keep == 1);
             backend_boot_reported = false;
-            g_state.home_failed = false;
+            {
+                std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                g_state.home_failed = false;
+            }
             g_state.home_refreshing = true;
             tasks::spawn("recommendations", []() { load_recommendations(false, true); });
         }
-        else if (!boot_pending && g_state.home_failed && !g_state.home_refreshing)
+        else if (!boot_pending && home_failed_now && !g_state.home_refreshing)
         {
             // The backend is healthy but the first feed request happened
             // before the network came up. Retry as soon as the user actually
             // looks at the window instead of leaving a stale error on Home.
-            g_state.home_failed = false;
+            {
+                std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                g_state.home_failed = false;
+            }
             g_state.home_refreshing = true;
             tasks::spawn("recommendations", []() { load_recommendations(false, true); });
         }
@@ -1027,10 +1039,7 @@ int app_run(int argc, char **argv)
                                   "Check the auth file in Settings.";
                 }
                 ui_notify_backend_error(err);
-                {
-                    std::lock_guard<std::mutex> lock(g_data_mutex);
-                    g_state.backend_status = err;
-                }
+                g_state.set_backend_status(err);
                 g_state.repaint_requested = true;
             }
         }
@@ -1817,9 +1826,15 @@ int app_run(int argc, char **argv)
             {
                 static bool s_home_retry_armed = false;
                 static std::chrono::steady_clock::time_point s_home_retry_at{};
+                bool home_failed;
+                {
+                    std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                    home_failed = g_state.home_failed;
+                }
+                const BackendError status = g_state.backend_status_snapshot();
                 const bool retryable =
-                    g_state.home_failed && !g_state.home_refreshing && !g_window_hidden &&
-                    g_state.backend_status.kind == BackendErrKind::Network;
+                    home_failed && !g_state.home_refreshing && !g_window_hidden &&
+                    status.kind == BackendErrKind::Network;
                 const auto retry_now = std::chrono::steady_clock::now();
                 if (!retryable)
                 {
@@ -1833,7 +1848,10 @@ int app_run(int argc, char **argv)
                 else if (retry_now >= s_home_retry_at)
                 {
                     s_home_retry_at = retry_now + std::chrono::seconds(30);
-                    g_state.home_failed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                        g_state.home_failed = false;
+                    }
                     g_state.home_refreshing = true;
                     tasks::spawn("recommendations-retry",
                                  []() { load_recommendations(false, true); });
@@ -1936,12 +1954,18 @@ int app_run(int argc, char **argv)
                 int expect_id = g_state.podcast_search_id;
                 tasks::spawn([query, expect_id]() {
                     auto shows = fetch_podcast_search(query);
-                    if (g_state.podcast_search_id != expect_id)
-                        return;
+                    {
+                        std::lock_guard<std::recursive_mutex> lock(g_state.podcast_mutex);
+                        if (g_state.podcast_search_id != expect_id)
+                            return;
+                    }
                     std::atomic_store(&g_state.podcast_search_results,
                                       std::make_shared<const std::vector<PodcastShow>>(
                                           std::move(shows)));
-                    g_state.podcast_search_loading = false;
+                    {
+                        std::lock_guard<std::recursive_mutex> lock(g_state.podcast_mutex);
+                        g_state.podcast_search_loading = false;
+                    }
                     g_state.repaint_requested = true;
                 });
             }
@@ -1990,7 +2014,10 @@ int app_run(int argc, char **argv)
                 std::string query = g_state.studio_queued_search;
                 int expect = g_state.studio_search_seq.load();
                 g_state.studio_search_loading = true;
-                g_state.studio_search_error.clear();
+                {
+                    std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                    g_state.studio_search_error.clear();
+                }
                 tasks::spawn("studio-search", [query, expect]() {
                     bool failed = false;
                     std::vector<Track> results = fetch_search(query, &failed);
@@ -1999,6 +2026,7 @@ int app_run(int argc, char **argv)
                     if (failed)
                     {
                         BackendError err = take_backend_error();
+                        std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                         g_state.studio_search_error =
                             err.ok() ? backend_error_user_message(err)
                                      : "Could not search YouTube Music.";
@@ -2024,7 +2052,10 @@ int app_run(int argc, char **argv)
                     const int seq = g_state.studio_analysis_seq.fetch_add(1) + 1;
                     const Track beat = g_state.studio_beat;
                     g_state.studio_analyzing = true;
-                    g_state.studio_analysis_error.clear();
+                    {
+                        std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                        g_state.studio_analysis_error.clear();
+                    }
                     tasks::spawn("studio-analyze", [beat_id, cache, seq, beat]() {
                         std::string audio;
                         if (is_local_track_id(beat_id))
@@ -2045,11 +2076,13 @@ int app_run(int argc, char **argv)
                             std::atomic_store(
                                 &g_state.studio_analysis,
                                 std::make_shared<const StudioAnalysis>(std::move(analysis)));
+                            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                             g_state.studio_analysis_error.clear();
                         }
                         else
                         {
                             BackendError err = take_backend_error();
+                            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                             g_state.studio_analysis_error =
                                 err.ok() ? backend_error_user_message(err)
                                          : "Could not analyse this beat.";
@@ -2242,6 +2275,11 @@ int app_run(int argc, char **argv)
                 s_settings_applied = true;
                 s_applied_low_power = low_power;
             }
+            // Worker-set status flips are applied on the UI thread (status_text
+            // is a UI-thread string; see AppState::status_ready_pending).
+            if (g_state.status_ready_pending.exchange(false))
+                g_state.status_text = "Ready.";
+
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplSDL2_NewFrame();
             smooth_scroll_begin_frame(); // capture & zero io.MouseWheel BEFORE NewFrame consumes it

@@ -364,8 +364,21 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
     }
 
     ImGui::Separator();
+    static char new_name[128] = "";
+    static bool s_add_menu_open = false;
+    // The context-menu popup is a new session each time it opens; BeginMenu
+    // alone cannot see that (this function returns early while it is closed).
+    if (ImGui::IsWindowAppearing())
+        new_name[0] = '\0';
     if (ImGui::BeginMenu("Add to playlist"))
     {
+        if (!s_add_menu_open)
+        {
+            // Start each menu session with an empty field; the old text used
+            // to linger across tracks and invocations.
+            new_name[0] = '\0';
+            s_add_menu_open = true;
+        }
         for (int i = 0; i < (int)state.playlists.size(); ++i)
         {
             const auto &pl = state.playlists[i];
@@ -378,7 +391,6 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
         }
         if (!state.playlists.empty())
             ImGui::Separator();
-        static char new_name[128] = "";
         ImGui::SetNextItemWidth(180.0f * s);
         ImGui::InputTextWithHint("##new_playlist", "New playlist", new_name, sizeof(new_name));
         if (ImGui::MenuItem("Create playlist"))
@@ -396,6 +408,10 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
             }
         }
         ImGui::EndMenu();
+    }
+    else
+    {
+        s_add_menu_open = false;
     }
 
     if (state.current_tab == Tab::Playlists && state.selected_playlist_index >= 0 &&

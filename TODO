@@ -1,5 +1,7 @@
 fix crossfade
 
+Reviewed-but-deferred issues live in docs/KNOWN-ISSUES.md.
+
 A natural crossfade can override a manual track selection
 ---------------------------------------------------------
 Reported 2026-11-16. Symptoms when clicking a track while the current one is

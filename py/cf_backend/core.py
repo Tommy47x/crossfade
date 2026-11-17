@@ -62,6 +62,26 @@ def _load_stream_disk():
             if (isinstance(ts, (int, float)) and isinstance(url, str) and url
                     and now - ts < _STREAM_TTL and vid not in _stream_cache):
                 _stream_cache[vid] = (float(ts), url)
+    _prune_stream_cache()
+
+
+def _cache_stream_url(video_id, url):
+    with _stream_lock:
+        _stream_cache[video_id] = (time.time(), url)
+    _prune_stream_cache()
+
+
+def _prune_stream_cache():
+    """Drop expired URLs and cap the in-memory cache (the disk writer uses
+    the same cap). Called on insert so a long session that resolves many
+    unique tracks cannot grow this dict without bound."""
+    now = time.time()
+    with _stream_lock:
+        fresh = [(vid, entry) for vid, entry in _stream_cache.items()
+                 if now - entry[0] < _STREAM_TTL]
+        fresh.sort(key=lambda kv: kv[1][0], reverse=True)
+        _stream_cache.clear()
+        _stream_cache.update(fresh[:_STREAM_DISK_MAX])
 
 
 def _stream_disk_lookup(video_id):
@@ -2006,8 +2026,7 @@ def get_stream_url(video_id, fresh=False):
             last_error = err
             continue
         if _url_playable(url):
-            with _stream_lock:
-                _stream_cache[video_id] = (time.time(), url)
+            _cache_stream_url(video_id, url)
             _warm_client = _client_from_url(url) or client_arg
             _save_stream_disk()
             return {'url': url}

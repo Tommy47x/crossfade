@@ -180,7 +180,10 @@ void request_analysis(AppState &state)
     state.studio_analysis_seq.fetch_add(1);
     std::atomic_store(&state.studio_analysis, std::shared_ptr<const StudioAnalysis>{});
     state.studio_analyzing = false;
-    state.studio_analysis_error.clear();
+    {
+        std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+        state.studio_analysis_error.clear();
+    }
     state.studio_analysis_requested_id = state.studio_beat.id;
     state.studio_analysis_dirty = true;
     state.repaint_requested = true;
@@ -231,7 +234,10 @@ void clear_beat(AppState &state)
     state.studio_project_loaded = false;
     state.studio_analysis_requested_id.clear();
     std::atomic_store(&state.studio_analysis, std::shared_ptr<const StudioAnalysis>{});
-    state.studio_analysis_error.clear();
+    {
+        std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+        state.studio_analysis_error.clear();
+    }
     state.studio_analyzing = false;
     state.studio_analysis_seq.fetch_add(1);
     state.studio_undo.clear();
@@ -715,11 +721,16 @@ void draw_timeline(AppState &state, MpvPlayer &player)
         const ImVec2 ts = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + (h - ts.y) * 0.5f),
                     ui_text_muted_u32(), msg);
-        if (!state.studio_analysis_error.empty() && !state.studio_beat.id.empty())
+        std::string analysis_error;
         {
-            const ImVec2 es = ImGui::CalcTextSize(state.studio_analysis_error.c_str());
+            std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+            analysis_error = state.studio_analysis_error;
+        }
+        if (!analysis_error.empty() && !state.studio_beat.id.empty())
+        {
+            const ImVec2 es = ImGui::CalcTextSize(analysis_error.c_str());
             dl->AddText(ImVec2(p0.x + (w - es.x) * 0.5f, p0.y + h * 0.5f + 22.0f),
-                        ui_col(g_accent_text), state.studio_analysis_error.c_str());
+                        ui_col(g_accent_text), analysis_error.c_str());
         }
         dl->PopClipRect();
         ImGui::EndChild();
@@ -1477,21 +1488,29 @@ void draw_beat_search(AppState &state)
             state.studio_search_seq.fetch_add(1);
             state.studio_queued_search = g_search_query;
             state.studio_search_loading = true;
-            state.studio_search_error.clear();
+            {
+                std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+                state.studio_search_error.clear();
+            }
             state.studio_search_dirty = true;
             state.repaint_requested = true;
         }
     }
 
+    std::string search_error;
+    {
+        std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+        search_error = state.studio_search_error;
+    }
     if (state.studio_search_loading.load())
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ui_c().text_muted);
         ImGui::TextUnformatted("Searching...");
         ImGui::PopStyleColor();
     }
-    else if (!state.studio_search_error.empty())
+    else if (!search_error.empty())
     {
-        ImGui::TextColored(g_accent_text, "%s", state.studio_search_error.c_str());
+        ImGui::TextColored(g_accent_text, "%s", search_error.c_str());
     }
 
     auto results = std::atomic_load(&state.studio_search_results);

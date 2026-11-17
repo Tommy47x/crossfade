@@ -277,52 +277,62 @@ void load_show(AppState &state, const PodcastShow &show)
         load_downloaded_tracks(state);
     const std::vector<Track> downloads = state.downloaded_tracks;
 
-    state.podcast_selected = show;
-    state.podcast_episodes.reset();
-    state.podcast_tracks.clear();
-
-    // Show the cached show + episode list instantly when it exists; the
-    // background fetch below refreshes it silently. This is what makes an
-    // offline open (and episodes downloaded earlier) work.
     PodcastDetails cached;
     const bool had_cache = load_podcast_cache(show.browse_id, cached);
-    if (had_cache)
+
     {
-        if (!cached.show.title.empty())
-            state.podcast_selected = cached.show;
-        auto episodes = std::make_shared<const std::vector<PodcastEpisode>>(
-            with_downloaded_episodes(state.podcast_selected, std::move(cached.episodes),
-                                     downloads));
-        state.podcast_tracks = tracks_for(state.podcast_selected, *episodes);
-        std::atomic_store(&state.podcast_episodes, episodes);
-        state.podcast_details_loading = false;
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        state.podcast_selected = show;
+        std::atomic_store(&state.podcast_episodes,
+                          std::shared_ptr<const std::vector<PodcastEpisode>>{});
+        state.podcast_tracks.clear();
+
+        // Show the cached show + episode list instantly when it exists; the
+        // background fetch below refreshes it silently. This is what makes an
+        // offline open (and episodes downloaded earlier) work.
+        if (had_cache)
+        {
+            if (!cached.show.title.empty())
+                state.podcast_selected = cached.show;
+            auto episodes = std::make_shared<const std::vector<PodcastEpisode>>(
+                with_downloaded_episodes(state.podcast_selected, std::move(cached.episodes),
+                                         downloads));
+            state.podcast_tracks = tracks_for(state.podcast_selected, *episodes);
+            std::atomic_store(&state.podcast_episodes, episodes);
+            state.podcast_details_loading = false;
+        }
+        else
+        {
+            state.podcast_details_loading = true;
+        }
+        state.repaint_requested = true;
     }
-    else
-    {
-        state.podcast_details_loading = true;
-    }
-    state.repaint_requested = true;
 
     AppState *sp = &state;
     const std::string id = show.browse_id;
     tasks::spawn("podcast-open", [sp, id, had_cache, downloads]() {
         PodcastDetails details = fetch_podcast_details(id);
-        if (sp->podcast_selected.browse_id != id)
-            return;
+        {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
+            if (sp->podcast_selected.browse_id != id)
+                return;
+            if (details.show.title.empty())
+                details.show = sp->podcast_selected;
+        }
         const bool got = !details.show.title.empty() || !details.episodes.empty();
         if (!got)
         {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
             if (!had_cache)
                 sp->podcast_details_loading = false;
             sp->repaint_requested = true;
             return;
         }
-        if (details.show.title.empty())
-            details.show = sp->podcast_selected;
         // An empty episode list from the network must not wipe the cached
         // one (transient backend hiccup, rate limit, show without episodes).
         if (had_cache && details.episodes.empty())
         {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
             sp->podcast_details_loading = false;
             sp->repaint_requested = true;
             return;
@@ -337,6 +347,7 @@ void load_show(AppState &state, const PodcastShow &show)
         cache_payload.episodes = *episodes;
         save_podcast_cache(cache_payload);
 
+        std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
         sp->podcast_selected = details.show;
         std::atomic_store(&sp->podcast_episodes, episodes);
         sp->podcast_tracks = std::move(tracks);
@@ -431,9 +442,12 @@ bool podcast_grid(AppState &state, const std::vector<PodcastShow> &shows,
 
 void load_podcast_library(AppState &state)
 {
-    if (state.podcast_library_loaded || state.podcast_library_loading)
-        return;
-    state.podcast_library_loading = true;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        if (state.podcast_library_loaded || state.podcast_library_loading)
+            return;
+        state.podcast_library_loading = true;
+    }
     AppState *sp = &state;
     tasks::spawn("podcast", [sp]() {
         auto shows = fetch_podcast_library();
@@ -442,6 +456,7 @@ void load_podcast_library(AppState &state)
                           std::make_shared<const std::vector<PodcastShow>>(std::move(shows)));
         std::atomic_store(&sp->podcast_later,
                           std::make_shared<const std::vector<PodcastEpisode>>(std::move(later)));
+        std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
         sp->podcast_library_loaded = true;
         sp->podcast_library_loading = false;
         sp->repaint_requested = true;
@@ -450,14 +465,19 @@ void load_podcast_library(AppState &state)
 
 void close_podcast_show(AppState &state)
 {
+    std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
     state.podcast_selected = PodcastShow{};
-    state.podcast_episodes.reset();
+    std::atomic_store(&state.podcast_episodes,
+                      std::shared_ptr<const std::vector<PodcastEpisode>>{});
     state.podcast_tracks.clear();
     state.repaint_requested = true;
 }
 
 void draw_podcasts_panel(AppState &state)
 {
+    // The open-show worker publishes selected/episodes/tracks; hold the same
+    // lock for the frame so it cannot swap them mid-draw.
+    std::lock_guard<std::recursive_mutex> state_lock(state.podcast_mutex);
     const UiMetrics &m = ui_m();
     const float width = std::min(1080.0f * m.layout_scale, ImGui::GetContentRegionAvail().x);
     const bool searching = state.search_buffer[0] != '\0';

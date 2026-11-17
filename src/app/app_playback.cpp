@@ -635,6 +635,25 @@ bool maybe_start_endless_refill()
 
 void consume_endless_results()
 {
+    static std::chrono::steady_clock::time_point s_retry_at{};
+    static int s_retry_backoff = 0;
+    const auto now = std::chrono::steady_clock::now();
+
+    // A refill that came back empty (network hiccup, rate limit) must not
+    // strand the queue at EOF. While the player waits for tracks, retry with
+    // a bounded backoff instead of giving up after the first attempt.
+    if (g_endless_waiting && !g_state.endless_loading.load() &&
+        s_retry_at != std::chrono::steady_clock::time_point{} && now >= s_retry_at)
+    {
+        s_retry_at = {};
+        g_endless_attempted = false;
+        if (!maybe_start_endless_refill())
+        {
+            g_endless_waiting = false;
+            g_state.status_text = "Ready.";
+        }
+    }
+
     if (!g_state.endless_ready.exchange(false))
         return;
     auto results = std::atomic_load(&g_state.endless_results);
@@ -672,9 +691,18 @@ void consume_endless_results()
         prefetch_next_track();
     }
 
-    if (g_endless_waiting)
+    if (g_endless_waiting && !appended && !g_state.endless_loading.load())
+    {
+        // Keep waiting: schedule the next attempt. 4 s, then 8/16/32 s.
+        s_retry_backoff = std::min(s_retry_backoff + 1, 4);
+        s_retry_at = now + std::chrono::seconds(2 << s_retry_backoff);
+        g_state.status_text = "Endless radio unavailable; retrying...";
+    }
+    else if (g_endless_waiting)
     {
         g_endless_waiting = false;
+        s_retry_at = {};
+        s_retry_backoff = 0;
         if (appended)
         {
             if (!advance_playback())
@@ -987,7 +1015,11 @@ void maybe_start_crossfade()
                                        g_cf.seconds))
         {
         case crossfade::ManualAction::Cancel:
+            // Nothing is pending or active; clear the target too so a later
+            // fade cannot reuse a stale track/index.
             g_cf.manual = false;
+            g_cf.track = Track{};
+            g_cf.index = -1;
             break;
         case crossfade::ManualAction::Finish:
             finish_manual_crossfade();

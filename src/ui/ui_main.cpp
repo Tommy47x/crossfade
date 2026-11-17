@@ -947,29 +947,46 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
 
     if (tracks == nullptr || tracks->empty())
     {
+        bool home_failed;
+        std::string home_error;
+        bool search_failed;
+        std::string search_error;
+        {
+            std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+            home_failed = state.home_failed;
+            home_error = state.home_error_msg;
+            search_failed = state.search_failed;
+            search_error = state.search_error_msg;
+        }
         if (hero_tab)
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, anim.stagger(0.12f, 0.5f));
-        if (home && state.home_failed && !searching)
+        if (home && home_failed && !searching)
         {
             // The home feed fetch failed with nothing on screen: say why and
             // offer a retry instead of an empty "Nothing here".
-            if (ui_error_state(state.home_error_msg.empty()
+            if (ui_error_state(home_error.empty()
                                    ? "Couldn't load your recommendations."
-                                   : state.home_error_msg.c_str()))
+                                   : home_error.c_str()))
             {
-                state.home_failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+                    state.home_failed = false;
+                }
                 state.home_refreshing = true;
                 state.refresh_requested = true;
                 state.repaint_requested = true;
             }
         }
-        else if (home_search && state.search_failed && !state.search_loading)
+        else if (home_search && search_failed && !state.search_loading)
         {
-            if (ui_error_state(state.search_error_msg.empty()
+            if (ui_error_state(search_error.empty()
                                    ? "Couldn't search right now."
-                                   : state.search_error_msg.c_str()))
+                                   : search_error.c_str()))
             {
-                state.search_failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+                    state.search_failed = false;
+                }
                 state.search_dirty = true;
                 state.queued_search = state.search_buffer;
                 state.repaint_requested = true;
