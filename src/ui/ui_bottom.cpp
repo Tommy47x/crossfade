@@ -17,6 +17,8 @@
 
 static constexpr float kTau = 6.28318530717958647692f;
 static std::unordered_map<ImGuiID, float> g_control_hover;
+// Sub-percent remainder for wheel-over-volume: touchpads send tiny deltas.
+static float s_vol_wheel_accum = 0.0f;
 
 template <typename LabelFn>
 static bool draw_progress_bar(const char *id, float *value01, float width, float height,
@@ -902,6 +904,27 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
 
         ui_draw_icon(dl, UiIcon::Volume, ImVec2(vol_x + vol_icon * 0.5f, wp.y + bar_h * 0.5f),
                      vol_icon, ui_text_muted_u32(), 1.5f);
+
+        // Wheel / two-finger scroll over the slider nudges the volume. The
+        // readme promises this; without it the wheel only scrolled the page
+        // under the pointer, so touchpad users had no mouse volume control.
+        // Fractional touchpad deltas accumulate so slow scrolls still move.
+        const ImVec2 wheel_min(vol_x, vol_y - m.space_2);
+        const ImVec2 wheel_max(bar_x + vol_bar_w, vol_y + seek_h + m.space_2);
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(wheel_min, wheel_max) &&
+            io.MouseWheel != 0.0f)
+        {
+            s_vol_wheel_accum += io.MouseWheel * 5.0f;
+            const int step = (int)s_vol_wheel_accum;
+            if (step != 0)
+            {
+                s_vol_wheel_accum -= (float)step;
+                state.volume_request = std::clamp(vol + step, 0, 100);
+            }
+        }
+        else
+            s_vol_wheel_accum = 0.0f;
+
         ImGui::SetCursorScreenPos(ImVec2(bar_x, vol_y));
         if (draw_progress_bar("##volume", &vol_value01, vol_bar_w, seek_h,
                               ui_accent_u32(1.0f), ui_overlay_u32(0.14f),
