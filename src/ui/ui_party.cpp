@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include "party.h"
+#include "party_tunnel.h"
 #include "party_util.h"
 #include "ui_components.h"
 #include "ui_icons.h"
@@ -145,7 +146,7 @@ void draw_party_orb(ImDrawList *dl, ImVec2 centre, float size, float alpha, doub
     const ImVec2 mx(centre.x + half, centre.y + half);
     dl->AddRectFilled(ImVec2(mn.x + 3.0f, mn.y + 4.0f), ImVec2(mx.x + 3.0f, mx.y + 4.0f),
                       IM_COL32(0, 0, 0, (int)(110.0f * alpha)), m.radius_lg);
-    dl->AddRectFilled(mn, mx, ui_with_alpha(ui_col(ui_c().surface_hover), alpha), m.radius_lg);
+    dl->AddRectFilled(mn, mx, ui_with_alpha(ui_overlay_u32(0.05f), alpha), m.radius_lg);
     dl->AddRectFilled(mn, mx, ui_accent_u32(0.055f * alpha), m.radius_lg);
     dl->AddRect(mn, mx, ui_with_alpha(ui_border_u32(), alpha), m.radius_lg, 0, 1.0f);
     ui_draw_icon(dl, UiIcon::Party, centre, size * 0.44f,
@@ -165,8 +166,10 @@ void draw_hero_shell(ImDrawList *dl, ImVec2 origin, float avail, float hero_h, f
     };
     const ImVec2 card_min = C(ImVec2(origin.x, origin.y + lift));
     const ImVec2 card_max = C(ImVec2(origin.x + avail, origin.y + hero_h + lift));
-    dl->AddRectFilled(card_min, card_max,
-                      ui_with_alpha(ui_col(ui_c().surface_hover), t), m.radius_lg);
+    // Match the app's translucent content surfaces instead of an opaque
+    // dark-grey card that hides the ambient backdrop.
+    dl->AddRectFilled(card_min, card_max, ui_with_alpha(ui_overlay_u32(0.05f), t),
+                      m.radius_lg);
     dl->AddRectFilled(card_min, card_max, ui_accent_u32(0.035f * t), m.radius_lg);
     dl->AddRect(card_min, card_max,
                 ui_with_alpha(ui_border_u32(), (0.4f + 0.6f * t) * t),
@@ -175,7 +178,6 @@ void draw_hero_shell(ImDrawList *dl, ImVec2 origin, float avail, float hero_h, f
 
 void draw_stopped_hero(AppState &state, const PartyAnim &a, const PartyStatus &st)
 {
-    (void)state;
     const UiMetrics &m = ui_m();
     const float avail = ImGui::GetContentRegionAvail().x;
     const bool narrow = avail < 560.0f * m.layout_scale;
@@ -254,7 +256,11 @@ void draw_stopped_hero(AppState &state, const PartyAnim &a, const PartyStatus &s
             std::string label;
             bool accent;
         };
-        const Chip chips[] = {{"SAME WI-FI", true}, {"NO ACCOUNT", false}, {"NO CLOUD", false}};
+        const bool public_reach = state.settings.party.public_reach();
+        const Chip chips[] = {
+            {public_reach ? "PUBLIC LINK" : "SAME WI-FI", true},
+            {public_reach ? "ANY NETWORK" : "NO ACCOUNT", false},
+            {public_reach ? "CLOUDFLARE" : "NO CLOUD", false}};
         float total = 0.0f;
         size_t fit = 0;
         for (const Chip &c : chips)
@@ -276,31 +282,78 @@ void draw_stopped_hero(AppState &state, const PartyAnim &a, const PartyStatus &s
         }
     }
 
-    const float start_w = 160.0f * m.layout_scale;
-    const float settings_w = 166.0f * m.layout_scale;
-    const float buttons_w = start_w + settings_w + m.space_2;
-    const float buttons_x = narrow ? centre_x - buttons_w * 0.5f : text_x;
-    if (ui_pill_button("party_start", "Start party", UiIcon::Party,
-                       ImVec2(buttons_x, btn_y), ImVec2(start_w, btn_h), true, t, true))
+    // The configured reach drives the primary button. When it is public, a
+    // one-click LAN button sits next to it so a same-Wi-Fi party never needs a
+    // detour through Settings.
+    const bool can_lan = state.settings.party.public_reach();
+    const float row_avail = narrow ? std::max(1.0f, avail - pad * 2.0f)
+                                   : std::max(1.0f, text_w);
+    const float gap = m.space_2;
+    float start_w = 150.0f * m.layout_scale;
+    float lan_w = 160.0f * m.layout_scale;
+    float settings_w = 150.0f * m.layout_scale;
+    const char *start_label = "Start party";
+    const char *lan_label = "Start LAN party";
+    const char *settings_label = "Party settings";
+    auto button_row_w = [&]() {
+        return start_w + (can_lan ? lan_w + gap : 0.0f) + settings_w +
+               (can_lan ? gap : 0.0f);
+    };
+    if (button_row_w() > row_avail)
     {
+        start_w = 128.0f * m.layout_scale;
+        lan_w = 136.0f * m.layout_scale;
+        settings_w = m.control_h;
+        start_label = can_lan ? "Public" : "Start";
+        lan_label = "LAN party";
+        settings_label = "";
+    }
+    if (button_row_w() > row_avail)
+    {
+        start_w = 104.0f * m.layout_scale;
+        lan_w = 88.0f * m.layout_scale;
+        start_label = can_lan ? "Public" : "Start";
+        lan_label = "LAN";
+    }
+    const float buttons_w = button_row_w();
+    const float buttons_x = narrow ? centre_x - buttons_w * 0.5f : text_x;
+
+    auto start_party = [&](bool lan_only) {
+        PartySettings settings = state.settings.party;
+        if (lan_only)
+            settings.reach = "lan";
         std::string error;
-        if (party_start(state.settings.party, error))
-        {
-            state.party_fullscreen = false;
-            state.repaint_requested = true;
-            ui_notify(UiNotifyType::Success, "Party is live",
-                      "The QR code is ready. Guests can scan it now.", 4.0f);
-        }
-        else
+        if (!party_start(settings, error))
         {
             state.repaint_requested = true;
             ui_notify(UiNotifyType::Error, "Couldn't start the party",
                       error.empty() ? "Check the network address and port." : error, 7.0f);
+            return;
         }
+        state.party_fullscreen = false;
+        state.repaint_requested = true;
+        if (settings.public_reach())
+            ui_notify(UiNotifyType::Success, "Party is starting",
+                      "The public link is connecting; the QR code updates when it is ready.",
+                      4.5f);
+        else
+            ui_notify(UiNotifyType::Success, "LAN party is live",
+                      "The QR code works for guests on this Wi-Fi.", 4.0f);
+    };
+
+    if (ui_pill_button("party_start", start_label, UiIcon::Party,
+                       ImVec2(buttons_x, btn_y), ImVec2(start_w, btn_h), true, t, true))
+        start_party(false);
+    float bx = buttons_x + start_w + gap;
+    if (can_lan)
+    {
+        if (ui_pill_button("party_lan", lan_label, UiIcon::Party, ImVec2(bx, btn_y),
+                           ImVec2(lan_w, btn_h), false, t, true))
+            start_party(true);
+        bx += lan_w + gap;
     }
-    if (ui_pill_button("party_settings", "Party settings", UiIcon::Settings,
-                       ImVec2(buttons_x + start_w + m.space_2, btn_y),
-                       ImVec2(settings_w, btn_h), false, t, true))
+    if (ui_pill_button("party_settings", settings_label, UiIcon::Settings,
+                       ImVec2(bx, btn_y), ImVec2(settings_w, btn_h), false, t, true))
     {
         state.settings_focus_party = true;
         state.current_tab = Tab::Settings;
@@ -344,8 +397,8 @@ void draw_running_hero(AppState &state, const PartyAnim &a, const PartyStatus &s
     dl->AddRectFilled(ImVec2(panel_min.x + 3.0f, panel_min.y + 4.0f),
                       ImVec2(panel_max.x + 3.0f, panel_max.y + 4.0f),
                       IM_COL32(0, 0, 0, (int)(120.0f * t)), m.radius_lg);
-    dl->AddRectFilled(panel_min, panel_max,
-                      ui_with_alpha(ui_col(ui_c().surface_hover), t), m.radius_lg);
+    dl->AddRectFilled(panel_min, panel_max, ui_with_alpha(ui_overlay_u32(0.05f), t),
+                      m.radius_lg);
     dl->AddRect(panel_min, panel_max, ui_with_alpha(ui_border_u32(), t), m.radius_lg, 0,
                 1.0f);
 
@@ -446,9 +499,21 @@ void draw_running_hero(AppState &state, const PartyAnim &a, const PartyStatus &s
             std::string label;
             bool accent;
         };
+        std::string reach_label = "LAN ONLY";
+        if (st.public_reach)
+        {
+            switch (st.tunnel_state)
+            {
+            case PartyTunnelState::Live: reach_label = "PUBLIC"; break;
+            case PartyTunnelState::Error: reach_label = "LAN FALLBACK"; break;
+            case PartyTunnelState::Starting:
+            case PartyTunnelState::Off:
+            default: reach_label = "CONNECTING"; break;
+            }
+        }
         const Chip chips[] = {{"SCAN TO JOIN", true},
                               {ps.require_approval ? "APPROVAL ON" : "OPEN QUEUE", false},
-                              {"LAN ONLY", false}};
+                              {reach_label, false}};
         float total = 0.0f;
         size_t fit = 0;
         for (const Chip &c : chips)
@@ -545,9 +610,7 @@ void draw_pending_requests(AppState &state, const PartyAnim &a)
         const ImVec2 mn(origin.x, origin.y + lift);
         const ImVec2 mx(origin.x + avail, origin.y + row_h + lift);
         dl->AddRectFilled(mn, mx,
-                          ui_with_alpha(ui_col(hovered ? ui_c().surface_active
-                                                       : ui_c().surface_hover),
-                                        rt),
+                          ui_with_alpha(ui_overlay_u32(hovered ? 0.075f : 0.045f), rt),
                           m.radius_md);
         dl->AddRect(mn, mx,
                     ui_with_alpha(hovered ? ui_accent_u32(0.38f) : ui_border_u32(), rt),
@@ -638,8 +701,7 @@ void draw_guest_queue(AppState &state, const PartyAnim &a)
         ImDrawList *dl = ImGui::GetWindowDrawList();
         const ImVec2 mn(origin.x, origin.y + lift);
         const ImVec2 mx(origin.x + avail, origin.y + row_h + lift);
-        dl->AddRectFilled(mn, mx,
-                          ui_with_alpha(ui_col(ui_c().surface_hover), 0.72f * rt),
+        dl->AddRectFilled(mn, mx, ui_with_alpha(ui_overlay_u32(0.045f), 0.72f * rt),
                           m.radius_sm);
 
         const ImVec2 art_min(origin.x + pad, origin.y + (row_h - art_sz) * 0.5f + lift);
@@ -705,16 +767,43 @@ void draw_connection_help(const PartyAnim &a, const PartyStatus &st)
     party_gap();
     const float ht = a.stagger(0.24f, 0.4f);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ht);
-    ui_section_header("Can't connect?", nullptr);
-    party_help("Everyone must be on the same Wi-Fi. Hotspots and public networks often isolate clients, so the hotspot owner can reach the laptop while another phone cannot. Use a normal router, make this laptop the hotspot, or turn off client isolation if your network exposes it.");
-    party_help("Android 16 and newer can block local-network access for browsers. If Chrome shows ERR_TOO_MANY_RETRIES, allow Nearby devices for Chrome (App info - Permissions) or open the link in Firefox.");
-    if (st.state == PartyRunState::Running && !st.ip.empty() && st.port > 0)
+    if (st.public_reach)
     {
-        const std::string probe =
-            "http://" + st.ip + ":" + std::to_string(st.port) + "/healthz";
-        party_help(("Quick test from the phone: open " + probe +
-                    " - it should say ok. If that fails, the phone cannot reach this laptop yet.")
-                       .c_str());
+        ui_section_header("Public link", nullptr);
+        party_help("Guests can be on any network - mobile data, another Wi-Fi, anywhere with internet. Only the person running crossfade needs to be online here.");
+        party_help("The link is a temporary Cloudflare Quick Tunnel. It changes every time the party starts or this laptop changes networks, so ask guests to scan the current QR code rather than saving the address.");
+        if (st.tunnel_state == PartyTunnelState::Error && !st.tunnel_error.empty())
+            party_help(("Public link problem: " + st.tunnel_error +
+                        " The same Wi-Fi link below still works.")
+                           .c_str());
+        else if (st.tunnel_state == PartyTunnelState::Starting)
+            party_help("The public link is still connecting. The QR code switches to it automatically.");
+        if (!st.lan_url.empty())
+            party_help(("Same Wi-Fi fallback: " + st.lan_url).c_str());
+        if (st.state == PartyRunState::Running && !st.url.empty())
+        {
+            std::string base = st.url;
+            const size_t join = base.find("/j/");
+            if (join != std::string::npos)
+                base = base.substr(0, join);
+            party_help(("Quick test: open " + base +
+                        "/healthz - it should say ok. If that fails, the tunnel is still starting or Cloudflare is unreachable.")
+                           .c_str());
+        }
+    }
+    else
+    {
+        ui_section_header("Can't connect?", nullptr);
+        party_help("Everyone must be on the same Wi-Fi. Hotspots and public networks often isolate clients, so the hotspot owner can reach the laptop while another phone cannot. Use a normal router, make this laptop the hotspot, or turn off client isolation if your network exposes it.");
+        party_help("Android 16 and newer can block local-network access for browsers. If Chrome shows ERR_TOO_MANY_RETRIES, allow Nearby devices for Chrome (App info - Permissions) or open the link in Firefox.");
+        if (st.state == PartyRunState::Running && !st.ip.empty() && st.port > 0)
+        {
+            const std::string probe =
+                "http://" + st.ip + ":" + std::to_string(st.port) + "/healthz";
+            party_help(("Quick test from the phone: open " + probe +
+                        " - it should say ok. If that fails, the phone cannot reach this laptop yet.")
+                           .c_str());
+        }
     }
     ImGui::PopStyleVar();
 }
@@ -744,6 +833,22 @@ void draw_party_panel(AppState &state)
     if (st.state == PartyRunState::Running)
     {
         draw_running_hero(state, a, st);
+        if (st.public_reach)
+        {
+            if (st.tunnel_state == PartyTunnelState::Starting)
+                party_help("Connecting the public Cloudflare link...");
+            else if (st.tunnel_state == PartyTunnelState::Error && !st.tunnel_error.empty())
+            {
+                party_gap();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.48f, 0.48f, 1.0f));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                                       ImGui::GetContentRegionAvail().x);
+                ImGui::TextWrapped("Public link unavailable: %s The same Wi-Fi link still works.",
+                                   st.tunnel_error.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
+        }
         draw_pending_requests(state, a);
         draw_guest_queue(state, a);
         draw_connection_help(a, st);
@@ -751,6 +856,23 @@ void draw_party_panel(AppState &state)
     else
     {
         draw_stopped_hero(state, a, st);
+        if (state.settings.party.public_reach() &&
+            !(st.state == PartyRunState::Error && !st.error.empty()))
+        {
+            std::string cloudflared;
+            if (!party_tunnel::available(cloudflared, state.settings.party.tunnel_path))
+            {
+                party_gap();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.48f, 0.48f, 1.0f));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                                       ImGui::GetContentRegionAvail().x);
+                ImGui::TextWrapped(
+                    "cloudflared isn't installed, so Start party cannot create the public "
+                    "link. Install it, or use Start LAN party instead.");
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
+        }
         if (st.state == PartyRunState::Error && !st.error.empty())
         {
             party_gap();
@@ -831,7 +953,22 @@ void draw_party_fullscreen(AppState &state)
             close = true;
 
         const std::string guests = guest_count_label(st.guests);
-        ui_meta_chip(dl, m, guests.c_str(), ImVec2(pad, pad + m.space_2), true, 1.0f);
+        const float guest_chip_w =
+            ui_meta_chip(dl, m, guests.c_str(), ImVec2(pad, pad + m.space_2), true, 1.0f);
+        std::string reach_chip = "SAME WI-FI";
+        if (st.public_reach)
+        {
+            switch (st.tunnel_state)
+            {
+            case PartyTunnelState::Live: reach_chip = "PUBLIC LINK"; break;
+            case PartyTunnelState::Error: reach_chip = "LAN FALLBACK"; break;
+            case PartyTunnelState::Starting:
+            case PartyTunnelState::Off:
+            default: reach_chip = "CONNECTING"; break;
+            }
+        }
+        ui_meta_chip(dl, m, reach_chip.c_str(),
+                     ImVec2(pad + guest_chip_w + m.space_2, pad + m.space_2), false, 1.0f);
 
         const PartySettings &ps = party_active_settings();
         const float display_base = std::min(38.0f, w * 0.045f);

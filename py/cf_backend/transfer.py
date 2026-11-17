@@ -5,7 +5,7 @@ Uses only the Python standard library so it works with the bundled venv.
 
 Export:
     transfer.py export --zip BACKUP.zip --config CONFIG_DIR \
-        --sections settings,auth,library,album_cache,artist_cache,lyrics,thumbs,audio,logs \
+        --sections settings,auth,library,album_cache,artist_cache,podcast_cache,lyrics,thumbs,audio,logs \
         [--library SNAPSHOT_DB] [--version 0.3.3]
 
 Import (normally started by the app; it waits for the app to exit):
@@ -42,6 +42,7 @@ SECTIONS = {
     },
     "album_cache": {"dirs": ["album_cache"]},
     "artist_cache": {"dirs": ["artist_cache"]},
+    "podcast_cache": {"dirs": ["podcast_cache"]},
     "lyrics": {"dirs": ["lyrics"]},
     "thumbs": {"dirs": ["thumb_cache"]},
     "audio": {"dirs": ["audio_cache"]},
@@ -52,7 +53,8 @@ SECTIONS = {
 }
 
 SECTION_NAMES = list(SECTIONS.keys())
-DEFAULT_SECTIONS = ["settings", "auth", "library", "album_cache", "artist_cache", "lyrics", "thumbs"]
+DEFAULT_SECTIONS = ["settings", "auth", "library", "album_cache", "artist_cache",
+                    "podcast_cache", "lyrics", "thumbs"]
 
 # Never put transient state or previous backups into a new archive.
 EXCLUDED_NAMES = {
@@ -176,13 +178,19 @@ def write_archive(args):
 
 
 def safe_rel(name):
+    # ZIP entry names are POSIX paths, but Windows treats a backslash as a
+    # separator: "..\\..\\x" is a single POSIX part, passes the checks below,
+    # then escapes once Path() normalises it. Reject backslashes on Windows.
+    # On POSIX they are ordinary filename characters and stay contained.
+    if os.name == "nt" and "\\" in name:
+        return None
     rel = PurePosixPath(name)
     if not rel.parts:
         return None
     if rel.is_absolute() or ".." in rel.parts:
         return None
     first = rel.parts[0]
-    if ":" in first or first.startswith("\\"):
+    if ":" in first:
         return None
     return Path(*rel.parts)
 
@@ -238,6 +246,7 @@ def import_archive(args):
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             if manifest.get("app") != "crossfade":
                 raise RuntimeError("Not a crossfade backup")
+            temp_root = temp.resolve()
             for info in zf.infolist():
                 if info.is_dir() or info.filename == "manifest.json":
                     continue
@@ -245,6 +254,12 @@ def import_archive(args):
                 if rel is None:
                     raise RuntimeError(f"Unsafe path in backup: {info.filename}")
                 target = temp / rel
+                # Defence in depth: whatever the name looked like, the file
+                # must land inside the staging directory.
+                try:
+                    target.resolve().relative_to(temp_root)
+                except (ValueError, OSError):
+                    raise RuntimeError(f"Unsafe path in backup: {info.filename}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)

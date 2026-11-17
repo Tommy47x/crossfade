@@ -98,11 +98,37 @@ std::string cookie_value(const httplib::Request &req, const std::string &name)
     return "";
 }
 
+std::string normalize_host(std::string host)
+{
+    host = lower(trim(host));
+    const std::string scheme = "https://";
+    if (host.rfind(scheme, 0) == 0)
+        host = host.substr(scheme.size());
+    const size_t slash = host.find('/');
+    if (slash != std::string::npos)
+        host = host.substr(0, slash);
+    const size_t colon = host.find(':');
+    if (colon != std::string::npos)
+        host = host.substr(0, colon);
+    return host;
+}
+
 bool host_ok(const std::string &host)
 {
+    std::lock_guard<std::mutex> lock(g_server_mutex);
     std::string h = lower(trim(host));
     if (h.empty())
         return false;
+    // Public tunnel hostname (Cloudflare forwards the original Host header;
+    // it usually has no :port because the edge terminates TLS on 443).
+    if (!g_cfg.public_host.empty())
+    {
+        const std::string &ph = g_cfg.public_host;
+        if (h == ph)
+            return true;
+        if (h.size() > ph.size() && h.compare(0, ph.size(), ph) == 0 && h[ph.size()] == ':')
+            return true;
+    }
     std::string port = ":" + std::to_string(g_cfg.port);
     if (h == lower(g_cfg.public_ip) + port)
         return true;
@@ -113,6 +139,21 @@ bool host_ok(const std::string &host)
     if (g_cfg.port == 80 && (h == "localhost" || h == "127.0.0.1"))
         return true;
     return false;
+}
+
+bool is_https_request(const httplib::Request &req)
+{
+    std::lock_guard<std::mutex> lock(g_server_mutex);
+    if (lower(trim(req.get_header_value("X-Forwarded-Proto"))) == "https")
+        return true;
+    if (g_cfg.public_host.empty())
+        return false;
+    const std::string h = lower(trim(req.get_header_value("Host")));
+    if (h == g_cfg.public_host)
+        return true;
+    return h.size() > g_cfg.public_host.size() &&
+           h.compare(0, g_cfg.public_host.size(), g_cfg.public_host) == 0 &&
+           h[g_cfg.public_host.size()] == ':';
 }
 
 void security_headers(const httplib::Request &req, httplib::Response &res)
@@ -296,6 +337,7 @@ bool party_server_start(const PartyServerConfig &config, std::string &error)
         return true;
 
     g_cfg = config;
+    g_cfg.public_host = normalize_host(g_cfg.public_host);
     auto svr = std::unique_ptr<httplib::Server>(new httplib::Server());
     svr->set_payload_max_length(4096);
     svr->set_read_timeout(5, 0);
@@ -342,6 +384,8 @@ bool party_server_start(const PartyServerConfig &config, std::string &error)
         // response avoids relying on a cookie being replayed for the redirect.
         std::string cookie = "cf_guest=" + guest_id +
                              "; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200";
+        if (is_https_request(req))
+            cookie += "; Secure";
         res.set_header("Set-Cookie", cookie);
         serve_page(res, party_api::page_html());
     });
@@ -548,6 +592,7 @@ void party_server_stop()
         if (!g_running)
             return;
         g_running = false;
+        g_cfg.public_host.clear();
         old = std::move(g_server);
         thread = std::move(g_listen_thread);
     }
@@ -567,5 +612,11 @@ int party_server_port()
 {
     std::lock_guard<std::mutex> lock(g_server_mutex);
     return g_cfg.port;
+}
+
+void party_server_set_public_host(const std::string &host)
+{
+    std::lock_guard<std::mutex> lock(g_server_mutex);
+    g_cfg.public_host = normalize_host(host);
 }
 

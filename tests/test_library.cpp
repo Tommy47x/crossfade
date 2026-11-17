@@ -83,6 +83,30 @@ int main()
     check(library::download_count() == 1, "download metadata indexed");
     check(library::playlist_names()[0] == "Test_List", "playlist name");
 
+    // Local (on-disk) songs: metadata, order and search survive a save/load.
+    Track local_a;
+    local_a.id = "local:aaaaaaaaaaaaaaa1";
+    local_a.title = "LocalSong One";
+    local_a.artist = "Local Artist";
+    local_a.album = "Local Album";
+    local_a.url = "/tmp/local one.flac";
+    local_a.duration_sec = 123;
+    Track local_b;
+    local_b.id = "local:aaaaaaaaaaaaaaa2";
+    local_b.title = "LocalSong Two";
+    local_b.url = "/tmp/local two.mp3";
+    local_b.duration_sec = 45;
+    library::save_local_tracks({local_a, local_b});
+    auto locals = library::load_local_tracks();
+    check(locals.size() == 2, "local tracks saved");
+    check(locals.size() == 2 && locals[0].id == local_a.id && locals[0].url == local_a.url &&
+              locals[0].duration_sec == 123,
+          "local order/path/duration");
+    check(library::search_tracks("LocalSong").size() == 2, "local tracks searchable");
+    library::save_local_tracks({local_a});
+    check(library::load_local_tracks().size() == 1, "local track removed");
+    check(library::search_tracks("LocalSong").size() == 1, "removed local leaves search");
+
     std::string integrity;
     check(library::integrity_check(integrity), ("integrity: " + integrity).c_str());
     const fs::path backup = root / "backup.db";
@@ -94,6 +118,7 @@ int main()
     check(library::load_liked().size() == 2, "second init keeps data");
     check(library::load_playlist_tracks("Test_List").size() == 2, "second init keeps playlist");
     check(library::download_count() == 1, "second init keeps downloads indexed");
+    check(library::load_local_tracks().size() == 1, "second init keeps local tracks");
 
     // A path that cannot be opened as a database must fail cleanly so the
     // caller can fall back to legacy JSON instead of losing the library.

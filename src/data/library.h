@@ -62,6 +62,13 @@ std::vector<PodcastShow> load_saved_podcasts();
 void save_downloads(const std::vector<Track> &tracks);
 long long download_count();
 
+// Local audio files the user added from disk (Studio / Library). The metadata
+// lives in the same `tracks` + FTS tables as everything else; `local_tracks`
+// only stores the order and the file path (Track.url). Files stay where the
+// user left them; a missing path is preserved so it can be re-located.
+void save_local_tracks(const std::vector<Track> &tracks);
+std::vector<Track> load_local_tracks();
+
 // Close the database and reset module state. The app calls this during
 // shutdown so SQLite can checkpoint the WAL cleanly.
 void shutdown();

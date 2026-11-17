@@ -3,6 +3,7 @@
 #include <vector>
 #include <atomic>
 #include <functional>
+#include <unordered_map>
 
 struct Track
 {
@@ -43,6 +44,36 @@ struct Lyrics
     std::vector<std::string> lines;
 };
 
+// ---- Studio: waveform + beat analysis ----
+// One resolution of the waveform pyramid. `mins`/`maxs` are parallel and hold
+// the sample range in each bucket (normalised to roughly [-1, 1]).
+struct StudioWaveLevel
+{
+    int buckets = 0;
+    std::vector<float> mins;
+    std::vector<float> maxs;
+};
+
+struct StudioAnalysis
+{
+    std::string id; // beat this analysis belongs to
+    bool ok = false;
+    double duration = 0.0;
+    double bpm = 0.0;
+    float confidence = 0.0f;
+    std::vector<double> beats;
+    std::vector<double> downbeats;
+    std::vector<StudioWaveLevel> waves; // coarse -> fine
+};
+
+// Analyse an audio file (waveform pyramid + beat grid), caching the result at
+// `cache_path`. Blocking: call from a worker, never the UI thread. Reads the
+// cache directly when it already exists. Returns false on decode failure.
+bool fetch_studio_analysis(const std::string &id, const std::string &audio_path,
+                           const std::string &cache_path, StudioAnalysis &out);
+// Parse a wave-cache file written by the backend. Exposed for tests.
+bool load_studio_analysis_file(const std::string &path, StudioAnalysis &out);
+
 bool start_backend();
 // Whether start_backend() also launches the play/prefetch workers.
 void set_optional_backends_enabled(bool enabled);
@@ -55,6 +86,40 @@ std::string backend_diagnostics();
 // during shutdown).
 void cancel_backend_startup();
 void stop_backend();
+
+// ---- Backend debug log (live command tracing) ----
+// Every command sent through the backend channel is recorded (bounded ring) so
+// an in-app debug window can show what was sent where and how long it took.
+struct BackendLogEntry
+{
+    uint64_t seq = 0;      // monotonic, per command
+    int64_t ts_ms = 0;     // steady-clock milliseconds at completion
+    std::string channel;   // "main" / "play" / "prefetch"
+    std::string command;   // the command line (clipped)
+    uint64_t ms = 0;       // round-trip duration
+    bool error = false;    // response carried an error / backend died
+    size_t bytes = 0;      // response payload size
+};
+
+struct BackendChannelStats
+{
+    std::string name;
+    bool ready = false;
+    bool dead = false;
+    uintptr_t pid = 0;
+    uint64_t commands = 0;
+    uint64_t errors = 0;
+    uint64_t last_ms = 0;
+};
+
+struct BackendDebugSnapshot
+{
+    std::vector<BackendChannelStats> channels;
+    std::vector<BackendLogEntry> log; // most recent first
+};
+
+BackendDebugSnapshot backend_debug_snapshot();
+void backend_debug_clear_log();
 
 // What went wrong, classified at the source (Python stamps {"kind": ...} on
 // every error payload; the C++ side only falls back to substring guessing).
@@ -154,6 +219,13 @@ bool backend_move_playlist_item(const std::string &playlist_id,
 std::vector<std::pair<std::string, std::string>> backend_playlist_items(
     const std::string &playlist_id);
 
+// Parse the pairs out of a `playlist` backend response (ytmusicapi's
+// get_playlist JSON). Exposed separately so it can be unit-tested without a
+// live backend: the response nests artists/album/thumbnails before
+// "setVideoId", which a nearest-brace scan gets wrong.
+std::vector<std::pair<std::string, std::string>> parse_playlist_item_pairs(
+    const std::string &response);
+
 // ------------------ Browse (charts & moods) ------------------
 
 // ------------------ Download cache size cap ------------------
@@ -236,11 +308,65 @@ struct AlbumSummary
     int track_count = 0;
 };
 
+// YouTube Music's "Top result" card for a query. The backend supplies the
+// server's own intent match; src/app/search_top.cpp validates it against the
+// shelves and the local library before the UI shows it.
+enum class TopKind
+{
+    None,
+    Song,
+    Album,
+    Artist
+};
+
+struct TopResult
+{
+    TopKind kind = TopKind::None;
+    std::string id; // video id / album browse id / artist channel id
+    std::string title;
+    std::string artist;
+    std::string artist_id;
+    std::string album;
+    std::string album_id;
+    std::string year;
+    std::string duration; // "3:58" when known
+    int duration_sec = 0;
+    std::string subscribers;
+    std::string thumbnail_url;
+    bool video = false; // song card that YouTube classes as a video
+    int track_count = 0;
+};
+
 struct SearchAllResult
 {
+    TopResult top;
     std::vector<Track> songs;
     std::vector<AlbumSummary> albums;
     std::vector<ArtistSummary> artists;
+};
+
+// Typeahead data for the search bar.
+struct SearchSuggestionQuery
+{
+    std::string text;
+    bool history = false; // from the account's search history
+};
+
+struct SearchSuggestionItem
+{
+    std::string kind; // "song" / "video" / "album" / "artist"
+    std::string id;   // video id or browse id
+    std::string title;
+    std::string artist;
+    std::string album;
+    std::string subtitle;
+    std::string thumbnail_url;
+};
+
+struct SearchSuggestions
+{
+    std::vector<SearchSuggestionQuery> queries;
+    std::vector<SearchSuggestionItem> items;
 };
 
 struct PodcastShow
@@ -303,6 +429,8 @@ bool fetch_artist_songs(const std::string &songs_browse_id, int offset, int coun
                         std::vector<Track> &out);
 bool fetch_artist_for_track(const std::string &video_id, std::string &artist_id, std::string &artist_name);
 std::vector<ArtistSummary> fetch_artist_search(const std::string &query);
+std::vector<AlbumSummary> fetch_search_albums(const std::string &query);
+SearchSuggestions fetch_search_suggestions(const std::string &query);
 bool fetch_search_all(const std::string &query, SearchAllResult &out);
 
 // Backend/auth diagnostics for Settings.
@@ -334,12 +462,22 @@ std::string find_cached_audio_path(const std::string &video_id);
 // existing local file, then the current cache copy, then the YouTube URL.
 std::string playable_track_url(const std::string &id, const std::string &url);// Download (if needed) and return the local audio file path.
 std::string get_cached_audio_path(const std::string &video_id);
+// Persist the metadata sidecar for an already-cached audio file. Podcast
+// downloads use it to keep the show/artist association in the Downloads list
+// (yt-dlp's generic metadata does not know which show an episode belongs to).
+// No-op when the file is missing or the track is being deleted.
+void save_cached_track_metadata(const Track &track, const std::string &audio_path);
 // Resolve a direct streaming URL via the backend ("yt-dlp -g").
 std::string fetch_stream_url(const std::string &video_id);
 // Speculative variant for background warming: uses a dedicated prefetch
 // backend channel, so it competes with neither a user click's resolve nor a
 // search/metadata request on the main channel.
 std::string fetch_stream_url_prefetch(const std::string &video_id);
+// Resolve several ids in one round trip on the prefetch channel. The backend
+// resolves them in parallel (four workers), so a whole page of rows warms in
+// seconds instead of one resolve per command. Failed ids are omitted.
+std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
+    const std::vector<std::string> &video_ids);
 // Same, but bypass and replace the backend's cached URL (used after a
 // player-side load failure, which often means the googlevideo URL expired).
 std::string fetch_stream_url_fresh(const std::string &video_id);

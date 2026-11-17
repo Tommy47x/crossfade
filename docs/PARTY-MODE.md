@@ -5,10 +5,15 @@ landed on, and the security and testing decisions that keep it contained.
 
 ## Goals
 
-- The host starts a party from the **Party** tab, gets a QR code, and guests
-  add YouTube songs from a phone on the same LAN.
-- No account, no cloud service, no telemetry, no outbound connection beyond the
-  existing `ytmusicapi` / `yt-dlp` backend calls the app already makes.
+- The host starts a party from the **Party** tab and gets a QR code. The default
+  reach is a **public link** through a locally spawned Cloudflare Quick Tunnel,
+  so guests can add YouTube songs from any network; **Start LAN party** next to
+  it is a one-click local override, and **Same Wi-Fi only** remains available as
+  the default in Settings.
+- No account and no telemetry. Same-Wi-Fi mode makes no outbound connection
+  beyond the existing `ytmusicapi` / `yt-dlp` backend calls. Public mode adds
+  only the `cloudflared` tunnel process (Cloudflare terminates TLS at the edge;
+  see the privacy notes below).
 - Party off means **zero** extra threads, sockets, timers or render work.
 - All queue mutation stays on the main/UI thread; HTTP threads only read
   immutable snapshots and push bounded requests into an inbox.
@@ -123,11 +128,37 @@ The guest page is served with a restrictive CSP, `X-Content-Type-Options`,
 or JSON explanation rather than an empty body, so a phone never shows a blank
 white page when a cookie is missing or a link is stale.
 
+## Public link lifecycle
+
+- **Start.** Resolve `cloudflared` (Settings override, `P100_CLOUDFLARED`, PATH,
+  then common install locations). If it is missing, the party does not start and
+  the error says how to install it or switch back to Same Wi-Fi. Otherwise the
+  local server starts first and the QR initially shows the LAN link while the
+  tunnel connects.
+- **Live.** The tunnel process prints `https://<random>.trycloudflare.com` on
+  stderr. The reader thread extracts it; the main thread adds that hostname to
+  the Host allowlist, swaps the QR/link to the public URL, and shows a short
+  notification. The exchange is in-memory only, and the join token is never
+  logged.
+- **Failure.** If the process exits or never prints a URL within 30 s, the
+  public link is marked broken, the QR falls back to the LAN link, and the error
+  is shown in the Party tab. A retry runs every 20 s while the party stays up.
+- **Network change.** The existing rebind path restarts the server on the new
+  address and restarts the tunnel with the new origin; the public URL changes.
+- **Stop.** `party_stop()` kills and reaps the tunnel before tearing down guest
+  state. No tunnel process or reader thread survives a stopped party.
+
 ## Security model
 
-- **LAN only.** The server binds to one selected IPv4 interface (or `0.0.0.0`
-  only when the selected address cannot be bound). It is not a public service
-  and does not use HTTPS.
+- **Two reach modes.** The HTTP server always binds to one selected IPv4
+  interface (or `0.0.0.0` only when the selected address cannot be bound). In
+  **Same Wi-Fi only** mode that is the whole surface: plain HTTP on the LAN. In
+  **Public link** mode crossfade spawns `cloudflared tunnel --url
+  http://<lan-ip>:<port> --no-autoupdate`, reads the assigned
+  `https://<random>.trycloudflare.com` URL from its log, and advertises that URL
+  in the QR. Guests reach the same server through Cloudflare; no inbound port
+  is opened and no router forwarding is needed. The server keeps binding to the
+  LAN address, so the tunnel process is the only new outbound connection.
 - **Address selection.** Automatic mode asks the kernel which source address it
   would use for outbound traffic and prefers it. This avoids stale secondary
   DHCP aliases that still answer on the laptop itself but are unreachable from
@@ -136,10 +167,13 @@ white page when a cookie is missing or a link is stale.
   constant time. The token appears only in the QR URL; it is never written to
   disk, logged, or returned by `/api/state`.
 - **Session cookie.** `cf_guest` is a 128-bit random id, `HttpOnly`,
-  `SameSite=Strict`, `Path=/`, 12 h `Max-Age`. Guest ids and names live in
-  memory only and are dropped when the party stops.
+  `SameSite=Strict`, `Path=/`, 12 h `Max-Age`, plus `Secure` when the request
+  arrived over HTTPS (`X-Forwarded-Proto: https` or the tunnel hostname). Guest
+  ids and names live in memory only and are dropped when the party stops.
 - **Host allowlist.** Every request must carry the bound IP (or
-  `localhost`/`127.0.0.1`) and port as its `Host`; anything else gets `421`.
+  `localhost`/`127.0.0.1`) and port, or the exact configured tunnel hostname
+  (with or without `:443`), as its `Host`; anything else gets `421`. The tunnel
+  hostname is set only after `cloudflared` reports the public URL.
 - **CSRF.** State-changing JSON requests require `Content-Type:
   application/json` and `X-CF: 1`. Cookies alone are not accepted. Combined
   with `SameSite=Strict`, another website cannot queue songs.
@@ -234,8 +268,16 @@ scripts/party-smoke-test.sh
   seconds and then run permanently late.
 - IPv4 only (the QR URL and Host check are IPv4-based). IPv6 LANs are out of
   scope for this pass.
-- HTTP, not HTTPS. That is appropriate for a trusted home LAN; do not port
-  forward the party server.
+- Same-Wi-Fi mode is HTTP, not HTTPS. That is appropriate for a trusted home
+  LAN; do not port forward the party server. Public mode gets HTTPS from
+  Cloudflare, but Cloudflare terminates TLS at its edge and relays the join
+  link and request paths, so it can see them; use Same-Wi-Fi mode when that is
+  not acceptable.
+- Public mode needs `cloudflared` installed locally. If it is missing, starting
+  a party fails with the install command and the Party tab explains it; the
+  in-app path field supports custom installs. Quick Tunnel addresses are
+  temporary, change on every party start and network change, and are not meant
+  for permanent hosting.
 - Guest search and metadata still depend on the local Python backend and the
   network; failed lookups return a friendly retryable error.
 - Pending approvals are not persisted, so restarting the app ends the party

@@ -108,6 +108,39 @@ int main()
     check(minimal.session_restore.track_title == "Old", "minimal title");
     check(minimal.session_restore.volume == -1, "minimal volume default");
 
+    // Podcast show cache round-trip: header + episode list (titles with
+    // quotes/newlines must survive the JSON escape/parse pair).
+    PodcastDetails pod;
+    pod.show.browse_id = "show1";
+    pod.show.title = "Show \"One\"";
+    pod.show.author = "Host";
+    pod.show.thumbnail_url = "https://example/art.jpg";
+    pod.show.description = "Line one\nLine two";
+    PodcastEpisode ep1;
+    ep1.video_id = "ep1";
+    ep1.title = "Episode 1";
+    ep1.author = "Host";
+    ep1.date = "1 Jan";
+    ep1.duration_sec = 123;
+    PodcastEpisode ep2;
+    ep2.video_id = "ep2";
+    ep2.title = "Episode \"2\"";
+    ep2.duration_sec = 456;
+    pod.episodes = {ep1, ep2};
+    save_podcast_cache(pod);
+    PodcastDetails loaded;
+    check(load_podcast_cache("show1", loaded), "podcast cache loads");
+    check(loaded.show.title == pod.show.title, "podcast show title");
+    check(loaded.show.author == "Host", "podcast show author");
+    check(loaded.show.description == pod.show.description, "podcast show description");
+    check(loaded.episodes.size() == 2, "podcast episode count");
+    check(loaded.episodes[0].video_id == "ep1" && loaded.episodes[0].duration_sec == 123,
+          "podcast episode 1");
+    check(loaded.episodes[1].title == "Episode \"2\"" &&
+              loaded.episodes[1].duration_sec == 456,
+          "podcast episode 2");
+    check(!load_podcast_cache("missing", loaded), "missing podcast cache");
+
     fs::remove_all(root, ec);
     if (testutil::failures == 0)
         std::printf("session: all checks passed\n");

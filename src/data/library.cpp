@@ -539,6 +539,8 @@ bool schema_setup()
         " title TEXT, author TEXT, thumbnail_url TEXT, description TEXT);"
         "CREATE TABLE IF NOT EXISTS downloads(video_id TEXT PRIMARY KEY,"
         " position INTEGER NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS local_tracks(video_id TEXT PRIMARY KEY,"
+        " position INTEGER NOT NULL);"
         "CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5("
         " video_id UNINDEXED, title, artist, album);"
         "PRAGMA user_version=1;");
@@ -1243,7 +1245,8 @@ void save_downloads(const std::vector<Track> &tracks)
                 " SELECT video_id FROM liked UNION SELECT video_id FROM history"
                 " UNION SELECT video_id FROM queue"
                 " UNION SELECT video_id FROM playlist_items"
-                " UNION SELECT video_id FROM downloads);"
+                " UNION SELECT video_id FROM downloads"
+                " UNION SELECT video_id FROM local_tracks);"
                 "DELETE FROM tracks_fts WHERE video_id NOT IN"
                 " (SELECT video_id FROM tracks);");
     commit_tx();
@@ -1264,6 +1267,103 @@ long long download_count()
         sqlite3_finalize(st);
     }
     return n;
+}
+
+void save_local_tracks(const std::vector<Track> &tracks)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    if (!g_db || !begin_tx())
+        return;
+
+    PreparedTrackWriter writer;
+    std::unordered_set<std::string> seen;
+    seen.reserve(tracks.size());
+
+    sqlite3_stmt *ins = nullptr;
+    sqlite3_prepare_v2(g_db,
+                       "INSERT OR REPLACE INTO local_tracks(video_id,position) VALUES(?,?)",
+                       -1, &ins, nullptr);
+    for (size_t i = 0; i < tracks.size(); ++i)
+    {
+        const std::string &id = tracks[i].id;
+        if (id.empty() || !seen.insert(id).second)
+            continue;
+        writer.write(tracks[i]);
+        if (ins)
+        {
+            sqlite3_bind_text(ins, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 2, (int)i);
+            sqlite3_step(ins);
+            sqlite3_reset(ins);
+        }
+    }
+    if (ins)
+        sqlite3_finalize(ins);
+
+    // Drop rows for local tracks the user removed.
+    {
+        sqlite3_stmt *sel = nullptr;
+        if (sqlite3_prepare_v2(g_db, "SELECT video_id FROM local_tracks", -1, &sel, nullptr) ==
+            SQLITE_OK)
+        {
+            std::vector<std::string> stale;
+            while (sqlite3_step(sel) == SQLITE_ROW)
+            {
+                const unsigned char *id = sqlite3_column_text(sel, 0);
+                if (id && !seen.count(reinterpret_cast<const char *>(id)))
+                    stale.emplace_back(reinterpret_cast<const char *>(id));
+            }
+            sqlite3_finalize(sel);
+            if (!stale.empty())
+            {
+                sqlite3_stmt *rm = nullptr;
+                if (sqlite3_prepare_v2(g_db, "DELETE FROM local_tracks WHERE video_id=?", -1, &rm,
+                                       nullptr) == SQLITE_OK)
+                {
+                    for (const std::string &id : stale)
+                    {
+                        sqlite3_bind_text(rm, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+                        sqlite3_step(rm);
+                        sqlite3_reset(rm);
+                    }
+                    sqlite3_finalize(rm);
+                }
+            }
+        }
+    }
+
+    // Metadata not referenced by any collection is dropped (same sweep as
+    // save_downloads), so a removed local track leaves Library search too.
+    exec_locked("DELETE FROM tracks WHERE video_id NOT IN ("
+                " SELECT video_id FROM liked UNION SELECT video_id FROM history"
+                " UNION SELECT video_id FROM queue"
+                " UNION SELECT video_id FROM playlist_items"
+                " UNION SELECT video_id FROM downloads"
+                " UNION SELECT video_id FROM local_tracks);"
+                "DELETE FROM tracks_fts WHERE video_id NOT IN"
+                " (SELECT video_id FROM tracks);");
+    commit_tx();
+}
+
+std::vector<Track> load_local_tracks()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    std::vector<Track> out;
+    if (!g_db)
+        return out;
+    sqlite3_stmt *st = nullptr;
+    if (sqlite3_prepare_v2(g_db,
+                           "SELECT t.video_id,t.title,t.artist,t.artist_id,t.album,"
+                           "t.album_id,t.track_number,t.thumbnail_url,t.duration_sec,"
+                           "t.url,t.requested_by,t.guest_id,t.from_party,t.party_round"
+                           " FROM local_tracks l JOIN tracks t ON t.video_id=l.video_id"
+                           " ORDER BY l.position",
+                           -1, &st, nullptr) != SQLITE_OK)
+        return out;
+    while (sqlite3_step(st) == SQLITE_ROW)
+        out.push_back(read_track(st, 0));
+    sqlite3_finalize(st);
+    return out;
 }
 
 std::vector<Track> search_tracks(const std::string &query, int limit)

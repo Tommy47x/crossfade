@@ -2,6 +2,7 @@
 
 #include "ytdlp.h"
 #include "mpvplayer.h"
+#include "local_audio.h"
 #include "crossfade.h"
 #include "texture.h"
 #include "ui.h"
@@ -13,6 +14,7 @@
 #include "tasks.h"
 #include "mpris.h"
 #include "power.h"
+#include "party_queue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +29,19 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+// Cover URL for playback metadata. A list row can draw an album/artist image
+// as a fallback, but the queue entry handed to auto-advance has no such
+// context: synthesize the video still rather than leave the bottom bar, the
+// lyrics header and the system media notification without artwork.
+static std::string playback_thumb_url(const Track &t)
+{
+    if (!t.thumbnail_url.empty())
+        return t.thumbnail_url;
+    if (!t.id.empty() && !is_local_track_id(t.id))
+        return "https://img.youtube.com/vi/" + t.id + "/hqdefault.jpg";
+    return std::string();
+}
 
 void stop_fade()
 {
@@ -56,13 +71,28 @@ void rebuild_queue_from_source()
     int start = g_state.queue_replace_index;
     g_state.queue_replace_index = 0;
 
+    // Guest party requests are not part of the host's source list. A source
+    // rebuild happens whenever the host starts a track, so clearing the queue
+    // outright used to silently drop every guest request -- the party queue
+    // then "jumped" back to the host playlist. Carry them across and re-insert
+    // them (fairly ordered) ahead of the freshly materialized host tracks.
+    std::vector<Track> guest_items;
+    guest_items.reserve(g_state.play_queue.size());
+    for (Track &t : g_state.play_queue)
+        if (t.from_party)
+            guest_items.push_back(std::move(t));
+
     g_state.play_queue.clear();
     g_state.queue_cycle.clear();
 
     auto playlist = get_playlist(g_state);
     if (!playlist || playlist->empty())
     {
+        // The host's source is gone, but the party queue must survive.
+        for (Track &t : guest_items)
+            party_queue::insert_fair(g_state.play_queue, std::move(t));
         g_state.queue_dirty = true;
+        g_state.repaint_requested = true;
         return;
     }
 
@@ -101,6 +131,11 @@ void rebuild_queue_from_source()
         std::shuffle(g_state.play_queue.begin(), g_state.play_queue.end(), rng);
     }
 
+    // Put the guest requests back in front of the host list, preserving the
+    // round-robin order insert_fair() assigned when they were requested.
+    for (Track &t : guest_items)
+        party_queue::insert_fair(g_state.play_queue, std::move(t));
+
     g_state.queue_dirty = true;
     g_state.repaint_requested = true;
 }
@@ -117,6 +152,16 @@ void resolve_audio(const std::string &video_id, const std::string &video_url,
     PlayRequest req;
     req.id = video_id;
     req.gen = gen;
+    if (is_local_track_id(video_id))
+    {
+        // A file on disk: play it directly and never touch the network or the
+        // stream-recording machinery.
+        req.path = video_url;
+        req.remote = false;
+        std::lock_guard<std::mutex> lock(g_play_queue_mutex);
+        g_play_queue.push(std::move(req));
+        return;
+    }
     req.path = find_cached_audio_path(video_id);
     req.remote = false;
     if (req.path.empty())
@@ -181,7 +226,8 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
     {
         if (ids.size() >= count)
             break;
-        if (t.id.empty() || !find_cached_audio_path(t.id).empty())
+        if (t.id.empty() || is_local_track_id(t.id) ||
+            !find_cached_audio_path(t.id).empty())
             continue;
         {
             std::lock_guard<std::mutex> lock(g_prefetch_mutex);
@@ -196,24 +242,73 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
 
     tasks::spawn("prefetch", [ids = std::move(ids), cancel_search_id]()
     {
-        for (size_t i = 0; i < ids.size(); ++i)
+        // Resolve in backend-parallel batches. One command per batch keeps the
+        // pipe from serializing four extractions behind each other; between
+        // batches we can still abandon a superseded search.
+        static constexpr size_t kBatch = 12;
+        for (size_t start = 0; start < ids.size(); start += kBatch)
         {
             if (cancel_search_id != 0 && g_state.search_id != cancel_search_id)
             {
                 // Superseded: release the slots not yet resolved (completed
                 // URLs stay warmed) so a future list can warm them again.
                 std::lock_guard<std::mutex> lock(g_prefetch_mutex);
-                for (size_t j = i; j < ids.size(); ++j)
+                for (size_t j = start; j < ids.size(); ++j)
                     g_prefetched_urls.erase(ids[j]);
                 return;
             }
-            std::string url = fetch_stream_url_prefetch(ids[i]);
+            std::vector<std::string> batch(ids.begin() + start,
+                                           ids.begin() + std::min(ids.size(), start + kBatch));
+            auto urls = fetch_stream_urls_prefetch(batch);
             std::lock_guard<std::mutex> lock(g_prefetch_mutex);
-            if (url.empty())
-                g_prefetched_urls.erase(ids[i]); // failed: allow a retry later
-            else
-                g_prefetched_urls[ids[i]] = url;
+            for (const std::string &id : batch)
+            {
+                auto it = urls.find(id);
+                if (it == urls.end() || it->second.empty())
+                    g_prefetched_urls.erase(id); // failed: allow a retry later
+                else
+                    g_prefetched_urls[id] = it->second;
+            }
         }
+    });
+}
+
+// Hover warming: resolving takes ~1.5-2 s, so the moment the pointer rests on
+// a row we can have its URL ready before the click lands. One at a time, and
+// only for rows not already reserved by the list prefetch.
+static std::atomic<bool> g_hover_prefetch_active{false};
+
+void prefetch_hovered_track(const std::string &video_id)
+{
+    if (video_id.empty() || power::low_power() || is_local_track_id(video_id))
+        return;
+    if (!find_cached_audio_path(video_id).empty())
+        return;
+    if (g_hover_prefetch_active.exchange(true))
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+        if (g_prefetched_urls.count(video_id))
+        {
+            g_hover_prefetch_active.store(false);
+            return;
+        }
+        g_prefetched_urls[video_id]; // reserve the in-flight slot
+    }
+
+    tasks::spawn("hover-prefetch", [video_id]()
+    {
+        auto urls = fetch_stream_urls_prefetch(std::vector<std::string>{video_id});
+        {
+            std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+            auto it = urls.find(video_id);
+            if (it == urls.end() || it->second.empty())
+                g_prefetched_urls.erase(video_id);
+            else
+                g_prefetched_urls[video_id] = it->second;
+        }
+        g_hover_prefetch_active.store(false);
+        g_state.repaint_requested = true;
     });
 }
 
@@ -230,7 +325,8 @@ void prefetch_urls_for_serial(const std::vector<Track> &tracks, size_t count,
     {
         if (ids.size() >= count)
             break;
-        if (t.id.empty() || !find_cached_audio_path(t.id).empty())
+        if (t.id.empty() || is_local_track_id(t.id) ||
+            !find_cached_audio_path(t.id).empty())
             continue;
         ids.push_back(t.id);
     }
@@ -443,7 +539,8 @@ void begin_play_track(const Track &t, int index)
     g_loading_since = std::chrono::steady_clock::now();
     g_state.current_title = t.title;
     g_state.current_artist = t.artist;
-    g_state.current_thumbnail_url = t.thumbnail_url;
+    const std::string thumb_url = playback_thumb_url(t);
+    g_state.current_thumbnail_url = thumb_url;
     g_state.current_track_id = t.id;
     g_state.current_album_id = t.album_id;
     g_state.current_artist_id = t.artist_id;
@@ -474,7 +571,7 @@ void begin_play_track(const Track &t, int index)
     g_state.pending_play_url = playable_track_url(t.id, t.url);
     g_state.pending_play_title = t.title;
     g_state.pending_play_artist = t.artist;
-    g_state.pending_play_thumbnail_url = t.thumbnail_url;
+    g_state.pending_play_thumbnail_url = thumb_url;
     g_state.pending_video_id = t.id;
     g_state.pending_video_url = playable_track_url(t.id, t.url);
 }
@@ -640,7 +737,7 @@ void adopt_fade_track(const Track &consumed, int consumed_index)
     g_state.crossfade_from_track.artist_id = g_state.current_artist_id;
     g_state.current_title = consumed.title;
     g_state.current_artist = consumed.artist;
-    g_state.current_thumbnail_url = consumed.thumbnail_url;
+    g_state.current_thumbnail_url = playback_thumb_url(consumed);
     g_state.current_track_id = consumed.id;
     g_state.current_album_id = consumed.album_id;
     g_state.current_artist_id = consumed.artist_id;
@@ -660,7 +757,7 @@ void adopt_fade_track(const Track &consumed, int consumed_index)
         history_entry.id = consumed.id;
         history_entry.title = consumed.title;
         history_entry.artist = consumed.artist;
-        history_entry.thumbnail_url = consumed.thumbnail_url;
+        history_entry.thumbnail_url = playback_thumb_url(consumed);
         history_entry.url = consumed.url;
         history_entry.duration_sec = consumed.duration_sec;
         for (auto it = g_state.playback_history.begin();
@@ -732,7 +829,12 @@ void promote_fade_player_to_main()
 
     g_cf.track = Track{};
     g_cf.index = -1;
-    g_state.playing = true;
+    // Keep the user's play/pause intent. A pause during the fade must survive
+    // the promotion: the ramp mirrors it onto both players, so forcing
+    // playing=true here would leave the UI claiming playback while mpv sits
+    // paused. The promoted player already carries the pause flag; restate it
+    // from the app's intent in case it started paused.
+    g_player->set_paused(!g_state.playing.load());
     if (!g_state.current_track_id.empty() &&
         g_state.lyrics_requested_id != g_state.current_track_id)
     {
@@ -749,7 +851,7 @@ void finish_manual_crossfade()
         return;
     promote_fade_player_to_main();
     g_state.loading = false;
-    g_state.status_text = "Playing";
+    g_state.status_text = g_state.playing.load() ? "Playing" : "Paused";
 
     prefetch_next_track();
     predownload_next_track();
@@ -1089,7 +1191,15 @@ void handle_player_event(const std::string &event, MprisPlayer *mpris)
 
         if (g_state.session_restore_pending) {
             g_state.session_restore_pending = false;
-            const double restore_pos = g_state.session_restore.position;
+            // Only apply the saved position to the track it belongs to. This
+            // start event might be for a different song: the restored track
+            // failed and playback auto-advanced, or the user picked another
+            // one while it was still resolving.
+            const bool restore_track =
+                !g_state.session_restore.track_id.empty() &&
+                g_state.current_track_id == g_state.session_restore.track_id;
+            const double restore_pos =
+                restore_track ? g_state.session_restore.position : 0.0;
             if (restore_pos > 0)
             {
                 // The stream just started, so the cache almost certainly

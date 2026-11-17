@@ -19,7 +19,7 @@ fi
 
 PORT=$((18000 + RANDOM % 2000))
 LOG="$(mktemp -t cf-party-smoke.XXXXXX)"
-"$BIN" "$PORT" >"$LOG" 2>&1 &
+"$BIN" "$PORT" smoke.trycloudflare.com >"$LOG" 2>&1 &
 PID=$!
 cleanup() {
     kill "$PID" 2>/dev/null || true
@@ -104,7 +104,18 @@ expect_code 400 "invalid add" -b "$JAR" -H 'Content-Type: application/json' -H '
 expect_code 200 "undo" -b "$JAR" -X DELETE -H 'X-CF: 1' "$BASE/api/add/dQw4w9WgXcQ"
 expect_code 200 "search" -b "$JAR" "$BASE/api/search?q=test"
 
-# Host allowlist: only 127.0.0.1/localhost (or the bound LAN IP) is served.
+# Public tunnel hostname: accepted with or without the edge's :443, and the
+# guest cookie gets Secure when Cloudflare reports an HTTPS request.
+expect_code 200 "public Host header" -H 'Host: smoke.trycloudflare.com' "$BASE/healthz"
+expect_code 200 "public Host with :443" -H 'Host: smoke.trycloudflare.com:443' "$BASE/healthz"
+curl -sS -D "$HEADER_FILE" -o /dev/null \
+    -H 'Host: smoke.trycloudflare.com' -H 'X-Forwarded-Proto: https' \
+    "$BASE/j/smoke-token" >/dev/null
+grep -qi '^Set-Cookie:.*Secure' "$HEADER_FILE" || fail "public cookie Secure"
+PASS=$((PASS + 3))
+
+# Host allowlist: only 127.0.0.1/localhost, the bound LAN IP and the configured
+# tunnel hostname are served.
 expect_code 421 "foreign Host header" -H 'Host: evil.example' "$BASE/healthz"
 FOREIGN_BODY="$(curl -sS -H 'Host: evil.example' "$BASE/healthz")"
 echo "$FOREIGN_BODY" | grep -qi 'Open the party link' || fail "foreign Host explanation"

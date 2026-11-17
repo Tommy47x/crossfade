@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 ImVec4 g_accent(0.43f, 0.70f, 0.81f, 1.0f);
 ImVec4 g_accent_hover(0.56f, 0.78f, 0.88f, 1.0f);
@@ -64,6 +67,98 @@ std::string accent_to_hex(const ImVec4 &color)
     snprintf(buf, sizeof(buf), "#%02x%02x%02x", color_channel_255(color.x),
              color_channel_255(color.y), color_channel_255(color.z));
     return std::string(buf);
+}
+
+// ----------------------------------------------------------------------
+// Shared accent bus (~/.config/accent/current + mode), written by the
+// settings app. Reading the same files as dwm/dmenu keeps every surface in
+// sync without IPC.
+// ----------------------------------------------------------------------
+static std::string accent_config_home()
+{
+    if (const char *xdg = std::getenv("XDG_CONFIG_HOME"))
+        if (*xdg)
+            return std::string(xdg);
+    if (const char *home = std::getenv("HOME"))
+        if (*home)
+            return std::string(home) + "/.config";
+    return ".";
+}
+
+std::string accent_shared_dir()
+{
+    return accent_config_home() + "/accent";
+}
+
+std::string accent_read_mode()
+{
+    std::FILE *f = std::fopen((accent_shared_dir() + "/mode").c_str(), "rb");
+    if (!f)
+        return "daily";
+    char buf[64] = {0};
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    std::string mode(buf, n);
+    while (!mode.empty() && (mode.back() == '\n' || mode.back() == '\r' ||
+                             mode.back() == ' ' || mode.back() == '\t'))
+        mode.pop_back();
+    size_t a = 0;
+    while (a < mode.size() && (mode[a] == ' ' || mode[a] == '\t'))
+        ++a;
+    mode = mode.substr(a);
+    return (mode == "auto" || mode == "fixed" || mode == "daily") ? mode : "daily";
+}
+
+static bool accent_read_shared(ImVec4 &out)
+{
+    std::FILE *f = std::fopen((accent_shared_dir() + "/current").c_str(), "rb");
+    if (!f)
+        return false;
+    char buf[64] = {0};
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    std::string hex(buf, n);
+    while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r' ||
+                            hex.back() == ' ' || hex.back() == '\t'))
+        hex.pop_back();
+    return accent_parse_hex(hex.c_str(), out);
+}
+
+void accent_write_shared(const std::string &hex, const std::string &mode)
+{
+    std::error_code ec;
+    const std::string dir = accent_shared_dir();
+    fs::create_directories(dir, ec);
+
+    // Avoid rewriting on every frame of a colour-picker drag.
+    auto read_text = [&](const char *name) {
+        std::string out;
+        if (std::FILE *f = std::fopen((dir + "/" + name).c_str(), "rb"))
+        {
+            char buf[64] = {0};
+            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+            std::fclose(f);
+            out.assign(buf, n);
+            while (!out.empty() && (out.back() == '\n' || out.back() == '\r' ||
+                                    out.back() == ' ' || out.back() == '\t'))
+                out.pop_back();
+        }
+        return out;
+    };
+    if (read_text("current") == hex && read_text("mode") == mode)
+        return;
+    auto write = [&](const char *name, const std::string &value) {
+        const std::string tmp = dir + "/." + name + ".tmp";
+        if (std::FILE *f = std::fopen(tmp.c_str(), "wb"))
+        {
+            std::fwrite(value.data(), 1, value.size(), f);
+            std::fputc('\n', f);
+            std::fclose(f);
+            fs::rename(tmp, dir + "/" + name, ec);
+        }
+    };
+    write("current", hex);
+    write("mode", mode);
 }
 
 // Read the desktop accent colour from the XDG desktop portal. Plasma and
@@ -125,16 +220,27 @@ void update_accent(const Settings &settings)
     static bool portal_available = true;
     ImVec4 base;
     bool have_color = false;
+    const std::string mode = accent_read_mode();
+    const bool bus_present = fs::exists(accent_shared_dir() + "/mode");
+    const bool bus_daily = bus_present && mode == "daily";
 
     if (const char *override_color = getenv("P100_ACCENT"))
         have_color = accent_parse_hex(override_color, base);
 
-    // Explicit choice from Settings takes precedence over the desktop theme.
-    if (!have_color && !settings.accent_color.empty())
+    // The settings app's shared bus wins over this app's local accent so the
+    // whole desktop stays on one colour. "daily" is computed below, which is
+    // byte-identical to what every other app derives from the date.
+    if (!have_color && bus_present && !bus_daily && accent_read_shared(base))
+        have_color = true;
+
+    // Local choice only when the system has not told us to use the daily bus.
+    // Crossfade's own accent UI publishes to the bus *before* calling here, so
+    // changing it in this app still takes effect.
+    if (!have_color && !bus_daily && !settings.accent_color.empty())
         have_color = accent_parse_hex(settings.accent_color.c_str(), base);
 
 #ifndef P100_WINDOWS
-    if (!have_color && portal_available)
+    if (!have_color && !bus_daily && portal_available)
     {
         if (read_portal_accent(base))
             have_color = true;

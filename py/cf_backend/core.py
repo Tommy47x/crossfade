@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -26,6 +27,79 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win3
 # video_id -> (resolved_at, url); avoids re-running yt-dlp for repeat plays.
 _STREAM_TTL = 7200  # googlevideo URLs are valid ~6h; probed before caching
 _stream_cache = {}
+_stream_lock = threading.Lock()
+
+# Resolved URLs are shared with the other backend processes (play, prefetch)
+# through a small on-disk cache: a URL warmed by one channel is usable by
+# another, and repeat plays across restarts skip extraction entirely.
+_STREAM_DISK_MAX = 400
+_stream_disk_loaded = False
+_stream_save_lock = threading.Lock()
+
+
+def _stream_disk_path():
+    return os.path.join(_config_dir(), 'stream_urls.json')
+
+
+def _load_stream_disk():
+    global _stream_disk_loaded
+    if _stream_disk_loaded:
+        return
+    _stream_disk_loaded = True
+    try:
+        with open(_stream_disk_path(), encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    with _stream_lock:
+        for vid, entry in data.items():
+            if not isinstance(entry, list) or len(entry) != 2:
+                continue
+            ts, url = entry
+            if (isinstance(ts, (int, float)) and isinstance(url, str) and url
+                    and now - ts < _STREAM_TTL and vid not in _stream_cache):
+                _stream_cache[vid] = (float(ts), url)
+
+
+def _stream_disk_lookup(video_id):
+    """Re-read the shared cache: another channel may have warmed this id."""
+    try:
+        with open(_stream_disk_path(), encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    entry = data.get(video_id) if isinstance(data, dict) else None
+    if not (isinstance(entry, list) and len(entry) == 2):
+        return None
+    ts, url = entry
+    if not (isinstance(ts, (int, float)) and isinstance(url, str) and url):
+        return None
+    if time.time() - ts >= _STREAM_TTL:
+        return None
+    with _stream_lock:
+        _stream_cache.setdefault(video_id, (float(ts), url))
+    return url
+
+
+def _save_stream_disk():
+    now = time.time()
+    with _stream_lock:
+        items = [(vid, entry) for vid, entry in _stream_cache.items()
+                 if now - entry[0] < _STREAM_TTL]
+    items.sort(key=lambda kv: kv[1][0], reverse=True)
+    payload = {vid: [entry[0], entry[1]] for vid, entry in items[:_STREAM_DISK_MAX]}
+    tmp = '%s.%d.tmp' % (_stream_disk_path(), os.getpid())
+    with _stream_save_lock:
+        try:
+            os.makedirs(os.path.dirname(tmp), exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, separators=(',', ':'))
+            os.replace(tmp, _stream_disk_path())
+        except OSError:
+            pass
 
 
 def ensure_config_dir(path):
@@ -117,10 +191,19 @@ def _err(msg, kind=None):
     return {'error': msg, 'kind': kind or _classify_error(msg)}
 
 
-def _thumb_url(item):
+def _thumb_url(item, size=0):
+    """Largest thumbnail URL for a ytmusicapi item.
+
+    YouTube Music only advertises 120px art for search cards, but its image
+    CDN serves the same asset at any requested width. `size` rewrites those
+    Google-hosted URLs so a hero-sized card isn't upscaled from 120px.
+    """
     thumbs = item.get('thumbnails') or item.get('thumbnail') or []
     if thumbs and isinstance(thumbs[-1], dict):
-        return thumbs[-1].get('url', '')
+        url = thumbs[-1].get('url', '')
+        if size and 'googleusercontent.com' in url:
+            url = re.sub(r'=w\d+-h\d+', '=w%d-h%d' % (size, size), url)
+        return url
     return ''
 
 
@@ -504,28 +587,241 @@ def search_albums(yt, query, limit=20):
     return out
 
 
-def search_all(yt, query, limit=20):
-    """Search songs, albums and artists in one backend round-trip.
+def _artist_name(item):
+    artists = item.get('artists') or []
+    if artists and isinstance(artists[0], dict):
+        return ', '.join(a.get('name') or '' for a in artists).strip(', ')
+    return item.get('artist') or item.get('title') or ''
 
-    The three searches are independent HTTP calls, so they run in parallel --
-    total latency becomes the slowest single call instead of the sum of four
-    (search_tracks itself issues two)."""
+
+def _top_card(item):
+    """Normalise YouTube Music's own "Top result" card for the UI.
+
+    The server resolves query intent (artist name -> artist card, album name
+    -> album card, track -> song card); this only reshapes the fields. The
+    validation/override policy lives in C++, next to the local library data.
+    """
+    kind = (item.get('resultType') or '').lower()
+    if kind not in ('song', 'video', 'album', 'artist'):
+        return None
+    artists = [a for a in (item.get('artists') or []) if isinstance(a, dict)]
+    artist_name = _artist_name(item)
+    artist_id = artists[0].get('id') or '' if artists else ''
+    title = item.get('title') or ''
+    if kind == 'artist':
+        title = artist_name or title
+    if not title:
+        return None
+    if kind in ('song', 'video'):
+        card_id = item.get('videoId') or ''
+    elif kind == 'album':
+        card_id = item.get('browseId') or ''
+    else:
+        card_id = artist_id
+    if not card_id:
+        return None
+    album_name, album_id = _album_fields(item)
+    return {
+        'kind': kind,
+        'id': card_id,
+        'title': title,
+        'artist': '' if kind == 'artist' else artist_name,
+        'artist_id': artist_id,
+        'album': album_name,
+        'album_id': album_id,
+        'year': str(item.get('year') or ''),
+        'duration': str(item.get('duration') or ''),
+        'duration_sec': _duration_sec(item),
+        'subscribers': str(item.get('subscribers') or ''),
+        # Search cards advertise 120px art; the CDN serves hero size.
+        'thumbnail_url': _thumb_url(item, size=544),
+    }
+
+
+def _suggestion_runs_text(runs):
+    return ''.join((r.get('text') or '') for r in (runs or []) if isinstance(r, dict))
+
+
+def get_search_suggestions(yt, query):
+    """Typeahead suggestions + the music items YouTube recommends for them.
+
+    The endpoint's first section is query suggestions (history entries when the
+    query repeats something the account searched before); the second is a small
+    set of songs/albums/artists. Playlists and podcasts are dropped: the
+    suggestion UI only navigates entities the app can open."""
+    try:
+        raw = yt._send_request('music/get_search_suggestions', {'input': query or ''})
+    except Exception as e:
+        return _err(f'Suggestions failed: {e}')
+
+    queries, items = [], []
+    for section in raw.get('contents') or []:
+        contents = ((section.get('searchSuggestionsSectionRenderer') or {})
+                    .get('contents')) or []
+        for entry in contents:
+            if not isinstance(entry, dict):
+                continue
+            renderer = (entry.get('searchSuggestionRenderer') or
+                        entry.get('historySuggestionRenderer'))
+            if renderer:
+                text = _suggestion_runs_text((renderer.get('suggestion') or {}).get('runs'))
+                if text:
+                    queries.append({
+                        'text': text,
+                        'history': 'historySuggestionRenderer' in entry,
+                    })
+                continue
+
+            r = entry.get('musicResponsiveListItemRenderer')
+            if not isinstance(r, dict):
+                continue
+            cols = []
+            for c in r.get('flexColumns') or []:
+                runs = (((c.get('musicResponsiveListItemFlexColumnRenderer') or {})
+                         .get('text') or {}).get('runs')) or []
+                cols.append(_suggestion_runs_text(runs))
+            title = cols[0] if cols else ''
+            meta = cols[1] if len(cols) > 1 else ''
+            extra = cols[2] if len(cols) > 2 else ''
+            parts = [p.strip() for p in meta.split('•')] if meta else []
+            kind = ''
+            if parts and parts[0].lower() in (
+                    'song', 'video', 'album', 'artist', 'playlist', 'podcast', 'episode'):
+                kind = parts[0].lower()
+                parts = parts[1:]
+            elif 'monthly audience' in meta.lower() or 'subscriber' in meta.lower():
+                kind = 'artist'
+            elif extra:
+                kind = 'song'
+            if not title or kind not in ('song', 'video', 'album', 'artist'):
+                continue
+
+            nav = r.get('navigationEndpoint') or {}
+            pid = r.get('playlistItemData') or {}
+            video_id = pid.get('videoId') or (nav.get('watchEndpoint') or {}).get('videoId') or ''
+            browse_id = (nav.get('browseEndpoint') or {}).get('browseId') or ''
+            item_id = video_id if kind in ('song', 'video') else browse_id
+            if not item_id:
+                continue
+
+            artist = ''
+            if parts:
+                artist = parts[0]
+            elif kind == 'artist':
+                artist = title
+            # "228M plays" is metadata noise in a compact dropdown.
+            cleaned = [p for p in parts if p and not re.fullmatch(r'[\d.,]+\s*[KMB]?\s*plays', p)]
+            subtitle_parts = cleaned[:1]
+            if kind in ('song', 'video') and extra:
+                subtitle_parts.append(extra)
+            elif kind in ('album', 'artist') and len(cleaned) > 1:
+                subtitle_parts.append(cleaned[1])
+            if kind == 'artist':
+                subtitle_parts = [meta] if meta else []
+            thumbs = (((r.get('thumbnail') or {}).get('musicThumbnailRenderer') or {})
+                      .get('thumbnail') or {}).get('thumbnails') or []
+            thumb = thumbs[-1].get('url', '') if thumbs and isinstance(thumbs[-1], dict) else ''
+            items.append({
+                'kind': kind,
+                'id': item_id,
+                'title': title,
+                'artist': artist,
+                'album': extra if kind in ('song', 'video') else (title if kind == 'album' else ''),
+                'subtitle': ' · '.join(p for p in subtitle_parts if p),
+                'thumbnail_url': thumb,
+            })
+
+    return {'queries': queries, 'items': items}
+
+
+def search_all(yt, query, limit=20):
+    """Fetch one search page in two parallel requests.
+
+    1. the default (unfiltered) search -- it carries YouTube Music's own
+       "Top result" card plus the album/artist/playlist/video shelves;
+    2. the song-filtered search -- the default page only devotes 5-10 slots
+       to songs because podcasts and episodes share the page.
+
+    Both run concurrently, so first paint costs the same as a single call.
+    Either request may fail without taking the whole search down."""
     if not query:
         return {'error': 'Missing query'}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fut_songs = pool.submit(search_tracks, yt, query, limit)
-        fut_albums = pool.submit(search_albums, yt, query, limit)
-        fut_artists = pool.submit(search_artists, yt, query, limit)
-        songs = fut_songs.result()
-        albums = fut_albums.result()
-        artists = fut_artists.result()
-    if isinstance(songs, dict) and isinstance(albums, dict) and isinstance(artists, dict):
-        return {'error': songs.get('error') or albums.get('error') or artists.get('error') or 'Search failed'}
-    return {
-        'songs': songs if isinstance(songs, list) else [],
-        'albums': albums if isinstance(albums, list) else [],
-        'artists': artists if isinstance(artists, list) else [],
-    }
+
+    def _run(fn):
+        try:
+            return fn() or [], None
+        except Exception as e:
+            return [], str(e)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_summary = pool.submit(_run, lambda: yt.search(query, limit=40))
+        fut_songs = pool.submit(_run, lambda: yt.search(query, filter='songs', limit=limit))
+        summary, summary_err = fut_summary.result()
+        songs, songs_err = fut_songs.result()
+
+    if not summary and not songs and (summary_err or songs_err):
+        return _err(songs_err or summary_err or 'Search failed')
+
+    top = None
+    albums, artists = [], []
+    seen_albums, seen_artists = set(), set()
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        category = item.get('category')
+        if category == 'More from YouTube':
+            continue  # the top card's related strip; the song shelf covers it
+        if category == 'Top result':
+            if top is None:
+                top = _top_card(item)
+            continue
+        result_type = (item.get('resultType') or '').lower()
+        if result_type == 'album':
+            browse_id = item.get('browseId') or ''
+            if not browse_id or browse_id in seen_albums:
+                continue
+            seen_albums.add(browse_id)
+            albums.append({
+                'browse_id': browse_id,
+                'title': item.get('title') or 'Unknown Album',
+                'artist': _artist_name(item),
+                'year': str(item.get('year') or ''),
+                'thumbnail_url': _thumb_url(item),
+                'track_count': item.get('trackCount') or 0,
+            })
+        elif result_type == 'artist':
+            name = _artist_name(item)
+            item_artists = item.get('artists') or []
+            browse_id = item.get('browseId') or ''
+            if not browse_id and item_artists and isinstance(item_artists[0], dict):
+                browse_id = item_artists[0].get('id') or ''
+            if not browse_id or not name or browse_id in seen_artists:
+                continue
+            seen_artists.add(browse_id)
+            artists.append({
+                'browse_id': browse_id,
+                'name': name,
+                'thumbnail_url': _thumb_url(item),
+                'subscribers': str(item.get('subscribers') or ''),
+            })
+
+    tracks, seen_songs = [], set()
+    extra = [i for i in summary
+             if isinstance(i, dict) and
+             (i.get('resultType') or '').lower() in ('song', 'video')]
+    for item in list(songs) + extra:
+        if not isinstance(item, dict):
+            continue
+        video_id = item.get('videoId') or item.get('id')
+        if not video_id or video_id in seen_songs or not item.get('title'):
+            continue
+        seen_songs.add(video_id)
+        try:
+            tracks.append(track_to_dict(item))
+        except Exception:
+            continue
+
+    return {'top': top, 'songs': tracks, 'albums': albums, 'artists': artists}
 
 
 def _duration_seconds(value):
@@ -1540,7 +1836,7 @@ def _url_playable(url):
                 return bool(resp.read(2048))
         except Exception:
             if attempt == 0:
-                time.sleep(0.6)
+                time.sleep(0.15)
     return False
 
 
@@ -1551,6 +1847,21 @@ _WARM_EXTRACTOR = os.environ.get('P100_WARM_EXTRACTOR') == '1'
 # module is imported lazily; any failure falls back to the subprocess path.
 _ydl_cls = None
 _ydl_tried = False
+_ydl_local = threading.local()
+
+
+def _thread_ydl(client_arg, browser, opts):
+    """Per-thread persistent YoutubeDL instance (yt-dlp caches player JS)."""
+    cache = getattr(_ydl_local, 'instances', None)
+    if cache is None:
+        cache = {}
+        _ydl_local.instances = cache
+    key = (client_arg, browser)
+    ydl = cache.get(key)
+    if ydl is None:
+        ydl = _ydl_cls(opts)
+        cache[key] = ydl
+    return ydl
 
 
 def _in_process_extract(video_id, client_arg, browser):
@@ -1578,10 +1889,19 @@ def _in_process_extract(video_id, client_arg, browser):
         # yt-dlp expects (browser, profile, keyring, container); a bare string
         # is unpacked character-by-character ("firefox" -> 7 args).
         opts['cookiesfrombrowser'] = (browser,)
+    # The primary client instance is kept per thread: yt-dlp caches the player
+    # JS and its signature solver on the instance, which is worth ~1 s per
+    # subsequent resolve. Fallback clients stay ephemeral (they are rare and
+    # each instance carries its own player-JS cache).
+    persistent = client_arg in (None, 'web_music', 'visionos')
     try:
-        with _ydl_cls(opts) as ydl:
+        ydl = _thread_ydl(client_arg, browser, opts) if persistent else _ydl_cls(opts)
+        try:
             info = ydl.extract_info(
                 f'https://www.youtube.com/watch?v={video_id}', download=False)
+        finally:
+            if not persistent:
+                ydl.close()
     except Exception as e:
         return None, str(e)
     if not info:
@@ -1621,7 +1941,11 @@ def _extract_stream_url(video_id, client_arg, browser):
         attempts.append(cmd[:3] + ["--cookies-from-browser", browser] + cmd[3:])
     for attempt in attempts:
         try:
-            url = subprocess.check_output(attempt, text=True, creationflags=_NO_WINDOW).strip()
+            # Bounded: this runs on the single command thread, so a child that
+            # hangs (cookie/keyring prompt, stuck network) would wedge every
+            # later command long after the C++ side stopped waiting.
+            url = subprocess.check_output(attempt, text=True, timeout=30,
+                                          creationflags=_NO_WINDOW).strip()
             if url:
                 return url, None
         except Exception as e:
@@ -1649,32 +1973,43 @@ def get_stream_url(video_id, fresh=False):
     # plays (and the player's prefetch) instead of re-running extraction.
     # `fresh` bypasses the cache after a player-side load failure.
     if fresh:
-        _stream_cache.pop(video_id, None)
-    cached = _stream_cache.get(video_id)
-    if not fresh and cached and time.time() - cached[0] < _STREAM_TTL:
-        return {'url': cached[1]}
+        with _stream_lock:
+            _stream_cache.pop(video_id, None)
+    else:
+        _load_stream_disk()
+        with _stream_lock:
+            cached = _stream_cache.get(video_id)
+        if cached and time.time() - cached[0] < _STREAM_TTL:
+            return {'url': cached[1]}
+        # Another backend channel may have resolved this id after we loaded.
+        url = _stream_disk_lookup(video_id)
+        if url:
+            return {'url': url}
 
     browser = os.environ.get('P100_BROWSER')
     last_error = "yt-dlp returned no URL"
     last_url = None
     # Warm client first: the one that last produced a playable URL this
-    # session. yt-dlp's default order can land on clients whose URLs pass
-    # extraction but 403 at fetch, so reusing a known-good client skips the
-    # dice roll entirely.
+    # session. After that: `visionos` and `web_music` are the profiles whose
+    # URLs reliably survive both the probe and mpv (measured 1.4-2.1 s vs
+    # ~3 s for the default order, whose URL is usually rejected at fetch).
     global _warm_client
     client_args = []
     if _warm_client:
         client_args.append(_warm_client)
-    client_args += [c for c in (None,) + _PLAYER_CLIENT_FALLBACKS
-                    if c != _warm_client]
+    for c in ('visionos', 'web_music', None) + _PLAYER_CLIENT_FALLBACKS:
+        if c not in client_args:
+            client_args.append(c)
     for client_arg in client_args:
         url, err = _extract_stream_url(video_id, client_arg, browser)
         if not url:
             last_error = err
             continue
         if _url_playable(url):
-            _stream_cache[video_id] = (time.time(), url)
+            with _stream_lock:
+                _stream_cache[video_id] = (time.time(), url)
             _warm_client = _client_from_url(url) or client_arg
+            _save_stream_disk()
             return {'url': url}
         last_url = url
         last_error = ("resolved URL rejected at fetch "
@@ -1685,6 +2020,44 @@ def get_stream_url(video_id, fresh=False):
     if last_url:
         return {'url': last_url}
     return {'error': last_error}
+
+
+_prefetch_pool = None
+_prefetch_pool_lock = threading.Lock()
+
+
+def _get_prefetch_pool():
+    """Shared pool so its threads (and their warm YoutubeDL instances) live
+    across prefetch commands instead of being rebuilt per batch."""
+    global _prefetch_pool
+    with _prefetch_pool_lock:
+        if _prefetch_pool is None:
+            _prefetch_pool = ThreadPoolExecutor(max_workers=4,
+                                                thread_name_prefix='cf-prefetch')
+        return _prefetch_pool
+
+
+def prefetch_stream_urls(video_ids):
+    """Resolve several ids at once (speculative prefetch).
+
+    The command pipe answers one command at a time, so the parallelism has to
+    live here: four worker threads, each with its own persistent YoutubeDL
+    instance, turn a 10-row prefetch from ~30 s into a few seconds -- and the
+    first rows are ready in under three."""
+    ids = [v for v in video_ids if re.fullmatch(r'[A-Za-z0-9_-]{11}', v or '')]
+    if not ids:
+        return {'urls': []}
+
+    def one(vid):
+        try:
+            result = get_stream_url(vid)
+        except Exception:
+            return None
+        url = result.get('url') if isinstance(result, dict) else None
+        return {'id': vid, 'url': url} if url else None
+
+    rows = [r for r in _get_prefetch_pool().map(one, ids) if r]
+    return {'urls': rows}
 
 
 # Repeat/back-navigation searches hit YTM every time; a small TTL cache makes
@@ -1722,6 +2095,222 @@ def _json_arg(arg):
     return obj if isinstance(obj, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Studio: waveform + beat analysis
+#
+# ffmpeg decodes the file to mono float PCM; the waveform is a multi-resolution
+# peak pyramid (so zooming never re-decodes) and beats come from a dependency-
+# free spectral-flux-style onset detector + tempo autocorrelation. Results are
+# written as a compact text file (see fetch_studio_analysis in ytdlp.cpp) so the
+# C++ side needs no JSON array parser.
+# ---------------------------------------------------------------------------
+
+_STUDIO_SR = 11025
+
+
+def _read_mono_pcm(path):
+    ffmpeg = os.environ.get('P100_FFMPEG') or 'ffmpeg'
+    cmd = [ffmpeg, '-v', 'error', '-i', path, '-t', '1800',
+           '-f', 'f32le', '-ac', '1', '-ar', str(_STUDIO_SR), '-']
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=180, creationflags=_NO_WINDOW)
+    except FileNotFoundError:
+        return None, 'ffmpeg not found (install ffmpeg for waveform and beat analysis)'
+    except Exception as e:
+        return None, 'ffmpeg failed: ' + str(e)
+    if proc.returncode != 0 or not proc.stdout:
+        msg = (proc.stderr or b'').decode('utf-8', 'replace').strip()
+        return None, 'Could not decode audio' + (': ' + msg if msg else '')
+    raw = proc.stdout
+    raw = raw[:len(raw) - (len(raw) % 4)]
+    from array import array
+    samples = array('f')
+    samples.frombytes(raw)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    return samples, None
+
+
+def _wave_pyramid(samples, levels):
+    n = len(samples)
+    out = []
+    for target in levels:
+        buckets = min(target, n) if n else 0
+        if buckets <= 0:
+            out.append((0, [], []))
+            continue
+        step = n / float(buckets)
+        mins, maxs = [], []
+        for b in range(buckets):
+            a = int(b * step)
+            c = int((b + 1) * step)
+            if c <= a:
+                c = min(n, a + 1)
+            chunk = samples[a:c]
+            if chunk:
+                mins.append(min(chunk))
+                maxs.append(max(chunk))
+            else:
+                mins.append(0.0)
+                maxs.append(0.0)
+        out.append((buckets, mins, maxs))
+    return out
+
+
+def _detect_beats(samples, sample_rate):
+    n = len(samples)
+    hop = 256
+    frames = n // hop
+    if frames < 8:
+        return 0.0, 0.0, [], []
+
+    energy = [0.0] * frames
+    for i in range(frames):
+        a = i * hop
+        s = 0.0
+        for v in samples[a:a + hop]:
+            s += v * v
+        energy[i] = s
+
+    onset = [0.0] * frames
+    for i in range(1, frames):
+        d = energy[i] - energy[i - 1]
+        onset[i] = d if d > 0.0 else 0.0
+
+    win = max(3, int(0.5 * sample_rate / hop))
+    peaks = []
+    last_t = -999.0
+    for i in range(1, frames - 1):
+        lo = max(0, i - win)
+        hi = min(frames, i + win + 1)
+        m = sum(onset[lo:hi]) / float(max(1, hi - lo))
+        if onset[i] > m * 1.4 and onset[i] >= onset[i - 1] and onset[i] >= onset[i + 1]:
+            t = i * hop / float(sample_rate)
+            if t - last_t >= 0.12:
+                peaks.append(t)
+                last_t = t
+
+    if len(peaks) < 4:
+        return 0.0, 0.0, peaks, []
+
+    min_lag = max(1, int(0.30 * sample_rate / hop))
+    max_lag = max(min_lag + 1, int(1.00 * sample_rate / hop))
+    best_lag, best_score = 0, 0.0
+    for lag in range(min_lag, max_lag + 1):
+        s = 0.0
+        for i in range(lag, frames):
+            s += onset[i] * onset[i - lag]
+        if s > best_score:
+            best_score, best_lag = s, lag
+    if best_lag <= 0:
+        return 0.0, 0.0, peaks, []
+
+    # Autocorrelation favours the half-tempo (a click every beat also lines up
+    # every other beat). If the octave-up lag correlates strongly too, prefer
+    # it so the grid is twice as fine.
+    if best_lag > 2:
+        lo = best_lag // 2
+        hi = best_lag - lo
+        best_half, best_half_score = 0, 0.0
+        for half in ({lo, hi}):
+            if half <= 0:
+                continue
+            sh = 0.0
+            for i in range(half, frames):
+                sh += onset[i] * onset[i - half]
+            if sh > best_half_score:
+                best_half, best_half_score = half, sh
+        if best_half and best_half_score >= best_score * 0.55:
+            best_lag, best_score = best_half, best_half_score
+
+    period = best_lag * hop / float(sample_rate)
+    bpm = 60.0 / period
+    while bpm < 60.0:
+        bpm *= 2.0
+        period /= 2.0
+    while bpm > 200.0:
+        bpm /= 2.0
+        period *= 2.0
+    total = sum(o * o for o in onset) + 1e-9
+    confidence = max(0.0, min(1.0, best_score / total))
+
+    duration = n / float(sample_rate)
+    steps = 24
+    best_phase, best_phase_score = 0.0, -1.0
+    for k in range(steps):
+        phase = period * k / float(steps)
+        s = 0.0
+        t = phase
+        while t < duration:
+            fi = int(t * sample_rate / hop)
+            if 0 <= fi < frames:
+                s += onset[fi]
+            t += period
+        if s > best_phase_score:
+            best_phase_score, best_phase = s, phase
+
+    beats = []
+    t = best_phase
+    while t < duration:
+        beats.append(round(t, 3))
+        t += period
+    return bpm, confidence, beats, beats[::4]
+
+
+def _write_wave_cache(path, duration, bpm, confidence, beats, downbeats, pyramid):
+    tmp = path + '.tmp'
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('CFWAVE 1\n')
+            f.write('duration %.6f\n' % duration)
+            f.write('bpm %.4f\n' % bpm)
+            f.write('confidence %.4f\n' % confidence)
+            f.write('beats ' + ','.join('%.3f' % x for x in beats) + '\n')
+            f.write('downbeats ' + ','.join('%.3f' % x for x in downbeats) + '\n')
+            for buckets, mins, maxs in pyramid:
+                f.write('wave %d\n' % buckets)
+                for i in range(buckets):
+                    f.write('%.5f,%.5f\n' % (mins[i], maxs[i]))
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def analyze_audio(payload):
+    payload = payload or {}
+    path = payload.get('path') or ''
+    cache = payload.get('cache') or ''
+    if not path or not cache:
+        return _err('Missing path/cache', kind='backend')
+    if not os.path.isfile(path):
+        return _err('Audio file not found', kind='not_found')
+    if os.path.isfile(cache) and os.path.getsize(cache) > 0:
+        return {'ok': True, 'cache': cache, 'cached': True}
+
+    samples, err = _read_mono_pcm(path)
+    if err:
+        return _err(err, kind='backend')
+    n = len(samples)
+    if n < 2048:
+        return _err('Audio file is too short to analyse', kind='backend')
+
+    duration = n / float(_STUDIO_SR)
+    pyramid = _wave_pyramid(samples, (64, 256, 1024, 4096, 16384))
+    bpm, confidence, beats, downbeats = _detect_beats(samples, _STUDIO_SR)
+    if not _write_wave_cache(cache, duration, bpm, confidence, beats, downbeats,
+                             pyramid):
+        return _err('Could not write the analysis cache', kind='backend')
+    return {'ok': True, 'cache': cache, 'duration': duration, 'bpm': bpm,
+            'confidence': confidence, 'beats': len(beats)}
 
 
 def run_command_loop(yt, stdin=None, stdout=None):
@@ -1733,6 +2322,16 @@ def run_command_loop(yt, stdin=None, stdout=None):
     """
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
+    # The C++ side speaks UTF-8. Reconfigure our own pipes as well, so a
+    # backend started without PYTHONIOENCODING (manual run, unusual locale)
+    # still decodes queries and encodes titles correctly.
+    for stream in (stdin, stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
     for line in stdin:
         line = line.strip()
         if not line:
@@ -1753,8 +2352,13 @@ def run_command_loop(yt, stdin=None, stdout=None):
             elif cmd == 'search':
                 result = (_cached_search(arg, lambda: search_tracks(yt, arg), 'search')
                           if arg else {'error': 'Missing query'})
+            elif cmd == 'suggest':
+                result = get_search_suggestions(yt, arg or '')
             elif cmd == 'search_all':
                 result = (_cached_search(arg, lambda: search_all(yt, arg), 'search_all')
+                          if arg else {'error': 'Missing query'})
+            elif cmd == 'album_search':
+                result = (_cached_search(arg, lambda: search_albums(yt, arg), 'album_search')
                           if arg else {'error': 'Missing query'})
             elif cmd == 'radio':
                 result = get_radio_tracks(yt, arg) if arg else {'error': 'Missing video_id'}
@@ -1780,10 +2384,14 @@ def run_command_loop(yt, stdin=None, stdout=None):
                           if arg else {'error': 'Missing query'})
             elif cmd == 'play':
                 result = get_stream_url(arg) if arg else {'error': 'Missing video_id'}
+            elif cmd == 'prefetch':
+                result = prefetch_stream_urls((arg or '').split())
             elif cmd == 'play_fresh':
                 result = get_stream_url(arg, fresh=True) if arg else {'error': 'Missing video_id'}
             elif cmd == 'lyrics':
                 result = get_lyrics(yt, arg) if arg else {'error': 'Missing video_id'}
+            elif cmd == 'analyze':
+                result = analyze_audio(_json_arg(arg))
             elif cmd == 'meta':
                 result = get_track_meta(yt, arg) if arg else {'error': 'Missing video_id'}
             elif cmd == 'library_playlists':

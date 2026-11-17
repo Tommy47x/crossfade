@@ -324,6 +324,24 @@ static void draw_recent_searches(AppState &state)
     }
 }
 
+// The two-request search page carries only a few album/artist rows (YouTube
+// spends the rest of the page on podcasts and playlists). Opening one of
+// those chips tops that shelf up once per query with a filtered fetch.
+static void ensure_search_category(AppState &state, int filter)
+{
+    if ((filter != 1 && filter != 2) || state.search_buffer[0] == '\0')
+        return;
+    const int search_id = state.search_id.load();
+    std::atomic<int> &fetched = filter == 1 ? state.search_albums_fetched_id
+                                            : state.search_artists_fetched_id;
+    if (fetched.load() == search_id)
+        return;
+    fetched.store(search_id);
+    state.search_category_dirty.store(filter);
+    state.search_loading.store(true);
+    state.repaint_requested = true;
+}
+
 static void draw_search_chips(AppState &state)
 {
     const UiMetrics &m = ui_m();
@@ -336,7 +354,10 @@ static void draw_search_chips(AppState &state)
             ImGui::SameLine(0.0f, gap);
         ImGui::PushID(i);
         if (search_chip(labels[i], state.search_filter == i, width))
+        {
             state.search_filter = i;
+            ensure_search_category(state, i);
+        }
         ImGui::PopID();
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_3));
@@ -591,6 +612,120 @@ static bool draw_list_hero(AppState &state, const std::vector<Track> &tracks,
     return false;
 }
 
+// Search "Top result": the same hero band Radio / Liked / Downloads / Podcasts
+// use, so the search page reads like every other page. The card itself comes
+// from YouTube's intent match, validated by src/app/search_top.cpp.
+static void draw_search_hero(AppState &state, const std::vector<Track> &tracks,
+                             int result_count, const ListPageAnim &anim)
+{
+    auto top = std::atomic_load(&state.search_top);
+    if (!top || top->kind == TopKind::None)
+        return;
+
+    const char *kind = top->kind == TopKind::Artist ? "ARTIST"
+                       : top->kind == TopKind::Album ? "ALBUM"
+                       : (top->video ? "VIDEO" : "SONG");
+    const UiIcon fallback = top->kind == TopKind::Artist ? UiIcon::Artist
+                            : top->kind == TopKind::Album ? UiIcon::Album
+                                                          : UiIcon::Play;
+
+    std::string subtitle;
+    if (top->kind == TopKind::Artist)
+    {
+        subtitle = top->subscribers.empty() ? std::string("Artist")
+                                            : top->subscribers + " monthly listeners";
+    }
+    else if (!top->artist.empty() && !top->album.empty() &&
+             top->kind == TopKind::Song)
+        subtitle = top->artist + "  \xC2\xB7  " + top->album;
+    else
+        subtitle = top->artist.empty() ? top->title : top->artist;
+
+    std::vector<UiHeroChip> chips;
+    chips.push_back({kind, true});
+    if (!top->duration.empty())
+        chips.push_back({top->duration, false});
+    else if (!top->year.empty())
+        chips.push_back({top->year, false});
+    if (top->kind == TopKind::Album && top->track_count > 0)
+        chips.push_back({std::to_string(top->track_count) +
+                             (top->track_count == 1 ? " TRACK" : " TRACKS"),
+                         false});
+    if (top->kind == TopKind::Artist && !top->subscribers.empty())
+        chips.push_back({top->subscribers + " LISTENERS", false});
+    if (result_count > 0)
+        chips.push_back({std::to_string(result_count) +
+                             (result_count == 1 ? " RESULT" : " RESULTS"),
+                         false});
+
+    std::vector<UiHeroAction> actions;
+    int play_index = -1;
+    int open_index = -1;
+    int artist_index = -1;
+    if (top->kind == TopKind::Song)
+    {
+        play_index = (int)actions.size();
+        actions.push_back({"Play", UiIcon::Play, true, !top->id.empty(), "Play"});
+    }
+    else if (top->kind == TopKind::Album)
+    {
+        open_index = (int)actions.size();
+        actions.push_back({"Open album", UiIcon::Album, true, !top->id.empty(), "Album"});
+    }
+    else
+    {
+        open_index = (int)actions.size();
+        actions.push_back({"Open artist", UiIcon::Artist, true, !top->id.empty(), "Artist"});
+    }
+    if (top->kind != TopKind::Artist && !top->artist_id.empty())
+    {
+        artist_index = (int)actions.size();
+        actions.push_back({"View artist", UiIcon::Artist, false, true, "Artist"});
+    }
+
+    const int clicked = ui_hero("TOP RESULT", top->title, subtitle, top->thumbnail_url,
+                                fallback, "search_top", chips, actions, anim, false,
+                                state.settings.hero_backdrop,
+                                state.settings.hero_backdrop_strength);
+    if (clicked < 0)
+        return;
+
+    if (clicked == play_index)
+    {
+        Track track;
+        track.id = top->id;
+        track.title = top->title;
+        track.artist = top->artist;
+        track.artist_id = top->artist_id;
+        track.album = top->album;
+        track.album_id = top->album_id;
+        track.thumbnail_url = top->thumbnail_url;
+        track.duration_sec = top->duration_sec;
+        int index = -1;
+        for (size_t i = 0; i < tracks.size(); ++i)
+        {
+            if (tracks[i].id != top->id)
+                continue;
+            track = tracks[i]; // play the list row: full metadata + neighbours
+            index = (int)i;
+            break;
+        }
+        ui_play_track(state, track, index);
+    }
+    else if (clicked == open_index && top->kind == TopKind::Album)
+    {
+        open_album_view(state, top->id);
+    }
+    else if (clicked == open_index && top->kind == TopKind::Artist)
+    {
+        open_artist_view(state, top->id, top->title);
+    }
+    else if (clicked == artist_index && !top->artist_id.empty())
+    {
+        open_artist_view(state, top->artist_id, top->artist);
+    }
+}
+
 static void draw_list_page(AppState &state, const AppLayout &layout, float width)
 {
     const UiMetrics &m = ui_m();
@@ -729,7 +864,16 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
 
     bool clear_history = false;
     static const std::vector<Track> k_empty_tracks;
-    if (hero_tab)
+    // Search owns a hero band too: "Top result" stays pinned above the chips
+    // on every search tab so switching Songs/Albums/Artists doesn't shift the
+    // page underneath the user.
+    const bool search_top_visible =
+        home_search && std::atomic_load(&state.search_top) != nullptr;
+    if (search_top_visible)
+    {
+        draw_search_hero(state, tracks ? *tracks : k_empty_tracks, count, anim);
+    }
+    else if (hero_tab)
     {
         // The hero band carries title, counts and actions; no plain header.
         clear_history = draw_list_hero(state, tracks ? *tracks : k_empty_tracks,
@@ -1304,6 +1448,11 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         s_fade_tab = tab_index;
     else if (tab_index != s_fade_tab)
     {
+        // Leaving Studio flushes any pending songwriting edits immediately
+        // instead of waiting for the debounce (the tab may not be reopened).
+        if (s_fade_tab == (int)Tab::Studio && state.studio_project_loaded &&
+            state.studio_project_dirty)
+            save_song_project(state.studio_project);
         s_fade_tab = tab_index;
         ui_anim_reset_list_reveals();
         ui_bump_page_epoch();
@@ -1349,7 +1498,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                               state.current_tab == Tab::Stats ||
                               state.current_tab == Tab::Album ||
                               state.current_tab == Tab::Artist ||
-                              state.current_tab == Tab::YouTube;
+                              state.current_tab == Tab::YouTube ||
+                              state.current_tab == Tab::Studio;
 
     // Divider between the list and a docked lyrics panel: drag to resize.
     // The new width is persisted through settings.json on release.
@@ -1393,7 +1543,10 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         if (state.current_tab == Tab::Album)
             panel_key += "_" + state.album_browse_id;
         else if (state.current_tab == Tab::Artist)
+        {
+            std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
             panel_key += "_" + state.artist_browse_id;
+        }
         ImGui::PushID(panel_key.c_str());
         const bool scroll_self = state.current_tab == Tab::Settings ||
                                  state.current_tab == Tab::Queue ||
@@ -1402,7 +1555,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                                  state.current_tab == Tab::Artists ||
                                  state.current_tab == Tab::Album ||
                                  state.current_tab == Tab::Artist ||
-                                 state.current_tab == Tab::YouTube;
+                                 state.current_tab == Tab::YouTube ||
+                                 state.current_tab == Tab::Studio;
         ImGui::BeginChild("PageContent", ImVec2(list_w, layout.body_size.y),
                           ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
@@ -1433,6 +1587,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
             draw_stats_panel(state);
         else if (state.current_tab == Tab::YouTube)
             draw_youtube_panel(state);
+        else if (state.current_tab == Tab::Studio)
+            draw_studio_panel(state, player);
 
         ImGui::EndChild();
         ImGui::PopID();

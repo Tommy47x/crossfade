@@ -85,6 +85,40 @@ int main()
     }
 
     {
+        // A host "source rebuild" (the host starting a track) must not drop
+        // guest requests. Collecting the from_party items and re-inserting
+        // them into a fresh host list preserves their round-robin order and
+        // keeps them ahead of the host tracks.
+        std::vector<Track> q;
+        Track pl1 = make("pl1", "");
+        pl1.from_queue_source = true;
+        q.push_back(pl1);
+        party_queue::insert_fair(q, make("a1", "a"));
+        party_queue::insert_fair(q, make("b1", "b"));
+        party_queue::insert_fair(q, make("a2", "a"));
+
+        std::vector<Track> guests;
+        for (const Track &t : q)
+            if (t.from_party)
+                guests.push_back(t);
+
+        std::vector<Track> rebuilt;
+        Track n1 = make("n1", "");
+        n1.from_queue_source = true;
+        Track n2 = make("n2", "");
+        n2.from_queue_source = true;
+        rebuilt.push_back(n1);
+        rebuilt.push_back(n2);
+        for (const Track &g : guests)
+            party_queue::insert_fair(rebuilt, g);
+
+        check(ids(rebuilt) == "a1,b1,a2,n1,n2", "guests survive a source rebuild");
+        check(rebuilt[0].party_round == 0 && rebuilt[1].party_round == 0 &&
+                  rebuilt[2].party_round == 1,
+              "round-robin order survives a source rebuild");
+    }
+
+    {
         std::vector<Track> q;
         q.push_back(make("pin", ""));
         Track pl1 = make("pl1", "");

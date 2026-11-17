@@ -20,6 +20,7 @@
 #include <csignal>
 #ifndef P100_WINDOWS
 #include <unistd.h>
+#include <signal.h>
 #endif
 #include <filesystem>
 #include <chrono>
@@ -32,6 +33,7 @@
 #include "paths.h"
 #include "ytdlp.h"
 #include "mpvplayer.h"
+#include "local_audio.h"
 #include "crossfade.h"
 #include "ui.h"
 #include "ui_backdrop.h"
@@ -81,6 +83,14 @@ std::mutex g_data_mutex;
 // SIGTERM/SIGINT request a clean shutdown (save session, stop workers, tear
 // down GL) instead of leaving the process to be killed mid-write.
 static volatile std::sig_atomic_t g_quit_requested = 0;
+// SIGUSR1 asks the main loop to re-read the shared accent bus immediately.
+// The settings app sends it after publishing a new colour; only a flag is
+// touched here (no allocation or SDL/ImGui calls in a signal handler).
+static volatile std::sig_atomic_t g_accent_reload = 0;
+static void handle_accent_signal(int)
+{
+    g_accent_reload = 1;
+}
 // Single-instance commands delivered by the warm-start accept thread. Main
 // loop values: 0 none, 1 show, 2 hide, 3 toggle, 4 quit.
 static std::atomic<int> g_warm_command{0};
@@ -412,6 +422,7 @@ static const char *tab_name(Tab t)
     case Tab::YouTube: return "YouTube";
     case Tab::Smart: return "Smart";
     case Tab::Party: return "Party";
+    case Tab::Studio: return "Studio";
     }
     return "?";
 }
@@ -457,6 +468,19 @@ static std::string app_context_summary()
         << " ui_scale=" << st.ui_scale << "\n";
     if (g_state.backend_status)
         out << "backend_error: " << g_state.backend_status.message << "\n";
+    if (party_running())
+    {
+        const PartyStatus ps = party_status();
+        out << "party: reach=" << (ps.public_reach ? "public" : "lan")
+            << " tunnel=" << (int)ps.tunnel_state << " guests=" << ps.guests;
+        if (!ps.url.empty())
+        {
+            // Log the origin/prefix only: never the join token.
+            const size_t join = ps.url.find("/j/");
+            out << " url=" << (join == std::string::npos ? ps.url : ps.url.substr(0, join));
+        }
+        out << "\n";
+    }
     return out.str();
 }
 
@@ -857,6 +881,15 @@ int app_run(int argc, char **argv)
 #ifndef P100_WINDOWS
     std::signal(SIGTERM, handle_quit_signal);
     std::signal(SIGINT, handle_quit_signal);
+    // No SA_RESTART: the signal must interrupt SDL_WaitEventTimeout() so the
+    // recolour lands on the next iteration instead of after the idle tick.
+    {
+        struct sigaction sa{};
+        sa.sa_handler = handle_accent_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGUSR1, &sa, nullptr);
+    }
 #endif
 
     // ---- Event callback ----
@@ -910,12 +943,33 @@ int app_run(int argc, char **argv)
         DLOG("warm start: shown at %lld", DNOW());
         g_window_hidden = false;
         defer_play = false;
-        if (warm_keep == 2 && backend_boot_state.load(std::memory_order_acquire) == 0)
+
+        const int boot_state = backend_boot_state.load(std::memory_order_acquire);
+        const bool boot_pending = boot_state == 0 && backend_boot_thread.joinable();
+        // Bring up a backend that was parked on purpose (UI-only mode) or one
+        // that failed to boot. An autostart launched at login can run before
+        // the network is up, and the backend boot (OAuth token refresh, DNS)
+        // could fail then; previously nothing retried it, so the session sat
+        // on "backend not running" until the app was restarted.
+        const bool want_start = boot_state < 0 || (warm_keep == 2 && !boot_pending) ||
+                                (!boot_pending && !backend_running());
+        if (want_start)
         {
             set_backend_deferred(false);
-            start_backend_async(false);
+            start_backend_async(warm_keep == 1);
+            backend_boot_reported = false;
+            g_state.home_failed = false;
             g_state.home_refreshing = true;
-            tasks::spawn("recommendations", []() { load_recommendations(false); });
+            tasks::spawn("recommendations", []() { load_recommendations(false, true); });
+        }
+        else if (!boot_pending && g_state.home_failed && !g_state.home_refreshing)
+        {
+            // The backend is healthy but the first feed request happened
+            // before the network came up. Retry as soon as the user actually
+            // looks at the window instead of leaving a stale error on Home.
+            g_state.home_failed = false;
+            g_state.home_refreshing = true;
+            tasks::spawn("recommendations", []() { load_recommendations(false, true); });
         }
         g_state.repaint_requested = true;
     };
@@ -980,6 +1034,17 @@ int app_run(int argc, char **argv)
                 g_state.repaint_requested = true;
             }
         }
+        // One-time repair for downloaded sidecars written from the old
+        // truncated yt-dlp capture (title only, no artist/cover). Local data
+        // is applied even offline; backend lookups wait for the backend.
+        static bool metadata_repair_started = false;
+        if (!metadata_repair_started &&
+            backend_boot_state.load(std::memory_order_acquire) != 0)
+        {
+            metadata_repair_started = true;
+            start_download_metadata_repair(g_state,
+                                           backend_running() && !power::low_power());
+        }
 #ifndef P100_WINDOWS
         while (g_main_context_iteration(g_main_context_default(), FALSE))
         {
@@ -1011,14 +1076,23 @@ int app_run(int argc, char **argv)
         // (|| would short-circuit and skip the second one's reset).
         auto now = std::chrono::steady_clock::now();
 
-        // Roll the accent colour over at local midnight without a restart.
+        // Roll the accent colour over at local midnight without a restart,
+        // and reload immediately when the settings app signals SIGUSR1. The
+        // 60 s check stays as the fallback: nobody signals the midnight roll.
         static time_t last_accent_check = 0;
         time_t wall_now = time(NULL);
-        if (wall_now - last_accent_check >= 60)
+        if (g_accent_reload || wall_now - last_accent_check >= 60)
         {
+            const bool signalled = g_accent_reload != 0;
+            g_accent_reload = 0;
             last_accent_check = wall_now;
             update_accent(g_state.settings);
             ui_theme_refresh_accent();
+            if (signalled)
+            {
+                g_state.repaint_requested = true;
+                DLOG("accent reloaded (SIGUSR1)");
+            }
         }
 
         bool lyrics_animating = is_lyrics_animating();
@@ -1193,6 +1267,11 @@ int app_run(int argc, char **argv)
                     else if (shift && key == SDLK_SLASH)
                     {
                         g_state.show_shortcuts = !g_state.show_shortcuts;
+                        g_state.repaint_requested = true;
+                    }
+                    else if (key == SDLK_F2 && !ctrl && !shift)
+                    {
+                        g_state.show_backend_debug = !g_state.show_backend_debug;
                         g_state.repaint_requested = true;
                     }
                     else if (ctrl && key == SDLK_COMMA)
@@ -1402,6 +1481,65 @@ int app_run(int argc, char **argv)
                 g_state.repaint_requested = true;
             }
 
+            // The background metadata repair published what it recovered from
+            // the play log / likes / history / backend. Fold it into play_log
+            // here: workers never touch these UI-owned vectors.
+            if (g_state.metadata_repair_pending.exchange(false))
+            {
+                auto recovered = std::atomic_load(&g_state.repaired_meta);
+                if (recovered)
+                {
+                    int fixed = 0;
+                    for (PlayEvent &ev : g_state.play_log)
+                    {
+                        auto it = recovered->find(ev.id);
+                        if (it == recovered->end())
+                            continue;
+                        const Track &m = it->second;
+                        bool changed = false;
+                        if (!m.artist.empty() && m.artist != "Unknown" &&
+                            m.artist != "Unknown Artist" &&
+                            (ev.artist.empty() || ev.artist == "Unknown" ||
+                             ev.artist == "Unknown Artist"))
+                        {
+                            ev.artist = m.artist;
+                            changed = true;
+                        }
+                        if (!m.title.empty() &&
+                            (ev.title.empty() || ev.title == "Unknown Track"))
+                        {
+                            ev.title = m.title;
+                            changed = true;
+                        }
+                        if (!m.thumbnail_url.empty() && ev.thumbnail_url.empty())
+                        {
+                            ev.thumbnail_url = m.thumbnail_url;
+                            changed = true;
+                        }
+                        if (changed)
+                            ++fixed;
+                    }
+                    if (fixed > 0)
+                    {
+                        save_play_log(g_state.play_log);
+                        g_state.stats_dirty = true;
+                        if (g_state.current_tab != Tab::Stats)
+                            rebuild_stats(g_state);
+                        ui_notify(UiNotifyType::Success, "Downloaded songs repaired",
+                                  std::to_string(fixed) +
+                                      " play-history entries now have the right artist and cover.",
+                                  4.5f);
+                    }
+                    g_state.repaint_requested = true;
+                }
+            }
+
+            // Derived stats are refreshed for other pages (radio seeds, Smart
+            // lists), but never while the Stats page is open: a new play must
+            // not replay its entrance animation under the user.
+            if (g_state.stats_dirty && g_state.current_tab != Tab::Stats)
+                rebuild_stats(g_state);
+
             // Capture the source duration of the track being recorded (it
             // shows up shortly after the start event); finalize compares the
             // recorded file's duration against it.
@@ -1497,7 +1635,13 @@ int app_run(int argc, char **argv)
                         const std::string pending_title = g_state.pending_play_title;
                         const std::string pending_artist = g_state.pending_play_artist;
                         const std::string pending_thumb = g_state.pending_play_thumbnail_url;
-                        const std::uint64_t pending_gen = g_play_generation.load();
+                        // Bump the generation when we actually commit to a new
+                        // resolve. ui_play_track() does not bump it (only the
+                        // natural-advance path via begin_play_track() does), so
+                        // without this a slow non-cached resolve for a previous
+                        // selection could finish after the user clicks a new
+                        // track and play the wrong song over the right one.
+                        const std::uint64_t pending_gen = g_play_generation.fetch_add(1) + 1;
                         tasks::spawn("resolve", [pending_id, pending_url, pending_title, pending_artist,
                                       pending_thumb, fresh, pending_gen]() {
                             resolve_audio(pending_id, pending_url, pending_title,
@@ -1666,15 +1810,112 @@ int app_run(int argc, char **argv)
                 tasks::spawn("recommendations-refresh", []() { load_recommendations(true); });
             }
 
+            // Network recovery: an autostart/warm instance booted before the
+            // network was up fails its first feed request. While the window
+            // is visible, retry quietly with backoff instead of leaving a
+            // stale "no connection" error until the user hits Retry.
+            {
+                static bool s_home_retry_armed = false;
+                static std::chrono::steady_clock::time_point s_home_retry_at{};
+                const bool retryable =
+                    g_state.home_failed && !g_state.home_refreshing && !g_window_hidden &&
+                    g_state.backend_status.kind == BackendErrKind::Network;
+                const auto retry_now = std::chrono::steady_clock::now();
+                if (!retryable)
+                {
+                    s_home_retry_armed = false;
+                }
+                else if (!s_home_retry_armed)
+                {
+                    s_home_retry_armed = true;
+                    s_home_retry_at = retry_now + std::chrono::seconds(10);
+                }
+                else if (retry_now >= s_home_retry_at)
+                {
+                    s_home_retry_at = retry_now + std::chrono::seconds(30);
+                    g_state.home_failed = false;
+                    g_state.home_refreshing = true;
+                    tasks::spawn("recommendations-retry",
+                                 []() { load_recommendations(false, true); });
+                }
+            }
+
             // Search: the UI debounces and snapshots the query; we run the
             // actual fetch here on a worker and publish results atomically,
             // discarding stale responses via search_id.
-            if (g_state.search_dirty)
+            //
+            // Only one search worker runs at a time. The backend answers one
+            // command per round trip, so stacking a worker per keystroke made
+            // the query the user stopped on wait behind every abandoned one.
+            // While a search is in flight, search_dirty stays set and the
+            // newest query is dispatched the moment the worker finishes.
+            if (g_state.search_dirty && !g_state.search_worker_active.load())
             {
                 g_state.search_dirty = false;
                 std::string query = g_state.queued_search;
                 int expect_id = g_state.search_id;
-                tasks::spawn("search", [query, expect_id]() { search_all_and_update(query, expect_id); });
+                g_state.search_worker_active.store(true);
+                tasks::spawn("search", [query, expect_id]() {
+                    // Reset on scope exit so a thrown/early-returning worker
+                    // can never wedge the coalescing gate shut.
+                    struct Release
+                    {
+                        ~Release()
+                        {
+                            g_state.search_worker_active.store(false);
+                            g_state.repaint_requested = true;
+                        }
+                    } release;
+                    search_all_and_update(query, expect_id);
+                });
+            }
+
+            // Albums/Artists chips: the two-request search page only carries
+            // a few rows per category, so the first visit tops that shelf up
+            // with a filtered fetch. Deferred while the main search is still
+            // running so its publish cannot overwrite the fuller shelf.
+            {
+                const int category = g_state.search_category_dirty.load();
+                if (category != 0 && !g_state.search_loading.load() &&
+                    !g_state.search_worker_active.load())
+                {
+                    g_state.search_category_dirty.store(0);
+                    std::string query(g_state.search_buffer);
+                    int expect_id = g_state.search_id;
+                    g_state.search_loading.store(true);
+                    tasks::spawn("search-category", [query, category, expect_id]() {
+                        search_category_and_update(query, category, expect_id);
+                    });
+                }
+            }
+
+            // Typeahead: the UI debounces the query; the worker fetches query
+            // suggestions plus YouTube's recommended items for the dropdown.
+            if (g_state.search_suggest_dirty)
+            {
+                g_state.search_suggest_dirty = false;
+                std::string query = g_state.queued_search_suggest;
+                int expect_id = g_state.search_suggest_id;
+                tasks::spawn("search-suggest", [query, expect_id]() {
+                    search_suggest_and_update(query, expect_id);
+                });
+            }
+
+            // Row hover: after a short dwell on a list row, warm its stream
+            // URL so the click resolves from cache instead of a ~2 s yt-dlp
+            // extraction. One speculative resolve at a time.
+            {
+                if (!g_state.hovered_track_id.empty() &&
+                    ImGui::GetFrameCount() - g_state.hovered_track_frame > 2)
+                    g_state.hovered_track_id.clear(); // pointer left the list
+                static std::string s_hover_warmed;
+                const std::string &hovered = g_state.hovered_track_id;
+                if (!hovered.empty() && hovered != s_hover_warmed &&
+                    ImGui::GetTime() - g_state.hovered_track_since >= 0.15)
+                {
+                    s_hover_warmed = hovered;
+                    prefetch_hovered_track(hovered);
+                }
             }
             if (g_state.auth_refresh_requested)
             {
@@ -1738,6 +1979,84 @@ int app_run(int argc, char **argv)
                             load_lyrics_worker(lyrics_id, lyrics_seq);
                         });
                     }
+                }
+            }
+
+            // Studio: the in-Studio YouTube beat search has its own query and
+            // snapshot so it can never disturb the Home/search tab.
+            if (g_state.studio_search_dirty)
+            {
+                g_state.studio_search_dirty = false;
+                std::string query = g_state.studio_queued_search;
+                int expect = g_state.studio_search_seq.load();
+                g_state.studio_search_loading = true;
+                g_state.studio_search_error.clear();
+                tasks::spawn("studio-search", [query, expect]() {
+                    bool failed = false;
+                    std::vector<Track> results = fetch_search(query, &failed);
+                    if (g_state.studio_search_seq.load() != expect)
+                        return;
+                    if (failed)
+                    {
+                        BackendError err = take_backend_error();
+                        g_state.studio_search_error =
+                            err.ok() ? backend_error_user_message(err)
+                                     : "Could not search YouTube Music.";
+                    }
+                    std::atomic_store(
+                        &g_state.studio_search_results,
+                        std::make_shared<const std::vector<Track>>(std::move(results)));
+                    g_state.studio_search_loading = false;
+                    g_state.repaint_requested = true;
+                });
+            }
+
+            // Studio: waveform + beat analysis for the selected beat. A YouTube
+            // beat is downloaded first (analysis needs a local file); local
+            // tracks are already on disk.
+            if (g_state.studio_analysis_dirty)
+            {
+                g_state.studio_analysis_dirty = false;
+                if (!g_state.studio_analysis_requested_id.empty())
+                {
+                    const std::string beat_id = g_state.studio_analysis_requested_id;
+                    const std::string cache = studio_analysis_cache_path(beat_id);
+                    const int seq = g_state.studio_analysis_seq.fetch_add(1) + 1;
+                    const Track beat = g_state.studio_beat;
+                    g_state.studio_analyzing = true;
+                    g_state.studio_analysis_error.clear();
+                    tasks::spawn("studio-analyze", [beat_id, cache, seq, beat]() {
+                        std::string audio;
+                        if (is_local_track_id(beat_id))
+                            audio = beat.url;
+                        else
+                        {
+                            audio = find_cached_audio_path(beat_id);
+                            if (audio.empty())
+                                audio = get_cached_audio_path(beat_id);
+                        }
+                        StudioAnalysis analysis;
+                        const bool ok = !audio.empty() &&
+                                        fetch_studio_analysis(beat_id, audio, cache, analysis);
+                        if (g_state.studio_analysis_seq.load() != seq)
+                            return; // a newer beat superseded this one
+                        if (ok)
+                        {
+                            std::atomic_store(
+                                &g_state.studio_analysis,
+                                std::make_shared<const StudioAnalysis>(std::move(analysis)));
+                            g_state.studio_analysis_error.clear();
+                        }
+                        else
+                        {
+                            BackendError err = take_backend_error();
+                            g_state.studio_analysis_error =
+                                err.ok() ? backend_error_user_message(err)
+                                         : "Could not analyse this beat.";
+                        }
+                        g_state.studio_analyzing = false;
+                        g_state.repaint_requested = true;
+                    });
                 }
             }
 
@@ -1974,6 +2293,9 @@ int app_run(int argc, char **argv)
             draw_main_ui(g_state, *g_player);
             draw_bottom_bar(g_state, *g_player);
             draw_party_chip(g_state);
+            // Top-most interactive surface of the frame (must be submitted
+            // after the other windows): the search typeahead dropdown.
+            draw_search_suggestions_overlay(g_state);
             updater::poll();
             ui_notify_draw();
             // Draw the QR takeover after the toasts so it is a true top-most
@@ -2009,6 +2331,13 @@ int app_run(int argc, char **argv)
                 ImGui::Text("S  Toggle sidebar");
                 ImGui::Text("Q  Up Next queue");
                 ImGui::Text("P  Party mode");
+                ImGui::Text("F2 Backend debug");
+                ImGui::Spacing();
+                ImGui::TextColored(ui_c().text_muted, "Studio");
+                ImGui::Text("C                Add cue at playhead");
+                ImGui::Text("[ / ]            Set loop in / out");
+                ImGui::Text("F                Follow the playhead");
+                ImGui::Text("Ctrl+Z           Undo songwriting edit");
                 ImGui::Spacing();
                 ImGui::TextColored(ui_c().text_muted, "Navigation");
                 ImGui::Text("/ or Ctrl+F      Focus search");
@@ -2016,6 +2345,8 @@ int app_run(int argc, char **argv)
                 ImGui::Text("?                Toggle this help");
                 ImGui::End();
             }
+
+            draw_backend_debug(g_state);
 
             ImGui::Render();
             glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
@@ -2058,6 +2389,8 @@ int app_run(int argc, char **argv)
     save_play_counts(g_state.play_counts);
     save_play_log(g_state.play_log);
     save_play_queue(g_state.play_queue);
+    if (g_state.studio_project_loaded && g_state.studio_project_dirty)
+        save_song_project(g_state.studio_project);
 
     // Drop any half-recorded stream (it wasn't finished).
     discard_recording();

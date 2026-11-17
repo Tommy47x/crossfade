@@ -6,12 +6,15 @@
 #include "ytdlp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 using persist::extract_int_field;
 using persist::extract_str_field;
@@ -20,6 +23,7 @@ using jsonutil::write_track;
 
 static std::mutex g_album_cache_mutex;
 static std::mutex g_artist_cache_mutex;
+static std::mutex g_podcast_cache_mutex;
 
 std::string lyrics_dir()
 {
@@ -329,4 +333,359 @@ void prefetch_artist_cache(const std::string &browse_id)
         if (fetch_artist(browse_id, artist))
             save_artist_cache(artist);
     });
+}
+
+// ----------------------------------------------------------------------
+// Podcast show cache
+//
+// The show page used to hit the backend on every open, so an offline launch
+// (or the moment before Wi-Fi comes up) showed an empty episode list -- even
+// for episodes already downloaded. Mirroring the album/artist caches keeps
+// the header and episode list on disk.
+// ----------------------------------------------------------------------
+std::string podcast_cache_dir()
+{
+    return p100_config_path("podcast_cache");
+}
+
+std::string podcast_cache_path(const std::string &browse_id)
+{
+    return podcast_cache_dir() + "/" + sanitize_filename(browse_id) + ".json";
+}
+
+void save_podcast_cache(const PodcastDetails &details)
+{
+    const std::string browse_id = details.show.browse_id;
+    if (browse_id.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_podcast_cache_mutex);
+    std::string dir = podcast_cache_dir();
+    mkdir(dir.c_str(), 0755);
+
+    std::string path = podcast_cache_path(browse_id);
+    std::string tmp = path + ".tmp";
+    std::ofstream out(tmp);
+    if (!out)
+        return;
+    out << "{\"browse_id\":\"" << json_escape(browse_id)
+        << "\",\"title\":\"" << json_escape(details.show.title)
+        << "\",\"author\":\"" << json_escape(details.show.author)
+        << "\",\"thumbnail_url\":\"" << json_escape(details.show.thumbnail_url)
+        << "\",\"description\":\"" << json_escape(details.show.description)
+        << "\",\"episodes\":[";
+    for (size_t i = 0; i < details.episodes.size(); ++i)
+    {
+        const PodcastEpisode &e = details.episodes[i];
+        if (i != 0)
+            out << ",";
+        // video_id first: the loader walks episode objects by that key.
+        out << "{\"video_id\":\"" << json_escape(e.video_id)
+            << "\",\"title\":\"" << json_escape(e.title)
+            << "\",\"author\":\"" << json_escape(e.author)
+            << "\",\"thumbnail_url\":\"" << json_escape(e.thumbnail_url)
+            << "\",\"date\":\"" << json_escape(e.date)
+            << "\",\"description\":\"" << json_escape(e.description)
+            << "\",\"duration_sec\":" << e.duration_sec << "}";
+    }
+    out << "]}";
+    out.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+        std::filesystem::remove(tmp, ec);
+}
+
+bool load_podcast_cache(const std::string &browse_id, PodcastDetails &out)
+{
+    if (browse_id.empty())
+        return false;
+
+    std::ifstream in(podcast_cache_path(browse_id));
+    if (!in.good())
+        return false;
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    if (json.empty())
+        return false;
+
+    out = PodcastDetails{};
+    out.show.browse_id = extract_str_field(json, "browse_id");
+    if (out.show.browse_id.empty())
+        out.show.browse_id = browse_id;
+    out.show.title = extract_str_field(json, "title");
+    out.show.author = extract_str_field(json, "author");
+    out.show.thumbnail_url = extract_str_field(json, "thumbnail_url");
+    out.show.description = extract_str_field(json, "description");
+
+    const size_t eps_key = json.find("\"episodes\":");
+    if (eps_key != std::string::npos)
+    {
+        size_t pos = json.find("\"video_id\":\"", eps_key);
+        while (pos != std::string::npos)
+        {
+            const size_t next = json.find("\"video_id\":\"", pos + 1);
+            const std::string obj =
+                next == std::string::npos ? json.substr(pos) : json.substr(pos, next - pos);
+            PodcastEpisode e;
+            e.video_id = extract_str_field(obj, "video_id");
+            e.title = extract_str_field(obj, "title");
+            e.author = extract_str_field(obj, "author");
+            e.thumbnail_url = extract_str_field(obj, "thumbnail_url");
+            e.date = extract_str_field(obj, "date");
+            e.description = extract_str_field(obj, "description");
+            e.duration_sec = extract_int_field(obj, "duration_sec");
+            if (!e.video_id.empty())
+                out.episodes.push_back(std::move(e));
+            if (next == std::string::npos)
+                break;
+            pos = next;
+        }
+    }
+    return !out.show.title.empty() || !out.episodes.empty();
+}
+
+// ----------------------------------------------------------------------
+// Downloaded-track metadata repair
+//
+// Sidecars written while run_capture() truncated yt-dlp's -j JSON at 64 KB
+// carry a title but no artist/thumbnail. Rebuild them from local listening
+// data first (play log, likes, history, queue, playlists), derive missing
+// covers from the video id, and optionally ask the backend for the rest.
+// The worker never touches UI-owned vectors: it publishes an id -> Track map
+// that the main loop applies to play_log.
+// ----------------------------------------------------------------------
+namespace
+{
+std::atomic<bool> g_metadata_repair_running{false};
+std::atomic<int> g_metadata_repair_done{0};
+std::atomic<int> g_metadata_repair_total{0};
+std::atomic<int> g_metadata_repair_updated{0};
+
+bool missing_artist(const std::string &artist)
+{
+    return artist.empty() || artist == "Unknown" || artist == "Unknown Artist";
+}
+
+bool local_media_id(const std::string &id)
+{
+    return id.rfind("local:", 0) == 0;
+}
+
+void merge_meta(std::unordered_map<std::string, Track> &map, const Track &t)
+{
+    if (t.id.empty() || local_media_id(t.id))
+        return;
+    Track &m = map[t.id];
+    m.id = t.id;
+    if ((m.title.empty() || m.title == "Unknown Track") && !t.title.empty() &&
+        t.title != "Unknown Track")
+        m.title = t.title;
+    if (missing_artist(m.artist) && !missing_artist(t.artist))
+        m.artist = t.artist;
+    if (m.thumbnail_url.empty() && !t.thumbnail_url.empty())
+        m.thumbnail_url = t.thumbnail_url;
+    if (m.artist_id.empty())
+        m.artist_id = t.artist_id;
+    if (m.album.empty())
+        m.album = t.album;
+    if (m.album_id.empty())
+        m.album_id = t.album_id;
+    if (m.duration_sec == 0)
+        m.duration_sec = t.duration_sec;
+}
+
+void metadata_repair_worker(AppState *state, std::vector<PlayEvent> play_log,
+                            std::vector<Track> liked, std::vector<Track> history,
+                            std::vector<Track> queue, std::vector<Playlist> playlists,
+                            bool fetch_missing)
+{
+    std::unordered_map<std::string, Track> meta;
+    std::vector<std::string> unknown_ids;
+    for (const PlayEvent &ev : play_log)
+    {
+        Track t;
+        t.id = ev.id;
+        t.title = ev.title;
+        t.artist = ev.artist;
+        t.thumbnail_url = ev.thumbnail_url;
+        merge_meta(meta, t);
+        if (!ev.id.empty() && !local_media_id(ev.id) && missing_artist(ev.artist))
+            unknown_ids.push_back(ev.id);
+    }
+    std::sort(unknown_ids.begin(), unknown_ids.end());
+    unknown_ids.erase(std::unique(unknown_ids.begin(), unknown_ids.end()), unknown_ids.end());
+    for (const Track &t : liked)
+        merge_meta(meta, t);
+    for (const Track &t : history)
+        merge_meta(meta, t);
+    for (const Track &t : queue)
+        merge_meta(meta, t);
+    for (const Playlist &p : playlists)
+        for (const Track &t : p.tracks)
+            merge_meta(meta, t);
+
+    std::vector<Track> downloads = get_cached_tracks();
+    int done = 0;
+    const int total = (int)downloads.size() + (int)unknown_ids.size();
+    g_metadata_repair_total = total;
+    int updated = 0;
+    int failures = 0;
+    bool network = fetch_missing;
+
+    for (Track &t : downloads)
+    {
+        Track r = t;
+        auto it = meta.find(t.id);
+        if (it != meta.end())
+        {
+            const Track &m = it->second;
+            if (missing_artist(r.artist) && !missing_artist(m.artist))
+                r.artist = m.artist;
+            if ((r.title.empty() || r.title == "Unknown Track") && !m.title.empty())
+                r.title = m.title;
+            if (r.thumbnail_url.empty() && !m.thumbnail_url.empty())
+                r.thumbnail_url = m.thumbnail_url;
+            if (r.artist_id.empty())
+                r.artist_id = m.artist_id;
+            if (r.album.empty())
+                r.album = m.album;
+            if (r.album_id.empty())
+                r.album_id = m.album_id;
+            if (r.duration_sec == 0)
+                r.duration_sec = m.duration_sec;
+        }
+        if (r.thumbnail_url.empty() && !local_media_id(t.id) && !t.id.empty())
+            r.thumbnail_url = "https://img.youtube.com/vi/" + t.id + "/hqdefault.jpg";
+
+        if (network && missing_artist(r.artist) && !local_media_id(t.id) && !t.id.empty())
+        {
+            Track fetched;
+            std::string error;
+            if (fetch_track_meta(t.id, fetched, error))
+            {
+                if (!fetched.title.empty() &&
+                    (r.title.empty() || r.title == "Unknown Track"))
+                    r.title = fetched.title;
+                if (!fetched.artist.empty())
+                    r.artist = fetched.artist;
+                if (!fetched.thumbnail_url.empty())
+                    r.thumbnail_url = fetched.thumbnail_url;
+                if (fetched.duration_sec > 0 && r.duration_sec == 0)
+                    r.duration_sec = fetched.duration_sec;
+                failures = 0;
+            }
+            else if (++failures >= 3)
+            {
+                // Backend/network is unavailable. Keep the local repairs and
+                // leave the rest for the next run instead of hammering it.
+                network = false;
+            }
+        }
+
+        const bool changed = r.title != t.title || r.artist != t.artist ||
+                             r.artist_id != t.artist_id || r.album != t.album ||
+                             r.album_id != t.album_id ||
+                             r.thumbnail_url != t.thumbnail_url ||
+                             r.duration_sec != t.duration_sec;
+        if (changed)
+        {
+            const std::string path = find_cached_audio_path(t.id);
+            if (!path.empty())
+            {
+                save_cached_track_metadata(r, path);
+                ++updated;
+            }
+        }
+        meta[t.id] = r;
+        g_metadata_repair_done = ++done;
+        if (state)
+            state->repaint_requested = true;
+    }
+
+    // Play-log rows can reference songs that are no longer downloaded (or
+    // never were). Resolve those too so the Top artist card is not skewed by
+    // a handful of "Unknown" entries. No sidecar is written for them.
+    if (network)
+    {
+        for (const std::string &id : unknown_ids)
+        {
+            g_metadata_repair_done = ++done;
+            auto it = meta.find(id);
+            if (it != meta.end() && !missing_artist(it->second.artist))
+                continue;
+            Track fetched;
+            std::string error;
+            if (fetch_track_meta(id, fetched, error))
+            {
+                Track &m = meta[id];
+                m.id = id;
+                if (!fetched.title.empty())
+                    m.title = fetched.title;
+                if (!fetched.artist.empty())
+                    m.artist = fetched.artist;
+                if (!fetched.thumbnail_url.empty())
+                    m.thumbnail_url = fetched.thumbnail_url;
+                if (fetched.duration_sec > 0)
+                    m.duration_sec = fetched.duration_sec;
+                failures = 0;
+            }
+            else if (++failures >= 3)
+            {
+                network = false;
+                break;
+            }
+        }
+    }
+
+    g_metadata_repair_done = total;
+    auto result =
+        std::make_shared<const std::unordered_map<std::string, Track>>(std::move(meta));
+    if (state)
+    {
+        std::atomic_store(&state->repaired_meta, result);
+        state->metadata_repair_pending = true;
+        state->repaint_requested = true;
+    }
+    g_downloads_dirty = true;
+    g_metadata_repair_updated = updated;
+    g_metadata_repair_running = false;
+}
+} // namespace
+
+void start_download_metadata_repair(AppState &state, bool fetch_missing)
+{
+    if (g_metadata_repair_running.exchange(true))
+        return;
+    g_metadata_repair_done = 0;
+    g_metadata_repair_total = 0;
+    g_metadata_repair_updated = 0;
+
+    // Snapshot UI-owned containers on the main thread.
+    std::vector<PlayEvent> play_log = state.play_log;
+    std::vector<Track> liked = state.liked_tracks;
+    std::vector<Track> history = state.playback_history;
+    std::vector<Track> queue = state.play_queue;
+    std::vector<Playlist> playlists = state.playlists;
+    AppState *sp = &state;
+    tasks::spawn("download-metadata-repair",
+                 [sp, play_log = std::move(play_log), liked = std::move(liked),
+                  history = std::move(history), queue = std::move(queue),
+                  playlists = std::move(playlists), fetch_missing]() mutable {
+                     metadata_repair_worker(sp, std::move(play_log), std::move(liked),
+                                            std::move(history), std::move(queue),
+                                            std::move(playlists), fetch_missing);
+                 });
+}
+
+bool download_metadata_repair_running()
+{
+    return g_metadata_repair_running.load();
+}
+
+void download_metadata_repair_progress(int &done, int &total, int &updated)
+{
+    done = g_metadata_repair_done.load();
+    total = g_metadata_repair_total.load();
+    updated = g_metadata_repair_updated.load();
 }

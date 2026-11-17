@@ -93,3 +93,18 @@ private:
 // the file can't be opened or has no readable duration. Used to validate a
 // finished --stream-record before it's moved into the cache.
 double probe_audio_file_duration(const std::string &path);
+
+// Metadata for a local audio file, read with a throwaway libmpv instance.
+// Used when the user adds songs from disk. `readable` is true when the file
+// opened and reported a positive duration; title/artist/album are the file's
+// tags (empty when absent).
+struct LocalAudioMeta
+{
+    bool readable = false;
+    double duration = -1.0;
+    std::string title;
+    std::string artist;
+    std::string album;
+};
+
+bool probe_local_audio_metadata(const std::string &path, LocalAudioMeta &out);

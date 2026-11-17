@@ -5,6 +5,7 @@
 #include "party_net.h"
 #include "party_queue.h"
 #include "party_server.h"
+#include "party_tunnel.h"
 #include "party_util.h"
 #include "guest_page.h"
 #include "texture.h"
@@ -118,14 +119,23 @@ std::atomic<PartyRunState> g_state{PartyRunState::Stopped};
 PartySettings g_settings;
 std::string g_token;
 std::string g_url;
+std::string g_lan_url;
 std::string g_ip;
 std::string g_error;
+bool g_public_reach = false;
+std::string g_public_url;
+std::string g_public_host;
+std::string g_tunnel_binary;
+std::string g_tunnel_error;
+double g_tunnel_retry_at = 0.0;
+bool g_tunnel_announced = false;
 int g_port = 0;
 std::string g_accent_hex = "#6db2d0";
 uint64_t g_version = 0;
 int g_requests_added = 0;
 std::string g_last_sig;
 double g_last_build = 0.0;
+double g_last_net_check = 0.0;
 std::shared_ptr<Snapshot> g_snapshot;
 std::unordered_map<std::string, Guest> g_guests;
 std::vector<PendingRequest> g_pending;
@@ -632,6 +642,29 @@ bool party_start(const PartySettings &settings, std::string &error)
     if (g_state == PartyRunState::Running)
         party_stop();
 
+    const bool want_public = settings.public_reach();
+    std::string cloudflared;
+    if (want_public && !party_tunnel::available(cloudflared, settings.tunnel_path))
+    {
+        std::string hint;
+#ifdef P100_WINDOWS
+        hint = "winget install --id Cloudflare.cloudflared";
+#elif defined(__APPLE__)
+        hint = "brew install cloudflared";
+#else
+        hint = "your package manager (for example pacman, apt or dnf install cloudflared)";
+#endif
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = PartyRunState::Error;
+        g_error = "cloudflared is not installed, so the public link cannot start. Install "
+                  "it with " + hint +
+                  ", or download it from Cloudflare's downloads page, then try again. You "
+                  "can also use Start LAN party on the Party tab, or switch Guest access to "
+                  "\"Same Wi-Fi only\" in Settings > Party.";
+        error = g_error;
+        return false;
+    }
+
     std::string ip = settings.interface_ip;
     if (!ip.empty())
     {
@@ -677,6 +710,10 @@ bool party_start(const PartySettings &settings, std::string &error)
         return false;
     }
 
+    party_server_set_public_host("");
+    const std::string lan_url =
+        "http://" + ip + ":" + std::to_string(party_server_port()) + "/j/" + token;
+
     {
         std::lock_guard<std::mutex> lock(g_mu);
         g_settings = settings;
@@ -684,7 +721,15 @@ bool party_start(const PartySettings &settings, std::string &error)
         g_token = token;
         g_port = party_server_port();
         g_ip = ip;
-        g_url = "http://" + ip + ":" + std::to_string(g_port) + "/j/" + g_token;
+        g_lan_url = lan_url;
+        g_url = lan_url; // the public URL replaces this when the tunnel is ready
+        g_public_reach = want_public;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_binary = cloudflared;
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
         g_error.clear();
         g_state = PartyRunState::Running;
         g_guests.clear();
@@ -696,6 +741,7 @@ bool party_start(const PartySettings &settings, std::string &error)
         g_version = 1;
         g_last_sig.clear();
         g_last_prefetch.clear();
+        g_last_net_check = 0.0;
         g_meta_cache.clear();
         g_meta_lru.clear();
         g_accent_hex = accent_hex_from_ui();
@@ -720,11 +766,25 @@ bool party_start(const PartySettings &settings, std::string &error)
             publish_locked(empty, 0.0, 0.0, true, false);
         }
     }
+
+    if (want_public)
+    {
+        std::string tunnel_error;
+        if (!party_tunnel::start(ip, party_server_port(), cloudflared, tunnel_error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_tunnel_error = tunnel_error.empty() ? "The public link could not start."
+                                                  : tunnel_error;
+        }
+    }
     return true;
 }
 
 void party_stop()
 {
+    // Kill the tunnel before taking g_mu: stop() joins its reader thread, and
+    // that thread may still be delivering log lines.
+    party_tunnel::stop();
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (g_state == PartyRunState::Stopped && !party_server_running())
@@ -748,8 +808,16 @@ void party_stop()
         g_snapshot.reset();
         g_token.clear();
         g_url.clear();
+        g_lan_url.clear();
         g_ip.clear();
         g_port = 0;
+        g_public_reach = false;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_binary.clear();
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
         g_version = 0;
         g_requests_added = 0;
         g_last_sig.clear();
@@ -772,12 +840,35 @@ bool party_running()
 PartyStatus party_status()
 {
     PartyStatus s;
+    const party_tunnel::Status ts = party_tunnel::status();
     std::lock_guard<std::mutex> lock(g_mu);
     s.state = g_state;
     s.url = g_url;
+    s.lan_url = g_lan_url;
     s.ip = g_ip;
     s.port = g_port;
     s.error = g_error;
+    s.public_reach = g_public_reach;
+    s.tunnel_error = g_tunnel_error;
+    if (g_public_reach)
+    {
+        switch (ts.state)
+        {
+        case party_tunnel::State::Live: s.tunnel_state = PartyTunnelState::Live; break;
+        case party_tunnel::State::Error: s.tunnel_state = PartyTunnelState::Error; break;
+        case party_tunnel::State::Starting:
+        case party_tunnel::State::Stopped:
+        default: s.tunnel_state = PartyTunnelState::Starting; break;
+        }
+        if (ts.state == party_tunnel::State::Live && !ts.url.empty() && !g_token.empty())
+            s.url = ts.url + "/j/" + g_token;
+        if (ts.state == party_tunnel::State::Error && !ts.error.empty())
+            s.tunnel_error = ts.error;
+    }
+    else
+    {
+        s.tunnel_state = PartyTunnelState::Off;
+    }
     s.guests = (int)g_guests.size();
     s.requests_added = g_requests_added;
     return s;
@@ -882,11 +973,283 @@ void party_approve_all()
     publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
 }
 
+namespace
+{
+// The address a running party should advertise right now. A saved interface
+// wins only while it still exists; otherwise fall back to the best current
+// private address ("" when offline).
+std::string current_party_ip(const std::string &preferred)
+{
+    if (!preferred.empty())
+    {
+        for (const party_net::Interface &i : party_net::list())
+            if (i.ip == preferred)
+                return preferred;
+    }
+    return party_net::best_ip();
+}
+
+// Rebind the listener and refresh the guest URL after the host moved to a
+// different network. Guest cookies/tokens live in this module, so a reboot of
+// the HTTP server keeps already-joined phones valid on the new address.
+bool rebind_party_to(const std::string &new_ip)
+{
+    std::string old_ip;
+    std::string old_public_host;
+    int old_port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        old_ip = g_ip;
+        old_public_host = g_public_host;
+        old_port = g_port > 0 ? g_port : g_settings.port;
+    }
+
+    PartyServerConfig cfg;
+    cfg.bind_ip = new_ip;
+    cfg.public_ip = new_ip;
+    cfg.port = old_port > 0 ? old_port : 8484;
+
+    std::string error;
+    party_server_stop();
+    if (!party_server_start(cfg, error))
+    {
+        // Try the previous address once. If that is gone too, surface the
+        // failure rather than advertising a dead URL.
+        PartyServerConfig old_cfg;
+        old_cfg.bind_ip = old_ip;
+        old_cfg.public_ip = old_ip;
+        old_cfg.public_host = old_public_host;
+        old_cfg.port = cfg.port;
+        if (old_ip.empty() || !party_server_start(old_cfg, error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_state = PartyRunState::Error;
+            g_error = error.empty() ? "Could not rebind the party address." : error;
+            g_url.clear();
+            g_ip.clear();
+            if (g_app)
+            {
+                g_app->repaint_requested = true;
+                publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+            }
+            return false;
+        }
+        return false;
+    }
+
+    bool public_reach = false;
+    std::string tunnel_binary;
+    int new_port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_ip = new_ip;
+        g_port = party_server_port();
+        if (!g_settings.interface_ip.empty())
+            g_settings.interface_ip = new_ip;
+        g_lan_url = "http://" + new_ip + ":" + std::to_string(g_port) + "/j/" + g_token;
+        // The quick-tunnel URL and origin changed with the network; go back to
+        // the LAN link until the new public URL arrives.
+        g_url = g_lan_url;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
+        g_error.clear();
+        g_state = PartyRunState::Running;
+        public_reach = g_public_reach;
+        tunnel_binary = g_tunnel_binary;
+        new_port = g_port;
+        ++g_version;
+        g_last_sig.clear();
+        if (g_app)
+        {
+            if (!g_app->settings.party.interface_ip.empty())
+                g_app->settings.party.interface_ip = new_ip;
+            g_app->repaint_requested = true;
+            publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+        }
+    }
+
+    party_server_set_public_host("");
+    if (public_reach)
+    {
+        party_tunnel::stop();
+        std::string tunnel_error;
+        if (!party_tunnel::start(new_ip, new_port, tunnel_binary, tunnel_error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_tunnel_error = tunnel_error.empty() ? "The public link could not restart."
+                                                  : tunnel_error;
+            if (g_app)
+                g_app->repaint_requested = true;
+        }
+    }
+    return true;
+}
+
+// Apply the tunnel's asynchronous state to the advertised link: swap in the
+// public URL when it arrives, fall back to the LAN link on failure, and retry
+// a dead tunnel with a slow backoff. Runs on the main thread.
+void party_sync_tunnel()
+{
+    bool public_reach = false;
+    std::string origin_ip;
+    std::string binary;
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        public_reach = g_public_reach;
+        origin_ip = g_ip;
+        binary = g_tunnel_binary;
+        port = g_port;
+    }
+    if (!public_reach)
+        return;
+
+    const party_tunnel::Status ts = party_tunnel::status();
+    const double now = now_sec();
+    bool announce = false;
+    bool clear_public_host = false;
+    bool changed = false;
+    std::string set_public_host;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (ts.state == party_tunnel::State::Live && !ts.url.empty() &&
+            ts.url != g_public_url)
+        {
+            g_public_url = ts.url;
+            g_public_host = ts.host;
+            g_url = ts.url + "/j/" + g_token;
+            g_tunnel_error.clear();
+            g_tunnel_retry_at = 0.0;
+            set_public_host = ts.host;
+            changed = true;
+            if (!g_tunnel_announced)
+            {
+                g_tunnel_announced = true;
+                announce = true;
+            }
+        }
+        else if (ts.state == party_tunnel::State::Starting && !g_tunnel_error.empty())
+        {
+            // A retry is in progress; stop showing the previous failure.
+            g_tunnel_error.clear();
+            changed = true;
+        }
+        else if (ts.state == party_tunnel::State::Error)
+        {
+            if (ts.error != g_tunnel_error)
+            {
+                g_tunnel_error = ts.error;
+                changed = true;
+            }
+            if (!g_public_url.empty())
+            {
+                g_public_url.clear();
+                g_public_host.clear();
+                g_url = g_lan_url;
+                clear_public_host = true;
+                changed = true;
+            }
+            if (g_tunnel_retry_at <= 0.0)
+                g_tunnel_retry_at = now + 20.0;
+        }
+        if (changed)
+        {
+            ++g_version;
+            g_last_sig.clear();
+            if (g_app)
+                publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+        }
+    }
+
+    if (!set_public_host.empty())
+        party_server_set_public_host(set_public_host);
+    else if (clear_public_host)
+        party_server_set_public_host("");
+
+    if (announce)
+    {
+        ui_notify(UiNotifyType::Success, "Public party link ready",
+                  "The QR code now works from any network.", 4.5f);
+        if (g_app)
+            g_app->repaint_requested = true;
+    }
+
+    if (ts.state == party_tunnel::State::Error)
+    {
+        double retry_at = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            retry_at = g_tunnel_retry_at;
+        }
+        if (retry_at > 0.0 && now >= retry_at)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_retry_at = now + 20.0;
+            }
+            std::string error;
+            if (!party_tunnel::start(origin_ip, port, binary, error))
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_error = error.empty() ? "The public link could not start." : error;
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_announced = false;
+            }
+        }
+    }
+}
+} // namespace
+
 void party_tick(AppState &state, double position_sec, double duration_sec, bool paused)
 {
     g_app = &state;
     if (g_state != PartyRunState::Running)
         return;
+
+    // Follow network changes (new Wi-Fi / hotspot / VPN). The listener is
+    // bound to one address, so without this the QR keeps pointing at an
+    // address the host no longer owns and every guest is stranded.
+    {
+        const double t = now_sec();
+        bool check = false;
+        std::string preferred;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (t - g_last_net_check >= 5.0)
+            {
+                g_last_net_check = t;
+                check = true;
+                preferred = g_settings.interface_ip;
+            }
+        }
+        if (check)
+        {
+            const std::string wanted = current_party_ip(preferred);
+            std::string current_ip;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                current_ip = g_ip;
+            }
+            if (!wanted.empty() && !current_ip.empty() && wanted != current_ip)
+            {
+                if (rebind_party_to(wanted))
+                {
+                    ui_notify(UiNotifyType::Info, "Party address updated",
+                              "The QR code now points at " + wanted + ".", 4.5f);
+                }
+                if (g_app)
+                    g_app->repaint_requested = true;
+            }
+        }
+    }
+
+    party_sync_tunnel();
 
     std::vector<AddedNotice> notifications;
     std::string prefetch_ids;

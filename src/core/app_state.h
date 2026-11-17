@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "studio_project.h"
 
 #include <mutex>
 
@@ -31,6 +32,11 @@ struct AppState
     std::string home_error_msg;
     std::shared_ptr<const std::vector<Track>> search_results;
     std::vector<Track> downloaded_tracks;
+    // Local audio files the user added (Studio). Main-thread only; loaded on
+    // demand and persisted through library.db. Kept separate from the
+    // YouTube-backed lists so they can never be stream-resolved or downloaded.
+    std::vector<Track> local_tracks;
+    bool local_tracks_loaded = false;
     std::shared_ptr<const std::vector<Track>> radio_results;
     std::vector<Track> liked_tracks;
     std::vector<Track> playback_history;
@@ -157,6 +163,12 @@ struct AppState
     // Set when the artist fetch failed with no cached copy to show.
     bool artist_failed = false;
     std::string artist_error_msg;
+    // Background artist fetches publish the fields above from a worker;
+    // draw_artist_panel holds this mutex for the whole frame so a fetch can
+    // never replace artist_songs/artist_albums while rows are being drawn
+    // (same pattern as album_mutex). Mutable so const readers (session save,
+    // get_playlist) can take it too.
+    mutable std::recursive_mutex artist_mutex;
     Tab artist_return_tab = Tab::Home;
     PlaylistSource artist_return_source = PlaylistSource::HOME;
     int artist_return_playlist_index = -1;
@@ -171,6 +183,10 @@ struct AppState
     bool search_dirty = false;
     std::string queued_search; // snapshot taken when the debounce fires
     std::atomic<int> search_id{0};
+    // Only one search worker runs at a time. New queries coalesce into
+    // queued_search instead of stacking up behind an in-flight request
+    // (the backend answers one command at a time).
+    std::atomic<bool> search_worker_active{false};
     // Set when the search fetch failed, so results area shows why + Retry.
     bool search_failed = false;
     std::string search_error_msg;
@@ -180,6 +196,23 @@ struct AppState
     std::vector<std::string> search_recent;
     std::shared_ptr<const std::vector<AlbumSummary>> search_album_results;
     std::shared_ptr<const std::vector<ArtistSummary>> search_artist_results;
+    // YouTube Music's "Top result" card after the local policy has run.
+    std::shared_ptr<const TopResult> search_top;
+    // Typeahead suggestions for the search bar (Home). Published by a worker;
+    // requests carry a sequence id so stale replies are dropped.
+    std::shared_ptr<const SearchSuggestions> search_suggestions;
+    bool search_suggest_dirty = false;
+    std::string queued_search_suggest;
+    std::atomic<int> search_suggest_id{0};
+    std::atomic<bool> search_suggest_loading{false};
+    // Category shelves are filled by the two-request search only thinly
+    // (3-6 rows); selecting the Albums/Artists chip tops them up once per
+    // search_id with a filtered fetch.
+    std::atomic<int> search_albums_fetched_id{0};
+    std::atomic<int> search_artists_fetched_id{0};
+    // 0 = none, 1 = albums, 2 = artists; set by the chip handlers and
+    // consumed by the main loop once the main search has settled.
+    std::atomic<int> search_category_dirty{0};
 
     // Multi-select in Liked / Downloads / Playlists. IDs are kept per list;
     // selection_context is cleared whenever the user changes lists.
@@ -192,6 +225,13 @@ struct AppState
     // Keyboard/shortcut state.
     bool focus_search_requested = false;
     bool show_shortcuts = false;
+    // Row hover piped from ui_track_row to the main loop: after a short dwell
+    // on a row its stream URL is warmed speculatively. UI thread only.
+    std::string hovered_track_id;
+    double hovered_track_since = 0.0;
+    int hovered_track_frame = 0;
+    // Backend debug window (live command log). Session-only; never persisted.
+    bool show_backend_debug = false;
     // Party view: fullscreen QR takeover. Session-only; never persisted.
     bool party_fullscreen = false;
     // Set by the Party tab's "Party settings" shortcut so the Settings page
@@ -257,6 +297,14 @@ struct AppState
     StatsSnapshot stats;
     int stats_period = 0; // 0 = all time, 1 = this month, 2 = this week
     bool stats_dirty = true;
+    // Set when the Stats tab is clicked (even if it is already active), so
+    // re-clicking it refreshes the page without waiting for a tab switch.
+    bool stats_refresh_requested = false;
+    // Download metadata repair: a worker publishes id -> Track here; the main
+    // loop applies it to play_log (unknown artists) without touching UI-owned
+    // vectors from the worker.
+    std::shared_ptr<const std::unordered_map<std::string, Track>> repaired_meta;
+    std::atomic<bool> metadata_repair_pending{false};
 
     // Pending play request
     std::string pending_play_url;
@@ -324,6 +372,33 @@ struct AppState
     std::atomic<bool> lyrics_refresh_requested{false}; // set by bottom-bar toggle
     std::string lyrics_requested_id;                   // track to fetch (main thread)
     bool lyrics_dirty = false;                         // set on track start (main thread)
+
+    // Studio (songwriting): the selected beat, its waveform/beat analysis and
+    // the in-Studio YouTube search. Main-thread owned except the snapshots
+    // published by workers. `studio_analysis_dirty` is consumed by the main
+    // loop exactly like lyrics_dirty, so the heavy work stays off the UI thread.
+    Track studio_beat;
+    std::shared_ptr<const StudioAnalysis> studio_analysis;
+    std::atomic<bool> studio_analyzing{false};
+    std::atomic<int> studio_analysis_seq{0};
+    std::string studio_analysis_requested_id;
+    bool studio_analysis_dirty = false;
+    std::string studio_analysis_error;
+    std::shared_ptr<const std::vector<Track>> studio_search_results;
+    std::atomic<bool> studio_search_loading{false};
+    std::atomic<int> studio_search_seq{0};
+    std::string studio_queued_search;
+    bool studio_search_dirty = false;
+    std::string studio_search_error;
+
+    // Current songwriting project for studio_beat: cues plus lyrics. Saved
+    // with a short debounce after edits (studio_project_dirty).
+    SongProject studio_project;
+    bool studio_project_loaded = false;
+    bool studio_project_dirty = false;
+    double studio_project_edit_time = 0.0;
+    // One-step-many undo for songwriting edits (capped snapshots).
+    std::vector<SongProject> studio_undo;
 
     // Podcasts (custom panel; loaded on demand).
     std::shared_ptr<const std::vector<PodcastShow>> podcast_shows;

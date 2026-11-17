@@ -273,8 +273,13 @@ private:
         }
         else if (strcmp(method_name, "PlayPause") == 0)
         {
-            self->m_player->toggle_pause();
-            self->update_playback_status(self->m_state.playing);
+            // Explicit state, not mpv's blind toggle: the app owns the
+            // play/pause intent (UI icon, crossfade gating, the next start
+            // event), so an async `cycle pause` must flip it here too.
+            const bool playing = !self->m_state.playing.load();
+            self->m_player->set_paused(!playing);
+            self->m_state.playing = playing;
+            self->update_playback_status(playing);
             self->m_state.repaint_requested = true;
             g_dbus_method_invocation_return_value(invocation, nullptr);
         }

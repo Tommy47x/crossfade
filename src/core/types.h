@@ -52,7 +52,8 @@ static inline ImVec4 accent_alpha(const ImVec4 &c, float a)
         Settings,
         YouTube,
         Smart,
-        Party
+        Party,
+        Studio
     };
 
     // ----------------------------------------------------------------------
@@ -71,7 +72,8 @@ static inline ImVec4 accent_alpha(const ImVec4 &c, float a)
         ARTIST,
         PODCAST,
         YOUTUBE_PLAYLIST,
-        SMART
+        SMART,
+        STUDIO
     };
 
 // ----------------------------------------------------------------------

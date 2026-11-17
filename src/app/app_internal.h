@@ -133,11 +133,16 @@ void show_notification(const std::string &title, const std::string &body,
 void cover_sweep_worker(std::vector<Track> tracks);
 void maybe_sweep_missing_covers();
 void background_download(const std::string &video_id);
-void load_recommendations(bool force = false);
+// `quiet` suppresses the backend-error toast (used by automatic retries that
+// would otherwise repeat the same "no connection" warning every 30 s).
+void load_recommendations(bool force = false, bool quiet = false);
 void artist_search_and_update(const std::string &query, int expect_id);
 bool text_matches_query(const std::string &haystack, const std::string &needle);
 void merge_local_search_results(const std::string &query, SearchAllResult &results);
 void search_all_and_update(const std::string &query, int expect_id);
+void search_category_and_update(const std::string &query, int category, int expect_id);
+void prefetch_hovered_track(const std::string &video_id);
+void search_suggest_and_update(const std::string &query, int expect_id);
 void load_lyrics_worker(std::string track_id, int expect_seq);
 
 // ---- Touch / wheel input (app_input.cpp) ----

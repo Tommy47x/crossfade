@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "imgui_internal.h"
 #include "ui_backdrop.h"
 #include "ui_components.h"
 #include "ui_icons.h"
@@ -125,10 +126,14 @@ static void activate_tab(AppState &s, Tab tab)
     case Tab::Stats:
         s.current_playlist_source = PlaylistSource::STATS;
         s.stats_dirty = true;
+        s.stats_refresh_requested = true;
         break;
     case Tab::Smart:
         s.current_playlist_source = PlaylistSource::SMART;
         build_smart_view(s);
+        break;
+    case Tab::Studio:
+        s.current_playlist_source = PlaylistSource::STUDIO;
         break;
     case Tab::Queue:
         break;
@@ -415,6 +420,7 @@ void draw_sidebar(AppState &state)
     nav_item(state, Tab::Stats, UiIcon::Stats, "Stats", rail);
     nav_item(state, Tab::Smart, UiIcon::Repeat, "Smart", rail);
     nav_item(state, Tab::Party, UiIcon::Party, "Party", rail);
+    nav_item(state, Tab::Studio, UiIcon::Studio, "Studio", rail);
 
     if (!rail)
         ImGui::Dummy(ImVec2(0, m.space_3));
@@ -471,6 +477,12 @@ void draw_sidebar(AppState &state)
 static double s_last_edit_time = 0.0;
 static bool s_pending_search = false;
 
+static double s_suggest_edit_time = 0.0;
+static bool s_suggest_pending = false;
+static bool s_suggest_suppress = false;
+static bool s_suggest_enter_consumed = false;
+static int s_suggest_index = -1;
+
 static void on_search_edit(AppState &state)
 {
     ++state.search_id;
@@ -483,6 +495,25 @@ static void on_search_edit(AppState &state)
     }
     s_last_edit_time = ImGui::GetTime();
     s_pending_search = true;
+    s_suggest_edit_time = s_last_edit_time;
+    s_suggest_pending = true;
+    s_suggest_suppress = false;
+    s_suggest_index = -1;
+}
+
+// Typeahead has its own, shorter debounce than the full search: the dropdown
+// should follow the typing, while the search itself waits for a real pause.
+static void dispatch_suggestions(AppState &state)
+{
+    if (!s_suggest_pending || ImGui::GetTime() - s_suggest_edit_time < 0.22)
+        return;
+    s_suggest_pending = false;
+    if (state.current_tab != Tab::Home || state.search_buffer[0] == '\0')
+        return;
+    state.queued_search_suggest = state.search_buffer;
+    state.search_suggest_dirty = true;
+    state.search_suggest_loading = true;
+    ++state.search_suggest_id;
 }
 
 static void dispatch_search(AppState &state)
@@ -505,7 +536,10 @@ static void dispatch_search(AppState &state)
                                   std::make_shared<const std::vector<AlbumSummary>>());
                 std::atomic_store(&state.search_artist_results,
                                   std::make_shared<const std::vector<ArtistSummary>>());
+                std::atomic_store(&state.search_top,
+                                  std::make_shared<const TopResult>());
                 state.search_loading = false;
+                state.search_category_dirty.store(0);
                 state.current_playlist_source = PlaylistSource::HOME;
             }
         }
@@ -519,19 +553,14 @@ static void dispatch_search(AppState &state)
                 state.search_recent.resize(10);
             save_search_recent(state.search_recent);
 
-            // Publish local-library matches immediately, then let the backend
-            // fill in the online results. The worker merges and dedupes them.
-            auto local = library::search_tracks(query, 60);
-            std::atomic_store(
-                &state.search_results,
-                std::make_shared<const std::vector<Track>>(std::move(local)));
-            std::atomic_store(&state.search_album_results,
-                              std::make_shared<const std::vector<AlbumSummary>>());
-            std::atomic_store(&state.search_artist_results,
-                              std::make_shared<const std::vector<ArtistSummary>>());
+            // Keep the previous results and top card on screen until the new
+            // ones land: clearing here made every pause while typing blank
+            // the page for the whole round trip. The worker publishes local
+            // and online rows together (merge_local_search_results).
             state.queued_search = query;
             state.search_dirty = true;
             state.search_loading = true;
+            state.search_category_dirty.store(0);
         }
     }
     else if (state.current_tab == Tab::Podcasts)
@@ -619,6 +648,7 @@ static const char *view_title(const AppState &s)
     case Tab::Podcasts: return "Podcasts";
     case Tab::Settings: return "Settings";
     case Tab::Smart: return "Smart";
+    case Tab::Studio: return "Studio";
     }
     return "crossfade";
 }
@@ -652,6 +682,7 @@ static std::string view_subtitle(const AppState &s)
     case Tab::Party: return "Let guests add songs from their phones";
     case Tab::Podcasts: return "Shows and episodes";
     case Tab::Settings: return "Make crossfade yours";
+    case Tab::Studio: return "Write lyrics over a beat";
     default: return s.status_text;
     }
 }
@@ -716,6 +747,352 @@ static bool header_refresh_button(AppState &state, const ImVec2 &pos, float widt
                     ui_with_alpha(label_col, alpha), label);
     }
     return clicked && !busy;
+}
+
+struct SuggestEntry
+{
+    int kind = 0; // 0 = recent/local query, 1 = YouTube query, 2 = music item
+    std::string text;
+    SearchSuggestionItem item;
+};
+
+static std::string suggest_lower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+static void apply_search_suggestion(AppState &state, const SuggestEntry &entry)
+{
+    if (entry.kind == 2)
+    {
+        const SearchSuggestionItem &it = entry.item;
+        if (it.kind == "song" || it.kind == "video")
+        {
+            Track t;
+            t.id = it.id;
+            t.title = it.title;
+            t.artist = it.artist;
+            t.album = it.album;
+            t.thumbnail_url = it.thumbnail_url;
+            ui_play_track(state, t, -1);
+        }
+        else if (it.kind == "album")
+            open_album_view(state, it.id);
+        else if (it.kind == "artist")
+            open_artist_view(state, it.id, it.title);
+    }
+    else
+    {
+        ui_set_search(state, entry.text);
+        s_last_edit_time = 0.0; // run this query now instead of debouncing
+        s_pending_search = true;
+        s_suggest_pending = false;
+        ++state.search_suggest_id; // drop any in-flight suggestions
+        state.search_suggest_loading = false;
+        std::atomic_store(&state.search_suggestions,
+                          std::make_shared<const SearchSuggestions>());
+    }
+    s_suggest_suppress = true;
+    s_suggest_index = -1;
+}
+
+// Dropdown under the search field: local recents, YouTube query suggestions,
+// and the songs/albums/artists YouTube recommends for the query. Rendered as
+// a popup so it floats above the content and closes on an outside click.
+// --- Search typeahead -------------------------------------------------
+// The dropdown is a deferred overlay: prepared while the header is drawn
+// (it needs the input's rect and this frame's key state) and rendered after
+// every other window, which keeps it on top without the focus theft a popup
+// causes. Clicking the search field must always leave the caret in the field.
+static std::vector<SuggestEntry> s_suggest_entries;
+static bool s_suggest_has_query = false;
+static bool s_suggest_has_item = false;
+static bool s_suggest_field_active = false;
+static bool s_suggest_overlay_hovered = false;
+static ImVec2 s_suggest_pos(0.0f, 0.0f);
+static ImVec2 s_suggest_size(0.0f, 0.0f);
+static float s_suggest_row_w = 0.0f;
+static float s_suggest_view_h = 0.0f;
+
+static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2 field_max,
+                                       bool search_active)
+{
+    s_suggest_enter_consumed = false;
+    s_suggest_entries.clear();
+    s_suggest_has_query = false;
+    s_suggest_has_item = false;
+    s_suggest_field_active = search_active;
+    if (state.current_tab != Tab::Home)
+        return;
+
+    const UiMetrics &m = ui_m();
+    const std::string query(state.search_buffer);
+    const std::string ql = suggest_lower(query);
+
+    std::unordered_set<std::string> seen;
+    if (query.empty())
+    {
+        for (const std::string &recent : state.search_recent)
+        {
+            if (s_suggest_entries.size() >= 6)
+                break;
+            s_suggest_entries.push_back({0, recent, {}});
+        }
+    }
+    else
+    {
+        for (const std::string &recent : state.search_recent)
+        {
+            if (s_suggest_entries.size() >= 3)
+                break;
+            const std::string rl = suggest_lower(recent);
+            if (rl == ql || rl.find(ql) == std::string::npos || !seen.insert(rl).second)
+                continue;
+            s_suggest_entries.push_back({0, recent, {}});
+        }
+        auto sugg = std::atomic_load(&state.search_suggestions);
+        if (sugg)
+        {
+            for (const SearchSuggestionQuery &q : sugg->queries)
+            {
+                if (s_suggest_entries.size() >= 8)
+                    break;
+                const std::string t = suggest_lower(q.text);
+                if (t.empty() || !seen.insert(t).second)
+                    continue;
+                s_suggest_entries.push_back({q.history ? 0 : 1, q.text, {}});
+            }
+            for (const SearchSuggestionItem &it : sugg->items)
+            {
+                if (s_suggest_entries.size() >= 13)
+                    break;
+                s_suggest_entries.push_back({2, {}, it});
+            }
+        }
+    }
+
+    const float pad = m.space_2;
+    const float query_h = 34.0f * m.layout_scale;
+    const float item_h = 54.0f * m.layout_scale;
+    float content_h = 0.0f;
+    for (const SuggestEntry &e : s_suggest_entries)
+    {
+        if (e.kind == 2)
+        {
+            content_h += item_h;
+            s_suggest_has_item = true;
+        }
+        else
+        {
+            content_h += query_h;
+            s_suggest_has_query = true;
+        }
+    }
+    if (s_suggest_has_query && s_suggest_has_item)
+        content_h += m.space_1 + 1.0f;
+    if (state.search_suggest_loading.load() && s_suggest_entries.empty())
+        content_h = query_h;
+    s_suggest_view_h = std::min(content_h, 400.0f * m.layout_scale);
+    const float width = std::max(300.0f * m.layout_scale, field_max.x - field_min.x);
+    s_suggest_pos = ImVec2(field_min.x, field_max.y + 6.0f * m.layout_scale);
+    s_suggest_size = ImVec2(width, s_suggest_view_h + pad * 2.0f);
+    s_suggest_row_w = width - pad * 2.0f;
+
+    const int n = (int)s_suggest_entries.size();
+    if (search_active && n > 0)
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+        {
+            s_suggest_index = s_suggest_index + 1 >= n ? 0 : s_suggest_index + 1;
+            ui_anim_request();
+        }
+        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+            s_suggest_index = s_suggest_index <= 0 ? n - 1 : s_suggest_index - 1;
+        else if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+        {
+            s_suggest_suppress = true;
+            s_suggest_index = -1;
+        }
+        else if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) &&
+                 s_suggest_index >= 0 && s_suggest_index < n)
+        {
+            s_suggest_enter_consumed = true;
+            apply_search_suggestion(state, s_suggest_entries[s_suggest_index]);
+        }
+    }
+}
+
+// Called once after every other window has been submitted, so the dropdown
+// floats above the content without a popup's focus behaviour.
+void draw_search_suggestions_overlay(AppState &state)
+{
+    if (s_suggest_entries.empty() || s_suggest_suppress)
+    {
+        s_suggest_overlay_hovered = false;
+        return;
+    }
+    if (!s_suggest_field_active && !s_suggest_overlay_hovered)
+        return;
+
+    const UiMetrics &m = ui_m();
+    const float pad = m.space_2;
+    const float query_h = 34.0f * m.layout_scale;
+    const float item_h = 54.0f * m.layout_scale;
+
+    ImGui::SetNextWindowPos(s_suggest_pos);
+    ImGui::SetNextWindowSize(s_suggest_size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, m.radius_md);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    // The pane is painted below, on top of a soft shadow: a flat WindowBg
+    // reads as a translucent rectangle floating over text, which looks muddy
+    // without a real backdrop blur. Frosted tint + edge highlight matches the
+    // hero band's glass treatment.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoCollapse;
+    ImGui::Begin("##search_suggestions", nullptr, flags);
+    // Keep the dropdown above the content and the header in ImGui's window
+    // order without focusing it (focus would steal the caret from the search
+    // field; plain submission order alone is not stable once other windows
+    // are focused).
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    s_suggest_overlay_hovered = ImGui::IsWindowHovered(
+        ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+    {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 a = ImGui::GetWindowPos();
+        const ImVec2 b(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
+        dl->PushClipRectFullScreen();
+        for (int i = 4; i >= 1; --i)
+        {
+            const float grow = (float)i * 2.0f * m.layout_scale;
+            dl->AddRectFilled(ImVec2(a.x - grow, a.y - grow * 0.4f + 5.0f),
+                              ImVec2(b.x + grow, b.y + grow + 5.0f),
+                              IM_COL32(0, 0, 0, 16), m.radius_md + grow);
+        }
+        dl->PopClipRect();
+        ImVec4 bg = ui_c().surface;
+        bg.w = 0.97f;
+        const ImVec4 tint = ui_backdrop_tint();
+        dl->AddRectFilled(a, b, ui_col(bg), m.radius_md);
+        dl->AddRectFilled(a, b, ui_col(ImVec4(tint.x, tint.y, tint.z, 0.10f)), m.radius_md);
+        dl->AddLine(ImVec2(a.x + m.radius_md * 0.6f, a.y + 1.0f),
+                    ImVec2(b.x - m.radius_md * 0.6f, a.y + 1.0f),
+                    IM_COL32(255, 255, 255, 16), 1.0f);
+        dl->AddRect(a, b, ui_col(ui_c().border), m.radius_md, 0, 1.0f);
+    }
+
+    const int n = (int)s_suggest_entries.size();
+    if (n == 0)
+    {
+        ImGui::TextDisabled("Searching suggestions...");
+    }
+    else
+    {
+        ImGui::BeginChild("##suggest_list", ImVec2(0.0f, s_suggest_view_h), false,
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 base = ImGui::GetCursorScreenPos();
+        const float row_w = s_suggest_row_w;
+        float y = base.y;
+        bool separator_done = false;
+        int apply_index = -1;
+
+        for (int i = 0; i < n; ++i)
+        {
+            const SuggestEntry &e = s_suggest_entries[i];
+            if (e.kind == 2 && s_suggest_has_query && !separator_done)
+            {
+                dl->AddLine(ImVec2(base.x + m.space_1, y),
+                            ImVec2(base.x + row_w - m.space_1, y),
+                            ui_border_soft_u32(), 1.0f);
+                y += m.space_1 + 1.0f;
+                separator_done = true;
+            }
+            const float h = e.kind == 2 ? item_h : query_h;
+            ImGui::PushID(i);
+            ImGui::SetCursorScreenPos(ImVec2(base.x, y));
+            ImGui::InvisibleButton("##suggestion", ImVec2(row_w, h));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool clicked = ImGui::IsItemClicked();
+            if (hovered)
+            {
+                s_suggest_index = i;
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
+            if (clicked)
+                apply_index = i;
+
+            const ImVec2 rmin(base.x, y);
+            const ImVec2 rmax(base.x + row_w, y + h);
+            if (s_suggest_index == i)
+                dl->AddRectFilled(rmin, rmax, ui_accent_u32(0.12f), m.radius_sm);
+            else if (hovered)
+                dl->AddRectFilled(rmin, rmax, ui_overlay_u32(0.05f), m.radius_sm);
+
+            if (e.kind == 2)
+            {
+                const float art = 36.0f * m.layout_scale;
+                const ImVec2 amin(rmin.x + m.space_2, y + (h - art) * 0.5f);
+                const ImVec2 amax(amin.x + art, amin.y + art);
+                const UiIcon fallback = e.item.kind == "album" ? UiIcon::Album
+                                        : e.item.kind == "artist" ? UiIcon::Artist
+                                                                  : UiIcon::Play;
+                ui_draw_cover(dl, e.item.thumbnail_url, amin, amax, m.radius_sm, 1.0f,
+                              fallback, "search_suggest", false, true);
+                const float tx = amax.x + m.space_3;
+                const float tw = std::max(20.0f, rmax.x - tx - m.space_2);
+                const std::string title =
+                    ui_ellipsize(g_ui_fonts.medium, 17.0f, e.item.title, tw);
+                const std::string sub =
+                    ui_ellipsize(g_ui_fonts.body, 14.0f, e.item.subtitle, tw);
+                const float title_fs = 17.0f * m.text_scale;
+                const float sub_fs = 14.0f * m.text_scale;
+                const float text_h = title_fs + (sub.empty() ? 0.0f : sub_fs + 2.0f);
+                const float ty = y + (h - text_h) * 0.5f;
+                dl->AddText(g_ui_fonts.medium, title_fs, ImVec2(tx, ty),
+                            ui_text_u32(), title.c_str());
+                if (!sub.empty())
+                    dl->AddText(g_ui_fonts.body, sub_fs,
+                                ImVec2(tx, ty + title_fs + 2.0f),
+                                ui_text_dim_u32(), sub.c_str());
+            }
+            else
+            {
+                ui_draw_icon(dl, e.kind == 0 ? UiIcon::History : UiIcon::Search,
+                             ImVec2(rmin.x + m.space_2 + 8.0f * m.layout_scale,
+                                    y + h * 0.5f),
+                             15.0f * m.layout_scale, ui_text_muted_u32(), 1.5f);
+                const float tx = rmin.x + m.space_2 + 26.0f * m.layout_scale;
+                const float tw = std::max(20.0f, rmax.x - tx - m.space_2);
+                const std::string text =
+                    ui_ellipsize(g_ui_fonts.body, 16.5f, e.text, tw);
+                const float fs = 16.5f * m.text_scale;
+                dl->AddText(g_ui_fonts.body, fs, ImVec2(tx, y + (h - fs) * 0.5f),
+                            ui_text_dim_u32(), text.c_str());
+            }
+            ImGui::PopID();
+            y += h;
+        }
+        ImGui::EndChild();
+
+        if (apply_index >= 0 && apply_index < n)
+        {
+            apply_search_suggestion(state, s_suggest_entries[apply_index]);
+            s_suggest_overlay_hovered = false;
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(1);
+    ImGui::PopStyleVar(3);
 }
 
 void draw_content_header(AppState &state)
@@ -933,12 +1310,6 @@ void draw_content_header(AppState &state)
         if (ImGui::InputTextWithHint("##global_search", "Search", state.search_buffer,
                                      sizeof(state.search_buffer)))
             on_search_edit(state);
-        // Enter dispatches immediately instead of waiting out the debounce.
-        if (ImGui::IsItemActive() &&
-            (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
-        {
-            s_last_edit_time = 0.0;
-        }
         ImGui::PopStyleColor(6);
         ImGui::PopStyleVar(2);
 
@@ -996,8 +1367,19 @@ void draw_content_header(AppState &state)
                                       compact_refresh))
                 state.refresh_requested = true;
         }
+
+        prepare_search_suggestions(state, field_pos, field_max, search_active);
+        // Enter with no highlighted suggestion dispatches the typed query
+        // instead of waiting out the debounce (and closes the dropdown).
+        if (search_active && !s_suggest_enter_consumed &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
+        {
+            s_last_edit_time = 0.0;
+            s_suggest_suppress = true;
+        }
     }
 
     dispatch_search(state);
+    dispatch_suggestions(state);
     ImGui::End();
 }

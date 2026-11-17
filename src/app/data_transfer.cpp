@@ -50,6 +50,7 @@ std::string join_sections(const Sections &s)
     add(s.library, "library");
     add(s.album_cache, "album_cache");
     add(s.artist_cache, "artist_cache");
+    add(s.podcast_cache, "podcast_cache");
     add(s.lyrics, "lyrics");
     add(s.thumbs, "thumbs");
     add(s.audio, "audio");

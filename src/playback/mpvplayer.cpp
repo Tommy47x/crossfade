@@ -324,3 +324,68 @@ double probe_audio_file_duration(const std::string &path)
     mpv_terminate_destroy(h);
     return dur;
 }
+
+bool probe_local_audio_metadata(const std::string &path, LocalAudioMeta &out)
+{
+    out = LocalAudioMeta{};
+    mpv_handle *h = mpv_create();
+    if (!h)
+        return false;
+    mpv_set_option_string(h, "video", "no");
+    mpv_set_option_string(h, "ao", "null");
+    mpv_set_option_string(h, "terminal", "no");
+    mpv_set_option_string(h, "msg-level", "all=no");
+    if (mpv_initialize(h) < 0)
+    {
+        mpv_destroy(h);
+        return false;
+    }
+    // Load, never play: we only want the header's tags and duration.
+    mpv_set_property_string(h, "pause", "yes");
+    const char *cmd[] = {"loadfile", path.c_str(), "replace", nullptr};
+    if (mpv_command_async(h, 0, cmd) < 0)
+    {
+        mpv_terminate_destroy(h);
+        return false;
+    }
+
+    double dur = -1.0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (dur < 0.0 && std::chrono::steady_clock::now() < deadline)
+    {
+        mpv_event *ev = mpv_wait_event(h, 0.05);
+        if (ev->event_id == MPV_EVENT_SHUTDOWN)
+            break;
+        double d = 0.0;
+        if (mpv_get_property(h, "duration", MPV_FORMAT_DOUBLE, &d) >= 0 && d > 0.0)
+            dur = d;
+        if (ev->event_id == MPV_EVENT_END_FILE)
+            break; // load error / unreadable file
+    }
+    if (dur <= 0.0)
+    {
+        mpv_terminate_destroy(h);
+        return false;
+    }
+
+    auto tag = [&](const char *key) -> std::string {
+        char *v = mpv_get_property_string(h, key);
+        std::string s = v ? v : "";
+        if (v)
+            mpv_free(v);
+        return s;
+    };
+    out.title = tag("metadata/by-key/title");
+    if (out.title.empty())
+        out.title = tag("metadata/by-key/Title");
+    out.artist = tag("metadata/by-key/artist");
+    if (out.artist.empty())
+        out.artist = tag("metadata/by-key/Artist");
+    out.album = tag("metadata/by-key/album");
+    if (out.album.empty())
+        out.album = tag("metadata/by-key/Album");
+    out.duration = dur;
+    out.readable = true;
+    mpv_terminate_destroy(h);
+    return true;
+}

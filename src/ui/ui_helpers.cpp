@@ -1,11 +1,29 @@
 #include "ui.h"
 #include "imgui_internal.h"
 #include "ui_notify.h"
+#include "library.h"
+
+#include <SDL.h>
 
 #include <algorithm>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+// Open a URL in the user's browser (song pages, links copied from a track).
+bool ui_open_external_url(const std::string &url)
+{
+    if (url.empty())
+        return false;
+    return SDL_OpenURL(url.c_str()) == 0;
+}
+
+void ui_copy_to_clipboard(const std::string &text)
+{
+    if (text.empty())
+        return;
+    SDL_SetClipboardText(text.c_str());
+}
 
 // ----------------------------------------------------------------------
 // Queue operations
@@ -90,6 +108,9 @@ void ui_invalidate_forward(AppState &state)
 
 void ui_go_back(AppState &state)
 {
+    // artist_browse_id is published by a worker; take the same lock for a
+    // consistent snapshot of the current artist view.
+    std::lock_guard<std::recursive_mutex> artist_lock(state.artist_mutex);
     // Remember where we are so ui_go_forward() can bring the user back.
     state.nav_forward.tab = state.current_tab;
     state.nav_forward.source = state.current_playlist_source;
@@ -135,6 +156,7 @@ void ui_go_back(AppState &state)
 
 void ui_go_forward(AppState &state)
 {
+    std::lock_guard<std::recursive_mutex> artist_lock(state.artist_mutex);
     if (!state.nav_forward_valid)
         return;
     const AppState::NavSnapshot fwd = state.nav_forward;
@@ -173,8 +195,25 @@ void ui_go_forward(AppState &state)
 // Shared UI helpers
 // ----------------------------------------------------------------------
 
+void ensure_local_tracks_loaded(AppState &state)
+{
+    if (state.local_tracks_loaded)
+        return;
+    state.local_tracks = library::load_local_tracks();
+    state.local_tracks_loaded = true;
+}
+
+std::string local_track_url(const AppState &state, const std::string &id)
+{
+    for (const Track &t : state.local_tracks)
+        if (t.id == id)
+            return t.url;
+    return "";
+}
+
 void build_smart_view(AppState &state)
 {
+    ensure_local_tracks_loaded(state);
     // Track metadata comes from the play log (title/artist/thumbnail per
     // play event); play counts only know ids. Newest entry per id wins.
     std::unordered_map<std::string, const PlayEvent *> meta;
@@ -207,7 +246,14 @@ void build_smart_view(AppState &state)
             t.title = ev->title;
             t.artist = ev->artist;
             t.thumbnail_url = ev->thumbnail_url;
-            t.url = "https://www.youtube.com/watch?v=" + ev->id;
+            if (ev->id.rfind("local:", 0) == 0)
+            {
+                t.url = local_track_url(state, ev->id);
+                if (t.url.empty())
+                    continue; // local file no longer indexed
+            }
+            else
+                t.url = "https://www.youtube.com/watch?v=" + ev->id;
             out.push_back(std::move(t));
         }
     }
@@ -226,7 +272,14 @@ void build_smart_view(AppState &state)
             t.title = ev.title;
             t.artist = ev.artist;
             t.thumbnail_url = ev.thumbnail_url;
-            t.url = "https://www.youtube.com/watch?v=" + ev.id;
+            if (ev.id.rfind("local:", 0) == 0)
+            {
+                t.url = local_track_url(state, ev.id);
+                if (t.url.empty())
+                    continue; // local file no longer indexed
+            }
+            else
+                t.url = "https://www.youtube.com/watch?v=" + ev.id;
             out.push_back(std::move(t));
         }
     }
@@ -264,6 +317,7 @@ PlaylistSource playlist_source_for_tab(Tab tab)
     case Tab::YouTube: return PlaylistSource::YOUTUBE_PLAYLIST;
     case Tab::Smart: return PlaylistSource::SMART;
     case Tab::Party: return PlaylistSource::HOME;
+    case Tab::Studio: return PlaylistSource::STUDIO;
     }
     return PlaylistSource::HOME;
 }
@@ -289,7 +343,12 @@ TrackListPtr get_playlist(const AppState &state)
     case PlaylistSource::ALBUM:
         return alias_of(state.album_tracks);
     case PlaylistSource::ARTIST:
-        return alias_of(state.artist_songs);
+    {
+        // A worker publishes artist_songs under artist_mutex; return a
+        // snapshot so playback can iterate it while a fetch completes.
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        return std::make_shared<const std::vector<Track>>(state.artist_songs);
+    }
     case PlaylistSource::PODCAST:
         return alias_of(state.podcast_tracks);
     case PlaylistSource::YOUTUBE_PLAYLIST:
@@ -341,8 +400,14 @@ void resolve_current_track_links(AppState &state)
     if (radio_results && scan(*radio_results))
         return;
     if (scan(state.downloaded_tracks) || scan(state.liked_tracks) ||
-        scan(state.playback_history) || scan(state.album_tracks) ||
-        scan(state.artist_songs) || scan(state.local_search_results))
+        scan(state.playback_history) || scan(state.album_tracks))
+        return;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        if (scan(state.artist_songs))
+            return;
+    }
+    if (scan(state.local_search_results))
         return;
     for (const auto &pl : state.playlists)
         if (scan(pl.tracks))

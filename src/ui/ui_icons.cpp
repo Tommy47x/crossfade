@@ -270,6 +270,16 @@ void ui_draw_icon(ImDrawList *dl, UiIcon icon, ImVec2 c, float s, ImU32 col, flo
         }
         break;
     }
+    case UiIcon::Studio:
+    {
+        // Pencil: shaft, nib and tail — "write lyrics".
+        dl->AddLine(p(c, s, -0.30f, 0.18f), p(c, s, 0.24f, -0.36f), col, t);
+        dl->AddLine(p(c, s, -0.12f, 0.36f), p(c, s, 0.42f, -0.18f), col, t);
+        dl->AddLine(p(c, s, 0.24f, -0.36f), p(c, s, 0.42f, -0.18f), col, t);
+        dl->AddTriangle(p(c, s, -0.30f, 0.18f), p(c, s, -0.12f, 0.36f),
+                        p(c, s, -0.46f, 0.46f), col, t);
+        break;
+    }
     }
 }
 

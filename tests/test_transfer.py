@@ -85,6 +85,28 @@ def main():
         check(rc.returncode != 0, "unsafe archive rejected")
         check(not (base / "escape.txt").exists(), "no path traversal")
 
+        # Backslash traversal: Windows reads "\" as a separator, so the
+        # archive must be rejected there. On POSIX it is a literal filename
+        # and must stay inside the destination.
+        evil_bs = base / "evil-backslash.zip"
+        bs_name = "..\\..\\escape.txt"
+        with zipfile.ZipFile(evil_bs, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(
+                {"app": "crossfade", "sections": ["settings"],
+                 "files": [bs_name], "dirs": []}))
+            zf.writestr(bs_name, "nope")
+        rc = subprocess.run(
+            [sys.executable, str(HELPER), "import", "--zip", str(evil_bs),
+             "--config", str(dst)],
+            check=False)
+        if os.name == "nt":
+            check(rc.returncode != 0, "backslash archive rejected on Windows")
+        else:
+            check(rc.returncode == 0, "literal backslash name imported on POSIX")
+            check(dst.joinpath(bs_name).is_file(),
+                  "literal backslash name kept in destination")
+        check(not (base / "escape.txt").exists(), "no backslash traversal")
+
     if failures:
         print(f"transfer: {failures} failure(s)", file=sys.stderr)
         return 1

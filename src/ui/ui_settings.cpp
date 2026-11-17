@@ -2,6 +2,7 @@
 #include "json_util.h"
 #include "tasks.h"
 #include <cstdlib>
+#include "party_tunnel.h"
 #include "party_util.h"
 #include "ytdlp.h"
 #include "texture.h"
@@ -19,6 +20,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 #include <fstream>
 #include <filesystem>
+#include <cctype>
 #include <cstring>
 #include <cfloat>
 #include <cstdio>
@@ -212,6 +214,8 @@ void save_settings(const Settings &settings)
         << "\"name\":\"" << json_escape(settings.party.name) << "\""
         << ",\"port\":" << std::max(1024, std::min(65535, settings.party.port))
         << ",\"interface_ip\":\"" << json_escape(settings.party.interface_ip) << "\""
+        << ",\"reach\":\"" << (settings.party.public_reach() ? "public" : "lan") << "\""
+        << ",\"tunnel_path\":\"" << json_escape(settings.party.tunnel_path) << "\""
         << ",\"require_approval\":" << (settings.party.require_approval ? "true" : "false")
         << ",\"max_per_guest\":" << std::max(0, std::min(20, settings.party.max_per_guest))
         << ",\"cooldown_sec\":" << std::max(0, std::min(60, settings.party.cooldown_sec))
@@ -520,6 +524,10 @@ Settings load_settings()
                     if (!(std::isdigit((unsigned char)c) || c == '.'))
                         ipv4_like = false;
                 s.party.interface_ip = ipv4_like ? iface : "";
+
+                std::string reach = pget_str("reach");
+                s.party.reach = reach == "lan" ? "lan" : "public";
+                s.party.tunnel_path = pget_str("tunnel_path");
 
                 if (pj.find("\"require_approval\"") != std::string::npos)
                     s.party.require_approval = pget_bool("require_approval");
@@ -1828,12 +1836,69 @@ void draw_settings_panel(AppState &state)
     {
         SettingsCard card("Party", "Let guests add songs from their phones.", UiIcon::Party);
         const float party_section_y = ImGui::GetCursorPosY();
-        settings_help("Start a party from the Party tab. Guests scan its QR code with a phone camera, paste a YouTube or YouTube Music link, and their songs join Up Next. Nothing leaves your local network - there is no account, no cloud, and no telemetry.");
+        settings_help("Start a party from the Party tab. Guests scan its QR code with a phone camera, paste a YouTube or YouTube Music link, and their songs join Up Next. There is no account and no telemetry.");
 
         PartySettings &ps = state.settings.party;
         if (party_running())
             ImGui::TextColored(ui_c().accent_text,
                                "A party is running. Changes here apply the next time you start one.");
+
+        settings_group_label("Guest access");
+        int reach = ps.public_reach() ? 0 : 1;
+        const char *reach_modes[] = {"Public link (Cloudflare)", "Same Wi-Fi only"};
+        settings_row_label("Reach", reach_modes[reach],
+                           "Public links work from any network through a temporary Cloudflare tunnel. Same Wi-Fi is the fastest and keeps every request local.");
+        ImGui::SetNextItemWidth(field_w);
+        if (ImGui::Combo("##party_reach", &reach, reach_modes, 2))
+        {
+            ps.reach = reach == 0 ? "public" : "lan";
+            save = true;
+        }
+
+        if (ps.public_reach())
+        {
+            std::string cf_path;
+            const bool cf_found = party_tunnel::available(cf_path, ps.tunnel_path);
+            if (cf_found)
+            {
+                settings_help(("cloudflared found: " + cf_path).c_str());
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.48f, 0.48f, 1.0f));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_w);
+                ImGui::TextWrapped(
+                    "cloudflared is not installed, so public parties cannot start. Install it with %s (or download it from Cloudflare) and restart crossfade, or switch Reach to Same Wi-Fi only.",
+#ifdef P100_WINDOWS
+                    "winget install --id Cloudflare.cloudflared");
+#elif defined(__APPLE__)
+                    "brew install cloudflared");
+#else
+                    "your package manager (for example pacman -S cloudflared)");
+#endif
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
+            settings_row_label("cloudflared path", nullptr,
+                               "Leave empty to search PATH. Set this if the binary is installed somewhere custom.");
+            ImGui::SetNextItemWidth(field_w);
+            ImGui::InputText("##party_tunnel_path", &ps.tunnel_path);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                while (!ps.tunnel_path.empty() &&
+                       std::isspace((unsigned char)ps.tunnel_path.front()))
+                    ps.tunnel_path.erase(ps.tunnel_path.begin());
+                while (!ps.tunnel_path.empty() &&
+                       std::isspace((unsigned char)ps.tunnel_path.back()))
+                    ps.tunnel_path.pop_back();
+                save = true;
+            }
+            settings_help("The public link is a random *.trycloudflare.com address that changes every time the party starts or the network changes. Cloudflare relays the guest page, so the link and its requests pass through Cloudflare; anyone with the link can add songs. Approval mode is recommended.");
+        }
+        else
+        {
+            settings_help("The link only works on this network. Hotspots and public Wi-Fi often isolate clients, so a phone may not reach this laptop even on the same Wi-Fi.");
+        }
 
         settings_group_label("Room");
         settings_row_label("Party name", nullptr,
@@ -1875,7 +1940,7 @@ void draw_settings_panel(AppState &state)
         for (const std::string &l : labels)
             ptrs.push_back(l.c_str());
         settings_row_label("Network", nullptr,
-                           "Pick the Wi-Fi or hotspot address phones can reach. Automatic skips Docker and VPN adapters and prefers the address your network routes.");
+                           "The local address the party server (and the Cloudflare tunnel) use. Automatic skips Docker and VPN adapters and prefers the address your network routes.");
         ImGui::SetNextItemWidth(field_w);
         if (ImGui::Combo("##party_iface", &current, ptrs.data(), (int)ptrs.size()))
         {
@@ -1899,7 +1964,10 @@ void draw_settings_panel(AppState &state)
             ps.port = std::max(1024, std::min(65535, ps.port));
             save = true;
         }
-        settings_help("Hotspots and public Wi-Fi often isolate clients. If a phone cannot open the link, make this laptop the hotspot, use a normal router, or disable client isolation. On Android 16+ Chrome may also need Nearby devices permission (or try Firefox).");
+        if (ps.public_reach())
+            settings_help("The tunnel connects to this local address; guests use the public link, so they do not need to be on this network.");
+        else
+            settings_help("Hotspots and public Wi-Fi often isolate clients. If a phone cannot open the link, make this laptop the hotspot, use a normal router, or disable client isolation. On Android 16+ Chrome may also need Nearby devices permission (or try Firefox).");
 
         settings_group_label("Who can add songs");
         if (settings_toggle_row("##party_approval", "Host approves every request",
@@ -2135,16 +2203,25 @@ void draw_settings_panel(AppState &state)
     {
         SettingsCard card("Library", "Caches, downloads and local data.", UiIcon::Download);
 
-    if (s_repair_running)
+    if (s_repair_running || download_metadata_repair_running())
     {
-        ImGui::Text("Repairing %d / %d  ·  %d covers  ·  %d lyrics",
-                    s_repair_done.load(), s_repair_total.load(),
-                    s_repair_covers.load(), s_repair_lyrics.load());
+        if (s_repair_running)
+            ImGui::Text("Repairing %d / %d  ·  %d covers  ·  %d lyrics",
+                        s_repair_done.load(), s_repair_total.load(),
+                        s_repair_covers.load(), s_repair_lyrics.load());
+        if (download_metadata_repair_running())
+        {
+            int done = 0, total = 0, updated = 0;
+            download_metadata_repair_progress(done, total, updated);
+            ImGui::Text("Repairing download metadata %d / %d  ·  %d updated", done, total,
+                        updated);
+        }
     }
     else
     {
         if (ui_secondary_button("Repair cached songs", ImVec2(200.0f * m.layout_scale, m.button_h)))
         {
+            start_download_metadata_repair(state, true);
             std::vector<Track> snapshot = state.downloaded_tracks;
             if (snapshot.empty())
                 snapshot = get_cached_tracks();
@@ -2160,7 +2237,7 @@ void draw_settings_panel(AppState &state)
                 });
             }
         }
-        settings_help("Re-download missing album covers and lyrics for downloaded songs.");
+        settings_help("Re-download missing album covers and lyrics, and repair downloaded artist/cover metadata.");
         if (s_repair_finished)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, ui_c().accent_text);
@@ -2301,6 +2378,8 @@ void draw_settings_panel(AppState &state)
                             "Cached album pages for instant/offline reopening.");
         settings_toggle_row("##xf_artist", "Artist cache", &s_xfer_sections.artist_cache,
                             "Cached artist pages for instant/offline reopening.");
+        settings_toggle_row("##xf_podcast", "Podcast cache", &s_xfer_sections.podcast_cache,
+                            "Cached podcast shows and episode lists for instant/offline reopening.");
         settings_toggle_row("##xf_lyrics", "Lyrics", &s_xfer_sections.lyrics,
                             "Downloaded per-track lyrics.");
         settings_toggle_row("##xf_thumbs", "Thumbnail cache", &s_xfer_sections.thumbs,

@@ -222,6 +222,10 @@ Grab the latest file for your distro from [Releases](../../releases):
 
 Arch users: `packaging/arch/PKGBUILD` in this repo builds via `makepkg -si`.
 
+Gentoo users: copy `packaging/gentoo/media-sound/crossfade` into a local
+overlay (or submit it to GURU). The ebuild builds with CMake and uses the
+system `ytmusicapi`/`yt-dlp` packages instead of a private venv.
+
 The packages set up the Python backend for you during install (one-time
 network fetch of `ytmusicapi` + `yt-dlp`). The AppImage bootstraps it into
 `~/.local/share/crossfade/venv` on first launch.
@@ -248,6 +252,13 @@ sudo dnf install @development-tools cmake SDL2-devel mesa-libGL-devel \
 ```
 
 You need **mpv ≥ 0.35** (libmpv is what the app links against).
+
+Public party links (the Party tab default) additionally need **`cloudflared`**;
+same-Wi-Fi parties work without it. Install it from your package manager where
+available, or from
+[Cloudflare's downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+If it is missing, crossfade says so in **Settings → Party** and when you try to
+start a party.
 
 ### 2. Build and install
 
@@ -483,8 +494,9 @@ The window has four persistent regions:
   rate, top-artist bars, and listening-by-hour charts for **All Time / This Month / This
   Week**.
 - **Smart** — **On Repeat** (your most-played tracks) and **Recently Played**.
-- **Party** — start a LAN party, show the QR code, approve guest requests, and
-  reopen the fullscreen code with `P`.
+- **Party** — start a party with a public Cloudflare link (or same-Wi-Fi only),
+  show the QR code, approve guest requests, and reopen the fullscreen code
+  with `P`.
 - **Albums / Artists** — saved grids; open any card for a detail page with **Play all**,
   save/unsave, and (for albums) download/delete.
 - **Playlists** — local playlists on the left, tracks on the right, with create, rename,
@@ -602,14 +614,20 @@ use **Copy diagnostics** when reporting a problem.
 ## Party mode
 
 Open **Party** (or press `P`) and choose **Start party**. The QR code appears
-right in the tab, ready to scan; anyone on the same Wi-Fi can join, search
-YouTube or paste a link, and add a song. Nothing leaves the local network: the
-server is part of crossfade, uses the existing Python backend for metadata, and
-never writes guest names or links to disk.
+right in the tab, ready to scan. By default the link is **public**: crossfade
+spawns a Cloudflare Quick Tunnel (`cloudflared`) in front of the local party
+server, so guests can join from any network, not just the same Wi-Fi. Press
+**Start LAN party** next to it for a one-off same-Wi-Fi party, or set
+**Settings → Party → Reach** to **Same Wi-Fi only** to make that the default.
+The server is part of crossfade, uses the existing Python backend for metadata,
+and never writes guest names or links to disk.
 
-- **Setup in Settings.** Party name, network address, port, approval, limits and
-  guest options live in **Settings → Party**. **Party settings** in the Party
-  tab jumps straight there. Changes apply the next time you start a party.
+- **Setup in Settings.** Party name, reach (public link or same Wi-Fi), network
+  address, tunnel binary path, port, approval, limits and guest options live in
+  **Settings → Party**. **Party settings** in the Party tab jumps straight
+  there. Changes apply the next time you start a party. Public parties need
+  `cloudflared` installed; the Settings page shows the install command for your
+  platform, and the Party tab warns before you start.
 - **One global queue.** Guest requests, your playlist and anything you queue
   manually share the same Up Next. Guest songs are interleaved round-robin,
   below explicit **Play next** pins but ahead of your playlist, so next/previous
@@ -625,19 +643,23 @@ never writes guest names or links to disk.
 - **Present QR.** Open a top-most fullscreen QR for a TV or projector, with a
   **Copy link** button; `Esc` or the close button returns to the app. Starting a
   party does not take over the screen automatically.
-- **Connection help.** The Party tab includes a same-Wi-Fi/hotspot/client
-  isolation reminder and a `/healthz` test link. On Android 16+, Chrome may need
-  **Nearby devices** permission before it can open a LAN address.
+- **Connection help.** The Party tab shows a `/healthz` test link and, for
+  same-Wi-Fi parties, a hotspot/client-isolation reminder. Public parties show
+  the tunnel state and keep the local link as a fallback. On Android 16+, Chrome
+  may need **Nearby devices** permission before it can open a LAN address.
 - **Privacy.** The party token lives only in the QR URL, guest ids are in memory
-  only, and the party never auto-starts or persists live state.
+  only, and the party never auto-starts or persists live state. Public links are
+  temporary Cloudflare Quick Tunnel addresses: Cloudflare relays the guest page
+  and can see the join link and its requests, and the address changes every time
+  the party starts or the network changes.
 
-Party mode binds to one LAN IPv4 address and serves plain HTTP. Use it on a
-trusted network; do not forward the port from your router. Hotspots and public
-Wi-Fi often isolate clients, so a phone that is not the hotspot owner may not
-reach the laptop even though both are "on the same Wi-Fi". If that happens, use
-a normal router, make the laptop the hotspot, or disable client isolation on
-the network. The full design and security notes are in
-[`docs/PARTY-MODE.md`](docs/PARTY-MODE.md).
+Party mode always binds to one LAN IPv4 address. Same-Wi-Fi mode serves plain
+HTTP and should be used on a trusted network; do not forward the port from your
+router. Hotspots and public Wi-Fi often isolate clients, so a phone that is not
+the hotspot owner may not reach the laptop even though both are "on the same
+Wi-Fi". If that happens, use the public link, use a normal router, make the
+laptop the hotspot, or disable client isolation on the network. The full design
+and security notes are in [`docs/PARTY-MODE.md`](docs/PARTY-MODE.md).
 
 ## Controls
 
@@ -695,7 +717,7 @@ history.
 | `liked.json` | Legacy liked tracks; imported into `library.db` and kept as a fallback |
 | `playlists/` | Legacy one-JSON-file-per-playlist data; imported into `library.db` and kept as a fallback |
 | `albums.json`, `artists.json` | Legacy saved album/artist metadata; imported into `library.db` |
-| `album_cache/`, `artist_cache/` | Cached album/artist headers and track lists (instant reopen, offline) |
+| `album_cache/`, `artist_cache/`, `podcast_cache/` | Cached album/artist/podcast headers and track/episode lists (instant reopen, offline) |
 | `history.json` | Legacy recently played timeline; imported into `library.db` |
 | `play_counts.json`, `play_log.json` | Legacy play counts/log used by Stats; imported into `library.db` |
 | `radio_last.cache` | Last radio station, so it reopens instantly |
@@ -972,7 +994,7 @@ C++/Python.
 | Lyrics are out of sync | **Settings → Lyrics → Timing offset** |
 | OAuth token rejected | Delete `browseroauth.json`, re-run the OAuth login, restart |
 | App won't start on Wayland | Run under XWayland (`SDL_VIDEODRIVER=x11 crossfade`) |
-| Guests can't open the party link | Make sure both devices are on the same Wi-Fi and no client-isolation/VPN blocks LAN traffic. Pick the right address in **Settings → Party → Network**. On a phone hotspot, the hotspot owner can often connect while other phones cannot: use a router or make the laptop the hotspot. On Android 16+, Chrome may show `ERR_TOO_MANY_RETRIES` until it is allowed to access nearby devices (Chrome → App info → Permissions → Nearby devices); Firefox is a quick alternative |
+| Guests can't open the party link | With **Reach → Public link**, install `cloudflared` and wait for the Party tab to show **PUBLIC** (the QR updates from the local fallback); a failed tunnel leaves the same-Wi-Fi link working. With **Same Wi-Fi only**, make sure both devices are on the same network and no client-isolation/VPN blocks LAN traffic. Pick the right address in **Settings → Party → Network**. On a phone hotspot, the hotspot owner can often connect while other phones cannot: use a router or make the laptop the hotspot. On Android 16+, Chrome may show `ERR_TOO_MANY_RETRIES` until it is allowed to access nearby devices (Chrome → App info → Permissions → Nearby devices); Firefox is a quick alternative |
 | Party port already in use | crossfade tries the next 10 ports automatically; or change the port in **Settings → Party** |
 | Guest search says it couldn't search | The local Python backend must be running and able to reach YouTube; adding a direct link still works when metadata lookup succeeds |
 
@@ -1011,7 +1033,7 @@ cat ~/.config/crossfade/audio_cache/<videoId>.meta.json
 - Linux is the primary target; Windows is beta and macOS is not started.
 - Cookie auth needs a periodic refresh; OAuth avoids most of that.
 - Manual skip crossfade only applies when the next track is already cached.
-- Party mode is LAN-only by design; it does not cross networks or VPNs.
+- Public party links require a locally installed `cloudflared`; Quick Tunnel addresses change each start, and Cloudflare relays the traffic. Same-Wi-Fi mode stays fully local.
 - No Flathub package yet; AppImage, deb, rpm and AUR are the current channels.
 - Two instances using the same config can briefly contend on the SQLite database.
 

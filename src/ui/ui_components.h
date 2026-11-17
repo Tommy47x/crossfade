@@ -18,6 +18,7 @@ struct TrackRowOptions
     bool show_duration = true;
     bool show_plays = false;
     bool show_delete = false;
+    const char *delete_label = "Delete";
     bool show_download = false;
     bool show_art_play = true;
     bool compact = false;
@@ -35,6 +36,9 @@ struct TrackRowOptions
     std::string right_text;
     bool selected = false;
     bool auto_play_double_click = true;
+    // Draw the shared right-click menu / "More" button. Studio turns this off
+    // so its local/beat lists don't offer YouTube-only actions.
+    bool show_context_menu = true;
     bool draggable = false;
     const char *drag_type = nullptr;
 };

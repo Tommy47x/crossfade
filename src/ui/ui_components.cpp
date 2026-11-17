@@ -1,4 +1,5 @@
 #include "ui_components.h"
+#include "local_audio.h"
 #include "ui.h"
 #include "ui_theme.h"
 #include "ui_backdrop.h"
@@ -84,7 +85,7 @@ static void draw_art(ImDrawList *dl, const std::string &url, ImVec2 pmin, ImVec2
 void ui_play_track(AppState &state, const Track &track, int index)
 {
     std::string thumb_url = track.thumbnail_url;
-    if (thumb_url.empty() && !track.id.empty())
+    if (thumb_url.empty() && !track.id.empty() && !is_local_track_id(track.id))
         thumb_url = "https://img.youtube.com/vi/" + track.id + "/hqdefault.jpg";
 
     state.current_title = track.title;
@@ -281,6 +282,7 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
     ImGui::Separator();
     ImGui::Spacing();
 
+    const bool local = track.id.rfind("local:", 0) == 0;
     const bool liked = is_track_liked(state, track.id);
     if (ImGui::MenuItem(liked ? "Unlike" : "Like"))
         toggle_like(state, track);
@@ -296,12 +298,13 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
             queue_remove_at(state, (int)(qit - state.play_queue.begin()));
     }
 
-    if (ImGui::MenuItem("Start Radio"))
+    if (!local && ImGui::MenuItem("Start Radio"))
     {
         start_radio_from_track(state, track);
     }
 
-    if (!track.album_id.empty() || !track.album.empty() || !track.id.empty())
+    if (!local &&
+        (!track.album_id.empty() || !track.album.empty() || !track.id.empty()))
     {
         if (ImGui::MenuItem("View album"))
             open_album_from_track(state, track);
@@ -326,7 +329,7 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
         }
     }
 
-    if (!track.artist_id.empty() || !track.id.empty())
+    if (!local && (!track.artist_id.empty() || !track.id.empty()))
     {
         if (ImGui::MenuItem("View artist"))
             open_artist_from_track(state, track);
@@ -348,6 +351,16 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
                 save_artist(state, a);
             }
         }
+    }
+
+    if (!local && !track.id.empty())
+    {
+        ImGui::Separator();
+        const std::string yt_url = "https://www.youtube.com/watch?v=" + track.id;
+        if (ImGui::MenuItem("Open on YouTube"))
+            ui_open_external_url(yt_url);
+        if (ImGui::MenuItem("Copy YouTube link"))
+            ui_copy_to_clipboard(yt_url);
     }
 
     ImGui::Separator();
@@ -711,7 +724,7 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     const float pad_y = (opt.compact ? m.space_1 : m.row_pad_y) * row_scale;
 
     const float rank_w = opt.show_rank ? 34.0f * m.layout_scale : 0.0f;
-    const float more_w = 32.0f * m.layout_scale;
+    const float more_w = opt.show_context_menu ? 32.0f * m.layout_scale : 0.0f;
     const float del_w_full = opt.show_delete ? 82.0f * m.layout_scale : 0.0f;
     const float dur_w_full = opt.show_duration ? 58.0f * m.layout_scale : 0.0f;
     const float right_text_w_full = opt.right_text.empty()
@@ -788,6 +801,21 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     const bool double_clicked = hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     const bool right_clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
     result.hovered = hovered;
+    // Pipe the hovered row to the main loop: after a short dwell it warms the
+    // stream URL so a click starts instantly (see prefetch_hovered_track).
+    if (hovered && !track.id.empty())
+    {
+        if (state.hovered_track_id != track.id)
+        {
+            state.hovered_track_id = track.id;
+            state.hovered_track_since = ImGui::GetTime();
+        }
+        state.hovered_track_frame = ImGui::GetFrameCount();
+    }
+    else if (!hovered && state.hovered_track_id == track.id)
+    {
+        state.hovered_track_id.clear();
+    }
     result.double_clicked = double_clicked;
     result.clicked = hovered && ImGui::IsItemClicked(ImGuiMouseButton_Left);
     result.ctrl_clicked = result.clicked && ImGui::GetIO().KeyCtrl;
@@ -827,7 +855,7 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     }
     const float vis_hover = hover_t * appear;
 
-    if (right_clicked)
+    if (right_clicked && opt.show_context_menu)
         ImGui::OpenPopup("TrackContextMenu");
 
     const bool current = (!state.current_track_id.empty() && track.id == state.current_track_id);
@@ -929,17 +957,21 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
                               ui_accent_u32(0.85f * appear), 1.0f);
     }
 
-    const float action_x = row_x + hit_w + m.space_1;
-    ImGui::SetCursorScreenPos(ImVec2(action_x, draw_y + (row_h - more_w) * 0.5f));
-    if (ui_icon_button("##track_more", UiIcon::More, more_w, false,
-                       ui_with_alpha(ui_text_muted_u32(), appear), "More"))
-        ImGui::OpenPopup("TrackContextMenu");
+    if (opt.show_context_menu)
+    {
+        const float action_x = row_x + hit_w + m.space_1;
+        ImGui::SetCursorScreenPos(ImVec2(action_x, draw_y + (row_h - more_w) * 0.5f));
+        if (ui_icon_button("##track_more", UiIcon::More, more_w, false,
+                           ui_with_alpha(ui_text_muted_u32(), appear), "More"))
+            ImGui::OpenPopup("TrackContextMenu");
+    }
 
     if (show_delete_inline)
     {
         ImGui::SetCursorScreenPos(ImVec2(row_x + full_w - del_w - m.space_1, draw_y + (row_h - m.control_h) * 0.5f));
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, appear);
-        const bool deleted = ImGui::Button("Delete", ImVec2(del_w, m.control_h));
+        const bool deleted = ImGui::Button(opt.delete_label ? opt.delete_label : "Delete",
+                                           ImVec2(del_w, m.control_h));
         ImGui::PopStyleVar();
         if (deleted)
         {
@@ -952,9 +984,10 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     }
 
     bool delete_requested = false;
-    ui_track_context_menu(state, track, opt.show_delete, opt.show_download,
-                          &result.download_requested, &result.download_remove,
-                          &delete_requested);
+    if (opt.show_context_menu)
+        ui_track_context_menu(state, track, opt.show_delete, opt.show_download,
+                              &result.download_requested, &result.download_remove,
+                              &delete_requested);
     if (delete_requested)
     {
         result.deleted = true;

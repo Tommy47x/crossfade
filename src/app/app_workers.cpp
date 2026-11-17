@@ -1,6 +1,8 @@
 #include "app_internal.h"
 
 #include "ytdlp.h"
+#include "search_top.h"
+#include "local_audio.h"
 #include "mpvplayer.h"
 #include "crossfade.h"
 #include "texture.h"
@@ -59,6 +61,8 @@ void background_download(const std::string &video_id)
         return; // low power: never download ahead of playback
     if (video_id.empty())
         return;
+    if (is_local_track_id(video_id))
+        return; // local files are already on disk
     if (!find_cached_audio_path(video_id).empty())
         return;
     {
@@ -85,11 +89,11 @@ void background_download(const std::string &video_id)
 }
 
 
-void load_recommendations(bool force)
+void load_recommendations(bool force, bool quiet)
 {
     auto tracks = fetch_recommendations(force);
     BackendError err = take_backend_error();
-    if (err)
+    if (err && !quiet)
         ui_notify_backend_error(err);
     // Don't clobber a good list with an empty one (e.g. a refresh that hit
     // a transient backend error) -- keep what's on screen and surface the
@@ -247,6 +251,20 @@ void search_all_and_update(const std::string &query, int expect_id)
         // Local library rows are authoritative and instant; put them first,
         // then append online results that aren't already present.
         merge_local_search_results(query, results);
+
+        // Search "Top result" card: YouTube's intent match, validated
+        // against these shelves and the local library (see search_top.cpp).
+        SearchTopInputs top_in;
+        top_in.query = query;
+        top_in.server = results.top;
+        top_in.songs = results.songs;
+        top_in.albums = results.albums;
+        top_in.artists = results.artists;
+        top_in.saved_albums = library::load_saved_albums();
+        top_in.saved_artists = library::load_saved_artists();
+        top_in.local_tracks = library::search_tracks(query, 60);
+        TopResult top = choose_search_top(top_in);
+
         // Warm the URLs of the visible results so clicking one starts fast.
         // Depth matches the rows a search page shows; warming runs on the
         // main backend channel and aborts as soon as search_id changes.
@@ -257,6 +275,8 @@ void search_all_and_update(const std::string &query, int expect_id)
                           std::make_shared<const std::vector<AlbumSummary>>(std::move(results.albums)));
         std::atomic_store(&g_state.search_artist_results,
                           std::make_shared<const std::vector<ArtistSummary>>(std::move(results.artists)));
+        std::atomic_store(&g_state.search_top,
+                          std::make_shared<const TopResult>(std::move(top)));
         g_state.current_playlist_source = PlaylistSource::SEARCH;
         g_state.search_loading = false;
         // Success clears any previous failure state; a genuinely empty result
@@ -275,6 +295,10 @@ void search_all_and_update(const std::string &query, int expect_id)
         {
             g_state.search_failed = true;
             g_state.search_error_msg = backend_error_user_message(err);
+            // A failed query has no card; don't leave the previous query's
+            // top result above an error state.
+            std::atomic_store(&g_state.search_top,
+                              std::make_shared<const TopResult>());
         }
     }
     std::lock_guard<std::mutex> lock(g_data_mutex);
@@ -282,6 +306,75 @@ void search_all_and_update(const std::string &query, int expect_id)
     g_state.repaint_requested = true;
 }
 
+// The two-request search page devotes only a few slots to albums/artists, so
+// the first time the user opens one of those chips we fetch that category's
+// full shelf and merge it into what the summary already published. Merging
+// (never replacing) keeps any rows that arrived while this was in flight.
+void search_category_and_update(const std::string &query, int category, int expect_id)
+{
+    if (query.empty())
+    {
+        g_state.search_loading = false;
+        return;
+    }
+
+    if (category == 1)
+    {
+        auto albums = fetch_search_albums(query);
+        if (g_state.search_id == expect_id)
+        {
+            auto current = std::atomic_load(&g_state.search_album_results);
+            std::vector<AlbumSummary> merged = current ? *current : std::vector<AlbumSummary>{};
+            std::unordered_set<std::string> seen;
+            for (const auto &a : merged)
+                seen.insert(a.browse_id);
+            for (auto &a : albums)
+                if (seen.insert(a.browse_id).second)
+                    merged.push_back(std::move(a));
+            std::atomic_store(&g_state.search_album_results,
+                              std::make_shared<const std::vector<AlbumSummary>>(std::move(merged)));
+        }
+    }
+    else if (category == 2)
+    {
+        auto artists = fetch_artist_search(query);
+        if (g_state.search_id == expect_id)
+        {
+            auto current = std::atomic_load(&g_state.search_artist_results);
+            std::vector<ArtistSummary> merged = current ? *current : std::vector<ArtistSummary>{};
+            std::unordered_set<std::string> seen;
+            for (const auto &a : merged)
+                seen.insert(a.browse_id);
+            for (auto &a : artists)
+                if (seen.insert(a.browse_id).second)
+                    merged.push_back(std::move(a));
+            std::atomic_store(&g_state.search_artist_results,
+                              std::make_shared<const std::vector<ArtistSummary>>(std::move(merged)));
+        }
+    }
+
+    BackendError err = take_backend_error();
+    if (err)
+        ui_notify_backend_error(err);
+    if (g_state.search_id == expect_id)
+        g_state.search_loading = false;
+    {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        g_state.backend_status = err;
+    }
+    g_state.repaint_requested = true;
+}
+
+void search_suggest_and_update(const std::string &query, int expect_id)
+{
+    SearchSuggestions sugg = fetch_search_suggestions(query);
+    if (g_state.search_suggest_id != expect_id)
+        return;
+    std::atomic_store(&g_state.search_suggestions,
+                      std::make_shared<const SearchSuggestions>(std::move(sugg)));
+    g_state.search_suggest_loading = false;
+    g_state.repaint_requested = true;
+}
 
 void load_lyrics_worker(std::string track_id, int expect_seq)
 {

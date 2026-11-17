@@ -171,6 +171,7 @@ directories are migrated once on first launch).
 - `artists.json` — saved artists (metadata for the permanent Artists tab)
 - `album_cache/<browse_id>.json` — cached album header + track list (instant reopen/offline)
 - `artist_cache/<channel_id>.json` — cached artist header + top songs + albums/singles (instant reopen/offline)
+- `podcast_cache/<browse_id>.json` — cached podcast header + episode list (instant reopen/offline)
 - `playlists/*.json` — one file per playlist
 - `audio_cache/` — downloaded audio files (opus/m4a/mp3) with `.meta.json` sidecars
 - `thumb_cache/` — cached thumbnail images

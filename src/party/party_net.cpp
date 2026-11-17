@@ -318,8 +318,15 @@ std::string best_ip()
         if (i.is_private)
             return i.ip;
     }
-    if (!all.empty())
-        return all.front().ip;
+    // A 169.254 self-assigned address means the interface has no usable
+    // network. Returning it would make a party QR point at an address other
+    // devices cannot reach (and flap during network transitions), so treat
+    // link-local-only as offline.
+    for (const Interface &i : all)
+    {
+        if (!is_link_local(i.ip))
+            return i.ip;
+    }
     return "";
 }
 

@@ -1,1 +1,40 @@
 fix crossfade
+
+A natural crossfade can override a manual track selection
+---------------------------------------------------------
+Reported 2026-11-16. Symptoms when clicking a track while the current one is
+inside its crossfade window:
+
+- the next track in the queue plays instead of the clicked one; clicking the
+  clicked row again plays the right one;
+- the lyrics panel shows the previous/next track's lyrics;
+- the seek bar's length/position keep changing with the other track.
+
+Cause, in order:
+
+1. app.cpp runs maybe_start_crossfade() before the pending-play block.
+   maybe_start_crossfade() does not check pending_manual_play /
+   pending_play_url, so a speculative fade starts after a click.
+2. adopt_fade_track() (app_playback.cpp:711) overwrites current_track_id,
+   title, artist and the lyrics target with the fade target -- which is the
+   next queue row -- and stores the clicked track as crossfade_from_track.
+3. The EOF handler's `g_cf.active` branch (app_playback.cpp:1280) promotes the
+   fade target and returns before the pending-manual-play guard below it.
+4. The "start" handler's was_manual branch assumes the UI already shows the
+   clicked track and never restores the metadata adopt_fade_track clobbered.
+5. Lyrics intentionally show the outgoing track until fade progress >= 0.5
+   (ui_lyrics.cpp:315); the seek bar switches to crossfade_position /
+   crossfade_duration at 0.5 (ui_bottom.cpp:148). Both then describe the wrong
+   track.
+
+Fix plan:
+
+1. maybe_start_crossfade(): return early while pending_manual_play or
+   pending_play_url is set -- a manual pick always beats a speculative fade.
+2. The EOF g_cf.active branch: if a manual play is pending, do not promote the
+   fade target; stop the helper and let the manual resolve take over.
+3. On the "start" event with was_manual, re-assert title/artist/thumbnail/ids
+   from the pending_* fields and refresh lyrics_requested_id.
+
+Repro: crossfade duration > 0, click a track during the last seconds of the
+current one; the next queue row plays. Setting crossfade to 0 should mask it.

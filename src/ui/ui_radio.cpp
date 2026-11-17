@@ -6,6 +6,7 @@
 #include "ui_icons.h"
 #include "ui_theme.h"
 #include "ytdlp.h"
+#include "local_audio.h"
 #include "paths.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <string>
@@ -32,7 +34,10 @@ constexpr size_t kPrefetchCount = 10;
 struct RadioSeed
 {
     Track track;
-    int plays = 0;
+    int plays = 0;        // display/hero count (recent when recency data exists)
+    int recent_plays = 0; // plays inside the recency window
+    double recent_score = 0.0;
+    int64_t last_ts = 0;
 };
 
 // Radio's motion clocks mirror the Stats page: one start stamp drives the
@@ -82,6 +87,17 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
 {
     std::unordered_map<std::string, Track> meta;
     std::unordered_map<std::string, int> plays;
+    std::unordered_map<std::string, int> recent_plays;
+    std::unordered_map<std::string, double> recent_score;
+    std::unordered_map<std::string, int64_t> last_ts;
+
+    // Seeds rotate with recent listening instead of freezing on all-time
+    // totals: the play log carries timestamps, so weigh plays by age (7-day
+    // half-life inside a 30-day window). Ranking falls back to all-time totals
+    // when the log has no usable timestamps or no recent plays.
+    const int64_t now = (int64_t)std::time(nullptr);
+    constexpr int64_t kRecencyWindowSec = 30 * 86400;
+    constexpr double kHalfLifeDays = 7.0;
 
     for (const auto &ev : state.play_log)
     {
@@ -94,6 +110,19 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
         t.thumbnail_url = ev.thumbnail_url;
         merge_meta(meta, t);
         ++plays[ev.id];
+        if (ev.ts > 0)
+        {
+            int64_t &last = last_ts[ev.id];
+            if (ev.ts > last)
+                last = ev.ts;
+            const int64_t age = now - ev.ts;
+            if (age >= 0 && age <= kRecencyWindowSec)
+            {
+                ++recent_plays[ev.id];
+                const double days = (double)age / 86400.0;
+                recent_score[ev.id] += std::pow(0.5, days / kHalfLifeDays);
+            }
+        }
     }
 
     // play_counts is the all-time total and survives the play_log ring cap.
@@ -117,16 +146,36 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
         for (const auto &t : *recs)
             merge_meta(meta, t);
 
+    auto make_seed = [&](const std::string &id, int all_time) {
+        RadioSeed s;
+        s.plays = all_time;
+        auto rp = recent_plays.find(id);
+        if (rp != recent_plays.end())
+            s.recent_plays = rp->second;
+        auto rs = recent_score.find(id);
+        if (rs != recent_score.end())
+            s.recent_score = rs->second;
+        auto lt = last_ts.find(id);
+        if (lt != last_ts.end())
+            s.last_ts = lt->second;
+        return s;
+    };
+
     std::vector<RadioSeed> out;
     out.reserve(plays.size());
     for (const auto &kv : plays)
     {
+        // Local files have no YouTube video id to seed a station with.
+        if (is_local_track_id(kv.first))
+            continue;
         auto it = meta.find(kv.first);
         if (it == meta.end() || it->second.title.empty())
             continue;
         Track t = it->second;
         ensure_thumb(t);
-        out.push_back(RadioSeed{t, kv.second});
+        RadioSeed s = make_seed(kv.first, kv.second);
+        s.track = std::move(t);
+        out.push_back(std::move(s));
     }
 
     if (out.empty())
@@ -135,7 +184,7 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
         auto add = [&](const std::vector<Track> &v) {
             for (const auto &src : v)
             {
-                if (src.id.empty() || src.title.empty())
+                if (src.id.empty() || is_local_track_id(src.id) || src.title.empty())
                     continue;
                 Track t = src;
                 ensure_thumb(t);
@@ -143,7 +192,9 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
                 auto pit = plays.find(t.id);
                 if (pit != plays.end())
                     p = pit->second;
-                out.push_back(RadioSeed{t, p});
+                RadioSeed s = make_seed(t.id, p);
+                s.track = std::move(t);
+                out.push_back(std::move(s));
             }
         };
         add(state.liked_tracks);
@@ -152,7 +203,20 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
             add(*recs);
     }
 
-    std::sort(out.begin(), out.end(), [](const RadioSeed &a, const RadioSeed &b) {
+    const bool any_recent =
+        std::any_of(recent_plays.begin(), recent_plays.end(),
+                    [](const std::pair<const std::string, int> &kv) { return kv.second > 0; });
+
+    std::sort(out.begin(), out.end(), [any_recent](const RadioSeed &a, const RadioSeed &b) {
+        if (any_recent)
+        {
+            if (a.recent_score != b.recent_score)
+                return a.recent_score > b.recent_score;
+            if (a.recent_plays != b.recent_plays)
+                return a.recent_plays > b.recent_plays;
+            if (a.last_ts != b.last_ts)
+                return a.last_ts > b.last_ts;
+        }
         if (a.plays != b.plays)
             return a.plays > b.plays;
         if (a.track.title != b.track.title)
@@ -160,7 +224,7 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
         return a.track.id < b.track.id;
     });
 
-    // De-duplicate while keeping the play-count-sorted order.
+    // De-duplicate while keeping the sorted order.
     std::vector<RadioSeed> unique;
     unique.reserve(std::min(out.size(), (size_t)kMaxSeeds));
     std::unordered_map<std::string, bool> seen;
@@ -173,6 +237,12 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
         if ((int)unique.size() >= kMaxSeeds)
             break;
     }
+    // In recency mode the tiles (and the hero's "N plays") show recent play
+    // counts, which is what explains the ordering. All-time totals remain the
+    // fallback when the log carries no timestamps.
+    if (any_recent)
+        for (RadioSeed &s : unique)
+            s.plays = s.recent_plays;
     return unique;
 }
 
@@ -189,6 +259,9 @@ static std::vector<RadioSeed> radio_seeds_cached(const AppState &state)
     size_t sig = 0;
     auto mix = [&sig](size_t v) { sig = sig * 1000003u + v; };
     mix(state.play_log.size());
+    // The log is a ring: at the cap its size stops changing, so include the
+    // newest timestamp to notice fresh plays.
+    mix(state.play_log.empty() ? 0 : (size_t)state.play_log.back().ts);
     mix(state.play_counts.size());
     mix(state.liked_tracks.size());
     mix(state.playback_history.size());
@@ -314,6 +387,9 @@ static bool load_radio_cache(AppState &state)
     }
     if (parts.size() < 5 || parts[0].empty())
         return false;
+    // Older builds could cache a local file as the seed; ignore that station.
+    if (is_local_track_id(parts[0]))
+        return false;
 
     auto tracks = parse_track_array(json_line);
     if (tracks.empty())
@@ -359,7 +435,7 @@ static Track seed_from_state(const AppState &state)
 
 static void begin_station(AppState &state, const Track &seed, int plays, bool switch_tab)
 {
-    if (seed.id.empty())
+    if (seed.id.empty() || is_local_track_id(seed.id))
         return;
 
     const uint64_t token = state.radio_request.fetch_add(1) + 1;
@@ -592,7 +668,7 @@ void draw_radio_panel(AppState &state)
     if (state.radio_seed_id.empty() && seeds.empty())
     {
         ui_empty_state(UiIcon::Radio, "No station yet",
-                       "Play a few songs and Radio will build itself from your most played");
+                       "Play a few songs and Radio will build itself from your recent listening");
         return;
     }
 
@@ -667,12 +743,17 @@ void draw_radio_panel(AppState &state)
     }
 
     // ------------------------------------------------------------------
-    // Start from: the most-played seeds, as tactile artwork tiles.
+    // Start from: recently played seeds (recency-weighted), as tactile
+    // artwork tiles.
     // ------------------------------------------------------------------
     if (!seeds.empty())
     {
         const bool has_plays = seeds.front().plays > 0;
-        header("Start from", has_plays ? "Your most played" : "From your library", nullptr, 0.24f);
+        const bool recent_mode = seeds.front().recent_score > 0.0;
+        header("Start from",
+               has_plays ? (recent_mode ? "Your recent listening" : "Your most played")
+                         : "From your library",
+               nullptr, 0.24f);
 
         const float tile_gap = m.space_2;
         const float min_tile = 206.0f * m.layout_scale + tile_gap;
@@ -857,8 +938,10 @@ void draw_radio_panel(AppState &state)
                         anim.in_view(origin.y, 100.0f);
         ImGui::Dummy(ImVec2(avail, h));
         const ImVec2 rmax(origin.x + avail, origin.y + h);
-        dl->AddRectFilled(origin, rmax,
-                          ui_with_alpha(ui_col(ui_c().surface_hover), t), m.radius_md);
+        // Translucent like the rest of the page: an opaque surface fill would
+        // punch a flat dark-grey hole into the ambient backdrop.
+        dl->AddRectFilled(origin, rmax, ui_with_alpha(ui_overlay_u32(0.05f), t),
+                          m.radius_md);
         dl->AddRect(origin, rmax, ui_with_alpha(ui_border_u32(), 0.7f * t), m.radius_md, 0, 1.0f);
         ui_draw_icon(dl, UiIcon::Radio,
                      ImVec2(origin.x + avail * 0.5f, origin.y + 34.0f * m.layout_scale),

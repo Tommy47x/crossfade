@@ -130,6 +130,9 @@ int main(int argc, char **argv)
     PartyServerConfig cfg;
     cfg.bind_ip = "127.0.0.1";
     cfg.public_ip = "127.0.0.1";
+    // Optional tunnel hostname, so the smoke test can exercise the public
+    // Host allowlist and the Secure cookie without a real tunnel.
+    cfg.public_host = argc > 2 ? argv[2] : "";
     cfg.port = argc > 1 ? std::atoi(argv[1]) : 18084;
     if (cfg.port < 1024 || cfg.port > 65000)
         cfg.port = 18084;
