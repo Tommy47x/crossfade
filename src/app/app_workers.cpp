@@ -89,8 +89,56 @@ void background_download(const std::string &video_id)
 }
 
 
+void background_video_download(const std::string &video_id, int max_height)
+{
+    if (video_id.empty() || is_local_track_id(video_id))
+        return;
+    if (!find_cached_video_path(video_id).empty())
+    {
+        g_downloads_dirty = true;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_download_mutex);
+        if (!g_downloading.insert("vid:" + video_id).second)
+            return; // already running
+    }
+    tasks::spawn("download-video", [video_id, max_height]()
+    {
+        std::string path = get_cached_video_path(video_id, max_height);
+        {
+            std::lock_guard<std::mutex> lock(g_download_mutex);
+            g_downloading.erase("vid:" + video_id);
+        }
+        if (!path.empty())
+        {
+            g_downloads_dirty = true;
+            ui_notify(UiNotifyType::Success, "Video downloaded",
+                      "It is now in Downloads (and plays offline).", 4.0f);
+        }
+        else
+        {
+            ui_notify(UiNotifyType::Warning, "Video download failed",
+                      "The video could not be downloaded.", 5.0f);
+        }
+    });
+}
+
 void load_recommendations(bool force, bool quiet)
 {
+    // Home is account-personalized. In guest mode the UI shows a sign-in
+    // prompt instead of fetching (and instead of an error toast).
+    if (backend_is_guest())
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+            g_state.home_failed = false;
+            g_state.home_error_msg.clear();
+        }
+        g_state.home_refreshing = false;
+        g_state.repaint_requested = true;
+        return;
+    }
     auto tracks = fetch_recommendations(force);
     BackendError err = take_backend_error();
     if (err && !quiet)

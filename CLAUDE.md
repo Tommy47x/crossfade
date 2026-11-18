@@ -52,6 +52,14 @@ install, put wheels in `wheels/` at the project root; the installer then uses
 The backend is selected from the auth mode stored in `settings.json` (Settings →
 Authentication), defaulting to browser cookies.
 
+When no usable session exists, both backends start in **guest mode**: they use an
+unauthenticated `YTMusic()` and serve public commands (search, albums, artists,
+radio, lyrics, podcasts) normally, while account commands (`recommendations`,
+library playlists, likes/playlist writes, saved podcasts) return
+`{"error": ..., "kind": "auth"}`. The ready handshake carries `"guest":true`; the
+C++ side exposes `backend_is_guest()` and the Home, YouTube and Podcasts tabs show
+sign-in prompts (linking to Settings → YouTube Music) instead of retrying.
+
 **Build from scratch after checkout** only requires the native dependencies and
 `python3`; `./install.sh` creates the venv and installs the Python packages.
 

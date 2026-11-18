@@ -54,6 +54,7 @@ std::string join_sections(const Sections &s)
     add(s.lyrics, "lyrics");
     add(s.thumbs, "thumbs");
     add(s.audio, "audio");
+    add(s.video, "video");
     add(s.logs, "logs");
     return out;
 }

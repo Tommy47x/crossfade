@@ -159,6 +159,7 @@ void save_settings(const Settings &settings)
         << "\"skip_crossfade_enabled\":" << (settings.skip_crossfade_enabled ? "true" : "false") << ","
         << "\"skip_crossfade_duration\":" << settings.skip_crossfade_duration << ","
         << "\"skip_crossfade_scope\":" << std::max(0, std::min(2, settings.skip_crossfade_scope)) << ","
+        << "\"video_quality\":" << std::max(0, std::min(2, settings.video_quality)) << ","
         << "\"volume_normalization\":" << (settings.volume_normalization ? "true" : "false") << ","
         << "\"show_notifications\":" << (settings.show_notifications ? "true" : "false") << ","
         << "\"endless_radio\":" << (settings.endless_radio ? "true" : "false") << ","
@@ -271,6 +272,11 @@ Settings load_settings()
         {
             const int scope = (int)std::lround(get_float("skip_crossfade_scope"));
             s.skip_crossfade_scope = std::max(0, std::min(2, scope));
+        }
+        if (json.find("\"video_quality\"") != std::string::npos)
+        {
+            const int q = (int)std::lround(get_float("video_quality"));
+            s.video_quality = std::max(0, std::min(2, q));
         }
         s.volume_normalization = get_bool("volume_normalization");
         s.show_notifications = get_bool("show_notifications");
@@ -1349,6 +1355,8 @@ void draw_settings_panel(AppState &state)
 
     if (state.settings_focus_party)
         s_settings_category = SC_PARTY;
+    if (state.settings_focus_auth)
+        s_settings_category = SC_YOUTUBE;
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::BeginChild("##settings_nav", ImVec2(nav_w, 0), ImGuiChildFlags_None,
@@ -1633,6 +1641,17 @@ void draw_settings_panel(AppState &state)
             ImGui::Dummy(ImVec2(0.0f, m.space_2));
         }
 
+        settings_group_label("Video");
+        {
+            static const char *quality_items[] = {"720p", "1080p", "Fit window"};
+            const int q = std::max(0, std::min(2, state.settings.video_quality));
+            settings_row_label("Music video quality", quality_items[q],
+                               "Resolution cap for the video page.");
+            ImGui::SetNextItemWidth(field_w);
+            if (ImGui::Combo("##video_quality", &state.settings.video_quality, quality_items, 3))
+                save = true;
+        }
+
         settings_group_label("Sound");
         if (settings_slider_row("##playback_speed", "Playback speed",
                                 &state.settings.playback_speed, 0.5f, 2.0f, "%.2fx",
@@ -1811,7 +1830,7 @@ void draw_settings_panel(AppState &state)
                                 &state.settings.server_sync,
                                 "Mirror likes and playlist edits to your signed-in account. Each playlist gets a private server-side copy that follows renames, adds and removals."))
         {
-            writeback_set_enabled(state.settings.server_sync);
+            writeback_set_enabled(state.settings.server_sync && !backend_is_guest());
             save = true;
         }
         settings_row_label("Discord Rich Presence",
@@ -2025,6 +2044,7 @@ void draw_settings_panel(AppState &state)
     if (s_settings_category == SC_YOUTUBE)
     {
         SettingsCard card("YouTube Music", "Account, cookies and stream resolving.", UiIcon::Playlist);
+        const float auth_section_y = ImGui::GetCursorPosY();
 
     const char *browsers[] = {"firefox", "chromium", "chrome", "brave", "edge", "librewolf"};
     int current_browser = 0;
@@ -2059,11 +2079,17 @@ void draw_settings_panel(AppState &state)
         save = true;
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_2));
+    settings_gap();
+    settings_help(backend_is_guest()
+        ? "Browsing as guest: search, albums, artists, radio and podcasts work. "
+          "Sign in to unlock personalized recommendations and your library."
+        : "Signed in to YouTube Music.");
     if (ui_primary_button("Sign in with browser", ImVec2(210.0f * m.layout_scale, m.button_h)))
     {
         const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
         AppState *sp = &state;
-        tasks::spawn([sp, script]() {
+        const bool oauth_mode = state.settings.auth_mode == "oauth";
+        tasks::spawn([sp, script, oauth_mode]() {
 #ifdef P100_WINDOWS
             // The vendored venv has ytmusicapi/yt-dlp and the Windows helper
             // opens a Tkinter sign-in window (no WebKitGTK/gi dependency).
@@ -2072,7 +2098,12 @@ void draw_settings_panel(AppState &state)
             const std::string cmd = "python3 \"" + script + "\" --google";
 #endif
             const int rc = std::system(cmd.c_str());
-            if (rc == 0)
+            if (rc == 0 && oauth_mode)
+            {
+                ui_notify(UiNotifyType::Info, "Browser session saved",
+                          "OAuth is selected; use the OAuth login command below.", 6.0f);
+            }
+            else if (rc == 0)
             {
                 sp->auth_refresh_requested = true;
                 ui_notify(UiNotifyType::Success, "Signed in",
@@ -2091,14 +2122,20 @@ void draw_settings_panel(AppState &state)
     {
         const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
         AppState *sp = &state;
-        tasks::spawn([sp, script]() {
+        const bool oauth_mode = state.settings.auth_mode == "oauth";
+        tasks::spawn([sp, script, oauth_mode]() {
 #ifdef P100_WINDOWS
             const std::string cmd = "\"" + backend_pythonw_path() + "\" \"" + script + "\" --import-firefox";
 #else
             const std::string cmd = "python3 \"" + script + "\" --import-firefox";
 #endif
             const int rc = std::system(cmd.c_str());
-            if (rc == 0)
+            if (rc == 0 && oauth_mode)
+            {
+                ui_notify(UiNotifyType::Info, "Browser session imported",
+                          "OAuth is selected; use the OAuth login command below.", 6.0f);
+            }
+            else if (rc == 0)
             {
                 sp->auth_refresh_requested = true;
                 ui_notify(UiNotifyType::Success, "Firefox session imported",
@@ -2188,6 +2225,11 @@ void draw_settings_panel(AppState &state)
         ImGui::TreePop();
     }
 
+        if (state.settings_focus_auth)
+        {
+            ImGui::SetScrollY(std::max(0.0f, auth_section_y - m.space_4));
+            state.settings_focus_auth = false;
+        }
     }
     if (s_settings_category == SC_SHORTCUTS)
     {
@@ -2387,6 +2429,8 @@ void draw_settings_panel(AppState &state)
                             "Cover artwork cache (can be several hundred MB).");
         settings_toggle_row("##xf_audio", "Downloaded audio", &s_xfer_sections.audio,
                             "Full audio cache. This can make the ZIP many GB; it is stored uncompressed for speed.");
+        settings_toggle_row("##xf_video", "Downloaded videos", &s_xfer_sections.video,
+                            "Offline video cache (video_cache/). Videos are large; this can make the ZIP very big.");
         settings_toggle_row("##xf_logs", "Logs & crash reports", &s_xfer_sections.logs,
                             "backend.log, crash logs and saved diagnostics bundles.");
 

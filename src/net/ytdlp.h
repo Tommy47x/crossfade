@@ -27,6 +27,8 @@ struct Track
     // playlist, album, etc.). Guest requests insert before these, but after
     // explicit "Play next" host items.
     bool from_queue_source = false;
+    // True for a row that comes from the offline video cache (Downloads).
+    bool is_video = false;
 };
 
 // Lyrics for one track. `ok` is false when the fetch failed (backend /
@@ -75,6 +77,9 @@ bool fetch_studio_analysis(const std::string &id, const std::string &audio_path,
 bool load_studio_analysis_file(const std::string &path, StudioAnalysis &out);
 
 bool start_backend();
+// True when the running backend started without a usable sign-in and is
+// limited to public browsing (search, albums, artists, radio, podcasts).
+bool backend_is_guest();
 // Whether start_backend() also launches the play/prefetch workers.
 void set_optional_backends_enabled(bool enabled);
 // While parked, commands fail fast instead of waiting for a backend that is
@@ -481,7 +486,62 @@ std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
 // Same, but bypass and replace the backend's cached URL (used after a
 // player-side load failure, which often means the googlevideo URL expired).
 std::string fetch_stream_url_fresh(const std::string &video_id);
+
+// Video stream pair for the main-area video surface. Both URLs belong to the
+// same video id: `video` is a video-only stream, `audio` (may be empty) the
+// separate audio stream, which mpv attaches with audio-add.
+struct VideoStreamUrls
+{
+    std::string video;
+    std::string audio;
+    std::string error;
+    // Fast path failed; the caller should retry with the full fallback walk.
+    bool retry = false;
+};
+VideoStreamUrls fetch_video_stream_urls(const std::string &video_id, bool fresh = false,
+                                        int max_height = 720, bool fast = false);
+
+// Official music-video match for a YouTube Music song id. `matched` is false
+// when the song's own upload is the best available (still a valid stream).
+struct MusicVideoMatch
+{
+    bool ok = false;
+    bool matched = false;
+    // The track's own upload is already a video: no search, no A/V sync.
+    bool self_video = false;
+    std::string id;
+    std::string title;
+    std::string artist;
+    int duration_sec = 0;
+    std::string error;
+};
+MusicVideoMatch fetch_music_video(const std::string &video_id);
+// Same lookup on the background channel, for parallel use with a resolve.
+MusicVideoMatch fetch_music_video_prefetch(const std::string &video_id);
+
+// Constant A/V offset for a matched music video: video_time = song_time +
+// offset. `confident` is false when the cross-correlation was ambiguous (the
+// caller then uses 0). Runs once per pair; the backend caches it on disk.
+struct VideoSyncResult
+{
+    bool ok = false;
+    bool confident = false;
+    double offset = 0.0;
+    double confidence = 0.0;
+    std::string error;
+};
+VideoSyncResult fetch_video_sync(const std::string &song_id, const std::string &video_id,
+                                 int song_duration_sec);
+// Cache-only variant: instant, hits the prefetch channel. `cached` is false
+// when the pair has not been analysed yet.
+VideoSyncResult fetch_video_sync_cached(const std::string &song_id, const std::string &video_id);
 std::vector<Track> get_cached_tracks();
+// Offline video cache (video_cache/<id>.mp4 and friends).
+std::string find_cached_video_path(const std::string &video_id);
+// Download (or return) the cached video file. Blocking: call on a worker.
+std::string get_cached_video_path(const std::string &video_id, int max_height = 720);
+std::vector<Track> get_cached_videos();
+void delete_cached_video(const std::string &video_id);
 
 // Cache path (ensuring the dir exists) where a streamed recording for
 // video_id should be written, e.g. <cache>/audio_cache/<id>.webm.

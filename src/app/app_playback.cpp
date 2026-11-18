@@ -15,6 +15,7 @@
 #include "mpris.h"
 #include "power.h"
 #include "party_queue.h"
+#include "video_surface.h"
 
 #include <algorithm>
 #include <atomic>
@@ -161,6 +162,20 @@ void resolve_audio(const std::string &video_id, const std::string &video_url,
         std::lock_guard<std::mutex> lock(g_play_queue_mutex);
         g_play_queue.push(std::move(req));
         return;
+    }
+    // A Downloads video row carries its local file in `video_url`. Play that
+    // file directly (offline) instead of re-resolving the stream.
+    if (!video_url.empty() && video_url.find("://") == std::string::npos)
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(video_url, ec))
+        {
+            req.path = video_url;
+            req.remote = false;
+            std::lock_guard<std::mutex> lock(g_play_queue_mutex);
+            g_play_queue.push(std::move(req));
+            return;
+        }
     }
     req.path = find_cached_audio_path(video_id);
     req.remote = false;
@@ -524,12 +539,685 @@ void commit_play_count()
 }
 
 
+// ----------------------------------------------------------------------
+// Video surface
+//
+// Audio always plays on its own player. The video page uses the idle mpv
+// instance to decode a MUTED video stream (aid=no), kept on the audible
+// player's timeline. Players never swap, so opening/closing the video or a
+// buffer hiccup on the video side can never interrupt the sound. While the
+// page is open, the muted video mirrors pause and follows seeks/drift.
+// A stream without video (or a failed resolve) leaves playback untouched and
+// only raises a toast.
+// ----------------------------------------------------------------------
+bool g_video_target_failed = false;
+bool g_video_follow_track = false;
+std::chrono::steady_clock::time_point g_video_requested_at{};
+
+// Player decoding the muted video while the page is open or preloading.
+static MpvPlayer *g_video_target = nullptr;
+static bool g_video_seek_done = false;
+// True once the preloading player has fully opened its new file (FILE_LOADED,
+// not START_FILE): only then is the track list meaningful.
+static bool g_video_file_loaded = false;
+// Throttle for alignment/seeking of the muted video.
+static std::chrono::steady_clock::time_point g_video_last_seek{};
+// Last audible-player seek generation the video has followed, and when it
+// was noticed (the audio's reported position lands a few frames later).
+static std::uint64_t g_video_audio_seek_gen = 0;
+static std::chrono::steady_clock::time_point g_video_audio_seek_at{};
+// Speed currently applied to the muted video player. Small nudges around the
+// user's speed keep it locked to the audio clock without seeking (which
+// would starve the video cache).
+static double g_video_applied_speed = 1.0;
+// Constant offset between the song timeline and the matched video's timeline
+// (video_time = song_time + offset). Estimated once per pair by the backend
+// (audio cross-correlation), cached there, 0 for the track's own upload.
+static double g_video_sync_offset = 0.0;
+// When the preload first became fully ready (seek done, playing, aligned).
+// The reveal waits a beat so the texture has live frames, not the pre-seek
+// still that used to be visible at the start of the animation.
+static std::chrono::steady_clock::time_point g_video_ready_at{};
+// No speed nudges / corrective seeks while the reveal animation runs: an mpv
+// speed change mid-animation can stall the decoder for a beat.
+static std::chrono::steady_clock::time_point g_video_hold_sync_until{};
+// Closing the page keeps the muted stream loaded and paused: reopening the
+// same track is then instant (no resolve, no reload; just a seek to catch up).
+static bool g_video_retained = false;
+static std::string g_video_retained_id;
+// Backend resolve results cross from the worker to the main loop here.
+struct VideoResolveResult
+{
+    std::string id;
+    std::string video;
+    std::string audio;
+    std::string error;
+    std::string title;   // matched music video's title, or the track title
+    std::string artist;
+    bool matched = false;
+    bool self_video = false;
+    // Interim result (the track's own upload, shown while the matched music
+    // video resolves) and a later hot-swap onto the matched video.
+    bool interim = false;
+    bool replace = false;
+    double sync_offset = 0.0;
+    bool sync_confident = false;
+    std::uint64_t gen = 0;
+};
+static std::mutex g_video_result_mutex;
+static std::shared_ptr<const VideoResolveResult> g_video_result;
+static std::uint64_t g_video_request_gen = 0;
+// A/V offset computed after the video has already started.
+struct VideoSyncMsg
+{
+    std::string song_id;
+    double offset = 0.0;
+    bool confident = false;
+    std::uint64_t gen = 0;
+};
+static std::shared_ptr<const VideoSyncMsg> g_video_sync_msg;
+
+// Events from the video player. START_FILE is only a hint: mpv's ytdl hook
+// emits it before the resolved file is open, so readiness is FILE_LOADED.
+static void video_target_event(const std::string &event)
+{
+    DLOG("video: event '%s'", event.c_str());
+    if (event == "loaded")
+        g_video_file_loaded = true;
+    else if (event.rfind("error", 0) == 0 || event == "end" || event == "stop")
+        g_video_target_failed = true;
+}
+
+// Stop the muted video player without touching the audible one.
+// `keep_frame` leaves the render surface attached so the page (if visible)
+// keeps showing the last frame while the next video preloads.
+static void stop_video_target(bool keep_frame)
+{
+    if (g_video_target)
+    {
+        if (g_video_target == display_player())
+            return; // safety: never stop the player that is making sound
+        g_video_target->set_event_callback(g_video_target == g_player.get() ? g_main_event_cb
+                                                                           : g_fade_event_cb);
+        g_video_target->set_volume(0);
+        g_video_target->set_stream_record("");
+        g_video_target->stop();
+        g_video_target->set_video_enabled(false);
+        g_video_target->set_audio_enabled(true);
+        // Drop any sync nudge so the idle player carries the user's speed into
+        // its next role (crossfade helper).
+        const double base = std::max(0.25, (double)g_state.settings.playback_speed);
+        g_video_target->set_speed(base);
+        g_video_applied_speed = base;
+        g_video_target = nullptr;
+    }
+    g_video_retained = false;
+    g_video_retained_id.clear();
+    g_video_sync_offset = 0.0;
+    if (!keep_frame)
+        video_surface().detach();
+}
+
+void begin_video_playback()
+{
+    if (!g_player || !g_fade_player || g_state.current_track_id.empty())
+        return;
+    if (g_state.video_loading.load())
+        return; // a preload is already in flight
+
+    // Instant reopen: the same track's muted stream is still loaded, paused.
+    if (g_video_retained && g_video_retained_id == g_state.current_track_id &&
+        g_video_target)
+    {
+        g_video_retained = false;
+        g_state.video_tab = g_state.current_tab;
+        g_state.video_loading = false;
+        g_state.video_active = true;
+        g_state.video_note.clear();
+        MpvPlayer *audible = display_player();
+        if (audible && g_video_target->cached_time_pos() >= 0.0)
+            g_video_target->seek(std::max(0.0, audible->cached_time_pos() + g_video_sync_offset));
+        g_video_audio_seek_gen = audible ? audible->seek_generation() : 0;
+        g_video_audio_seek_at = {};
+        const double base = std::max(0.25, (double)g_state.settings.playback_speed);
+        g_video_target->set_speed(base);
+        g_video_applied_speed = base;
+        g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
+        g_video_target->set_paused(!g_state.playing.load());
+        g_video_target->set_volume(0);
+        g_state.repaint_requested = true;
+        DLOG("video: reusing the retained stream");
+        return;
+    }
+    g_video_retained = false;
+    g_video_retained_id.clear();
+    g_video_sync_offset = 0.0;
+    g_video_ready_at = {};
+
+    // Free the idle player: an in-flight audio crossfade uses the helper.
+    settle_inflight_crossfade();
+    // A follow-up video reuses the same idle player; keep the page's frame.
+    stop_video_target(g_state.video_active);
+    g_state.video_tab = g_state.current_tab;
+
+    MpvPlayer *audible = display_player();
+    MpvPlayer *target = (audible == g_player.get()) ? g_fade_player.get() : g_player.get();
+    if (!target || target == audible)
+        return;
+    if (!video_surface().attached_to(*target) && !video_surface().attach(*target))
+    {
+        ui_notify(UiNotifyType::Info, "Video unavailable",
+                  "The video output could not be created on this display.", 4.0f);
+        return;
+    }
+
+    // Use the same (fixed) render size the page will use, so showing it
+    // later does not re-allocate the texture mid-animation.
+    {
+        int tw = 0, th = 0;
+        video_render_target_size(video_surface().aspect(), tw, th);
+        video_surface().set_target_size(tw, th);
+    }
+    target->set_event_callback(video_target_event);
+    target->set_stream_record("");
+    target->set_volume(0);
+    target->set_audio_enabled(false); // muted: sound stays on the audio player
+    target->set_video_enabled(true);
+
+    g_video_target = target;
+    g_video_target_failed = false;
+    g_video_seek_done = false;
+    g_video_file_loaded = false;
+    const std::uint64_t gen = ++g_video_request_gen; // invalidate older resolves
+    g_video_requested_at = std::chrono::steady_clock::now();
+    g_state.video_loading = true;
+    g_state.video_note.clear();
+    g_state.repaint_requested = true;
+
+    const std::string id = g_state.current_track_id;
+    if (id.rfind("local:", 0) == 0)
+    {
+        DLOG("video: preloading local file %s", g_state.current_track_url.c_str());
+        target->play_video(g_state.current_track_url);
+        target->set_paused(!g_state.playing.load());
+        return;
+    }
+
+    // Offline copy: play it from disk (instant, no resolve, works offline).
+    const std::string cached = find_cached_video_path(id);
+    if (!cached.empty())
+    {
+        DLOG("video: preloading cached file %s", cached.c_str());
+        g_state.current_video_title = g_state.current_title;
+        g_state.video_note.clear();
+        target->play_video(cached);
+        target->set_paused(!g_state.playing.load());
+        return;
+    }
+
+    // Quality cap for the resolve (0 = 720p, 1 = 1080p, 2 = window height).
+    int height = 720;
+    if (g_state.settings.video_quality == 1)
+        height = 1080;
+    else if (g_state.settings.video_quality == 2)
+        height = (int)ImGui::GetIO().DisplaySize.y;
+    height = std::clamp(height, 360, 1080);
+    const std::string track_title = g_state.current_title;
+    const std::string track_artist = g_state.current_artist;
+    MpvPlayer *audible_now = display_player();
+    const int song_duration = audible_now ? (int)std::lround(std::max(0.0, audible_now->cached_duration())) : 0;
+    // One-time analysis; explicitly skipped in low power mode.
+    const bool allow_sync = !power::low_power();
+
+    DLOG("video: resolving %s via the backend (h=%d)", id.c_str(), height);
+    tasks::spawn("video-resolve", [id, gen, height, track_title, track_artist,
+                                   song_duration, allow_sync]()
+    {
+        // The official-video lookup runs on the background channel while the
+        // fast resolve of the track's own upload happens in parallel.
+        MusicVideoMatch match;
+        std::thread match_thread([&]() { match = fetch_music_video_prefetch(id); });
+        VideoStreamUrls own = fetch_video_stream_urls(id, false, height, true);
+        match_thread.join();
+
+        const bool matched = match.ok && match.matched && !match.id.empty();
+        const bool self_video = matched && match.self_video;
+        const std::string stream_id = matched ? match.id : id;
+        const bool upgrade = matched && stream_id != id;
+
+        auto make_result = [&](const VideoStreamUrls &urls, bool is_matched,
+                               const std::string &title, const std::string &artist,
+                               bool is_interim, bool is_replace) {
+            auto res = std::make_shared<VideoResolveResult>();
+            res->id = id;
+            res->gen = gen;
+            res->video = urls.video;
+            res->audio = urls.audio;
+            res->error = urls.error;
+            res->matched = is_matched;
+            res->self_video = is_matched && self_video;
+            res->title = title;
+            res->artist = artist;
+            res->interim = is_interim;
+            res->replace = is_replace;
+            return res;
+        };
+        auto post = [&](const std::shared_ptr<VideoResolveResult> &res) {
+            std::lock_guard<std::mutex> lock(g_video_result_mutex);
+            if (!g_video_result || g_video_result->gen <= gen)
+                g_video_result = res;
+            g_state.repaint_requested = true;
+        };
+
+        // Instant start: the song's own upload is always playable and can be
+        // shown while the matched music video resolves. It is replaced in
+        // place once the match is ready (no page close, nothing to re-open).
+        if (upgrade && !own.video.empty())
+            post(make_result(own, false, track_title, track_artist, true, false));
+
+        VideoStreamUrls urls = upgrade ? VideoStreamUrls{} : own;
+        if (upgrade)
+        {
+            urls = fetch_video_stream_urls(stream_id, false, height, true);
+            if (urls.video.empty())
+                urls = fetch_video_stream_urls(stream_id, false, height, false);
+        }
+        else if (urls.video.empty())
+        {
+            // Fast path failed: full fallback walk in the background.
+            urls = fetch_video_stream_urls(stream_id, false, height, false);
+        }
+
+        double sync_offset = 0.0;
+        bool sync_confident = false;
+        bool sync_pending = false;
+        if (matched && !self_video && !urls.video.empty())
+        {
+            VideoSyncResult cached = fetch_video_sync_cached(id, stream_id);
+            if (cached.ok && cached.confident)
+            {
+                sync_offset = cached.offset;
+                sync_confident = true;
+            }
+            else
+            {
+                sync_pending = allow_sync && (cached.ok || !cached.error.empty());
+            }
+        }
+
+        auto final_res = make_result(urls, matched,
+                                     matched ? match.title : track_title,
+                                     matched ? match.artist : track_artist,
+                                     false, upgrade);
+        final_res->sync_offset = sync_offset;
+        final_res->sync_confident = sync_confident;
+        post(final_res);
+
+        if (sync_pending)
+        {
+            VideoSyncResult sync = fetch_video_sync(id, stream_id, song_duration);
+            auto msg = std::make_shared<VideoSyncMsg>();
+            msg->song_id = id;
+            msg->gen = gen;
+            msg->offset = sync.ok ? sync.offset : 0.0;
+            msg->confident = sync.ok && sync.confident;
+            {
+                std::lock_guard<std::mutex> lock(g_video_result_mutex);
+                g_video_sync_msg = std::move(msg);
+            }
+            g_state.repaint_requested = true;
+        }
+    });
+}
+
+// Main-loop side of the backend resolve: load the video URL into the muted
+// player. Only the video URL is used; audio keeps coming from its own player.
+void video_preload_poll()
+{
+    if (!g_video_target)
+        return;
+    // Results arrive while loading (first load) or while the page is open
+    // (hot-swap from the track's own upload to the matched music video).
+    if (!g_state.video_loading.load() && !g_state.video_active)
+        return;
+    std::shared_ptr<const VideoResolveResult> result;
+    {
+        std::lock_guard<std::mutex> lock(g_video_result_mutex);
+        result = std::move(g_video_result);
+        g_video_result.reset();
+    }
+    if (!result)
+        return;
+    if (result->gen != g_video_request_gen || result->id != g_state.current_track_id)
+    {
+        DLOG("video: dropping stale resolve %s", result->id.c_str());
+        return;
+    }
+    if (result->video.empty())
+    {
+        // The interim upload may still be on screen; keep it rather than
+        // tearing down a working video.
+        if (!g_state.video_active)
+            cancel_video_resolve(true);
+        return;
+    }
+
+    const bool hot = result->replace && g_state.video_active;
+    DLOG("video: resolved (%s, sync %s %.2fs%s)",
+         result->self_video ? "already a video"
+                            : (result->matched ? "matched music video" : "track upload"),
+         result->sync_confident ? "offset" : "none", result->sync_offset,
+         hot ? ", hot-swap" : "");
+    g_video_sync_offset = result->sync_offset;
+    g_state.current_video_title = result->title.empty() ? g_state.current_title : result->title;
+    if (result->interim)
+        g_state.video_note.clear();
+    else
+        g_state.video_note = result->matched
+                                 ? ""
+                                 : "No music video match - showing this track's own video.";
+
+    g_video_target->play_video(result->video);
+    g_video_target->set_paused(!g_state.playing.load());
+    if (hot)
+    {
+        // Keep the page up; jump the new stream to the audio position.
+        MpvPlayer *audible = display_player();
+        if (audible)
+            g_video_target->seek(std::max(
+                0.0, audible->cached_time_pos() + g_video_sync_offset + 0.1));
+        g_state.video_loading = false;
+        g_state.repaint_requested = true;
+    }
+}
+
+
+// Called once per frame while a preload is in flight, after the surface has
+// tried to render a frame. Shows the page once a real, aligned frame exists.
+void video_preload_tick(bool have_frame)
+{
+    if (!g_state.video_loading.load() || !g_video_target)
+        return;
+    if (g_video_target_failed)
+    {
+        cancel_video_resolve(true);
+        return;
+    }
+    g_video_target->set_paused(!g_state.playing.load());
+    if (!g_video_file_loaded)
+    {
+        if (std::chrono::steady_clock::now() - g_video_requested_at >
+            std::chrono::seconds(30))
+            cancel_video_resolve(true); // resolve never finished
+        return;
+    }
+    if (!g_video_target->has_video())
+    {
+        cancel_video_resolve(true); // audio-only upload, no video track
+        return;
+    }
+    if (!g_video_seek_done)
+    {
+        MpvPlayer *audible = display_player();
+        const double pos = audible ? audible->cached_time_pos() : -1.0;
+        if (pos > 0.5)
+            g_video_target->seek(std::max(0.0, pos + g_video_sync_offset));
+        g_video_seek_done = true;
+        g_video_last_seek = std::chrono::steady_clock::now();
+        return;
+    }
+    // Wait until the alignment seek has actually completed and playback has
+    // started: seeking still reports the seek target as time-pos, which made
+    // the first frames of the reveal show a frozen pre-seek image.
+    if (!have_frame || g_video_target->is_buffering() || g_video_target->is_seeking() ||
+        g_video_target->is_core_idle())
+        return;
+
+    MpvPlayer *audible = display_player();
+    const double audio_pos = audible ? audible->cached_time_pos() : -1.0;
+    const double tpos = g_video_target->cached_time_pos();
+    if (audio_pos >= 0.0 && tpos >= 0.0 &&
+        std::fabs(tpos - (audio_pos + g_video_sync_offset)) > 0.2)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_video_last_seek > std::chrono::milliseconds(350))
+        {
+            g_video_target->seek(std::max(0.0, audio_pos + g_video_sync_offset + 0.1));
+            g_video_last_seek = now;
+        }
+        return;
+    }
+    // Hold the reveal briefly: the seek completing and the clock advancing
+    // does not guarantee the *texture* has moved yet. Two or three rendered
+    // frames here are what make the picture live from the first animation
+    // frame.
+    const auto ready_now = std::chrono::steady_clock::now();
+    if (g_video_ready_at == std::chrono::steady_clock::time_point{})
+    {
+        g_video_ready_at = ready_now;
+        return;
+    }
+    if (ready_now - g_video_ready_at < std::chrono::milliseconds(100))
+        return;
+    finish_video_start();
+}
+
+// Main-loop side of the deferred A/V analysis. Applied as a one-time seek
+// (or stored for the retained reopen) when the background result arrives.
+void video_sync_poll()
+{
+    std::shared_ptr<const VideoSyncMsg> msg;
+    {
+        std::lock_guard<std::mutex> lock(g_video_result_mutex);
+        msg = std::move(g_video_sync_msg);
+        g_video_sync_msg.reset();
+    }
+    if (!msg)
+        return;
+    if (!msg->confident || msg->gen != g_video_request_gen ||
+        msg->song_id != g_state.current_track_id || !g_video_target)
+    {
+        DLOG("video: dropping sync result for %s", msg->song_id.c_str());
+        return;
+    }
+    g_video_sync_offset = msg->offset;
+    DLOG("video: sync offset applied %.2fs", msg->offset);
+    if (g_state.video_active)
+    {
+        MpvPlayer *audible = display_player();
+        if (audible)
+            g_video_target->seek(std::max(
+                0.0, audible->cached_time_pos() + g_video_sync_offset + 0.1));
+    }
+    g_state.repaint_requested = true;
+}
+
+void finish_video_start()
+{
+    if (!g_video_target)
+    {
+        cancel_video_resolve(false);
+        return;
+    }
+    g_state.video_loading = false;
+    g_state.video_active = true;
+    g_video_target_failed = false;
+    MpvPlayer *audible = display_player();
+    g_video_audio_seek_gen = audible ? audible->seek_generation() : 0;
+    g_video_audio_seek_at = {};
+    g_video_ready_at = {};
+    const double base = std::max(0.25, (double)g_state.settings.playback_speed);
+    g_video_target->set_speed(base);
+    g_video_applied_speed = base;
+    g_video_target->set_paused(!g_state.playing.load());
+    g_video_target->set_volume(0);
+    g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
+    g_state.repaint_requested = true;
+    DLOG("video: showing (audio=%.2f video=%.2f)",
+         audible ? audible->cached_time_pos() : -1.0,
+         g_video_target->cached_time_pos());
+}
+
+// While the page is open: mirror pause and follow user seeks. The two
+// decoders run on independent clocks; they stay within a frame of each other
+// on their own, so only an explicit seek (or a large stall) is corrected --
+// seeking every frame would starve the video cache and freeze the picture.
+void video_active_tick()
+{
+    if (!g_state.video_active || !g_video_target)
+        return;
+    if (g_video_target_failed)
+    {
+        DLOG("video: stream ended while active");
+        g_video_target_failed = false;
+        end_video_playback();
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    // Do no mpv work at all while the reveal runs: even synchronous property
+    // reads queue behind the player's decoder and were stalling the UI thread.
+    if (now < g_video_hold_sync_until)
+        return;
+
+    const bool want_pause = !g_state.playing.load();
+    if (g_video_target->is_paused() != want_pause)
+        g_video_target->set_paused(want_pause);
+    if (g_video_target->is_buffering())
+        return;
+
+    MpvPlayer *audible = display_player();
+    if (!audible)
+        return;
+
+    // A user seek bumps the audible player's seek generation. Give mpv a
+    // moment to report the landed position, then move the video there too.
+    const std::uint64_t gen = audible->seek_generation();
+    if (gen != g_video_audio_seek_gen)
+    {
+        g_video_audio_seek_gen = gen;
+        g_video_audio_seek_at = now;
+        return;
+    }
+    if (g_video_audio_seek_at != std::chrono::steady_clock::time_point{})
+    {
+        if (now - g_video_audio_seek_at < std::chrono::milliseconds(180))
+            return;
+        g_video_audio_seek_at = {};
+        g_video_target->seek(std::max(0.0, audible->cached_time_pos() + g_video_sync_offset + 0.1));
+        g_video_last_seek = now;
+        return;
+    }
+
+    // Warm the next track's match decision while the page is open: the
+    // search is the slow part of opening, and the backend caches it on disk,
+    // so advancing (or pressing V on the next track) starts instantly.
+    {
+        static std::string s_prefetched_next;
+        std::string next_id;
+        {
+            std::lock_guard<std::mutex> lock(g_data_mutex);
+            if (!g_state.play_queue.empty())
+                next_id = g_state.play_queue.front().id;
+        }
+        if (!next_id.empty() && next_id != g_state.current_track_id &&
+            next_id != s_prefetched_next)
+        {
+            s_prefetched_next = next_id;
+            tasks::spawn("video-match-prefetch", [next_id]()
+            {
+                fetch_music_video_prefetch(next_id);
+            });
+        }
+    }
+
+    // Recover only from a large drift (e.g. the video stream stalled and the
+    // audio kept going), and do it rarely.
+    const double audio_pos = audible->cached_time_pos();
+    const double tpos = g_video_target->cached_time_pos();
+    const double want_pos = audio_pos + g_video_sync_offset;
+    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > 2.0 &&
+        now - g_video_last_seek > std::chrono::seconds(2))
+    {
+        DLOG("video: resync (audio=%.2f video=%.2f offset=%.2f)", audio_pos, tpos,
+             g_video_sync_offset);
+        g_video_target->seek(std::max(0.0, want_pos + 0.1));
+        g_video_last_seek = now;
+        return;
+    }
+
+    // Fine lock: nudge the muted video's speed toward the audio position.
+    // Seeking for sub-second differences would drop the buffered video and
+    // cause the stutter; a few percent of speed is imperceptible and closes
+    // the gap within a couple of seconds.
+    const double base = std::max(0.25, (double)g_state.settings.playback_speed);
+    double desired = base;
+    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > 0.08)
+        desired = base + std::clamp((want_pos - tpos) * 0.25, -0.12, 0.12);
+    if (std::fabs(desired - g_video_applied_speed) > 0.004)
+    {
+        g_video_target->set_speed(desired);
+        g_video_applied_speed = desired;
+    }
+}
+
+void cancel_video_resolve(bool notify)
+{
+    stop_video_target(false);
+    g_state.video_loading = false;
+    g_state.video_theater = false;
+    g_video_target_failed = false;
+    g_video_seek_done = false;
+    g_video_file_loaded = false;
+    g_video_ready_at = {};
+    g_state.repaint_requested = true;
+    // Invalidate a resolve that is still running on its worker thread.
+    ++g_video_request_gen;
+    {
+        std::lock_guard<std::mutex> lock(g_video_result_mutex);
+        g_video_result.reset();
+    }
+    if (notify)
+        ui_notify(UiNotifyType::Info, "No video for this track",
+                  "Playing the audio only.", 3.5f);
+    DLOG("video: no video here, staying on audio");
+}
+
+void end_video_playback()
+{
+    if (!g_state.video_active && !g_state.video_loading.load())
+        return;
+    if (g_state.video_loading.load() && !g_state.video_active)
+    {
+        cancel_video_resolve(false);
+        return;
+    }
+    g_state.video_active = false;
+    g_state.video_loading = false;
+    g_state.video_theater = false;
+    g_video_follow_track = false;
+    // Keep the muted stream loaded and paused: the page fades out on the
+    // retained frame and reopening this track is instant. The audible player
+    // is untouched. Track changes release it (see begin_play_track).
+    if (g_video_target)
+    {
+        g_video_target->set_paused(true);
+        g_video_target->set_volume(0);
+        g_video_retained = true;
+        g_video_retained_id = g_state.current_track_id;
+    }
+    g_state.repaint_requested = true;
+    DLOG("video: back to audio (retained)");
+}
+
 void begin_play_track(const Track &t, int index)
 {
     if (t.id.empty())
         return;
     g_endless_waiting = false;
     stop_fade();
+    // Track change invalidates the retained/preloaded video. If the page is
+    // open, keep its last frame until the new video is ready.
+    stop_video_target(g_state.video_active);
     // Invalidate resolves still in flight for the previous selection; this
     // request's generation is captured when the resolver thread is spawned.
     g_play_generation.fetch_add(1);
@@ -831,6 +1519,8 @@ bool can_start_manual_crossfade(const Track &t)
         return false;
     if (!g_state.playing.load() || !g_player || !g_player->is_playing())
         return false;
+    if (g_state.video_active || g_state.video_loading.load())
+        return false;
     if (t.id.empty())
         return false;
     return true;
@@ -913,6 +1603,8 @@ void start_manual_crossfade(const Track &t, int index,
     // Restart semantics: a second Next during a fade cancels the running one
     // and starts a fresh fade toward the newly picked track.
     stop_fade();
+    // The helper player must be free for the fade.
+    stop_video_target(false);
     // The outgoing track is being skipped, so drop its partial recording now
     // (while the listen timer still refers to it -- discard_recording repairs
     // it in the background when enough was heard).
@@ -1003,6 +1695,12 @@ void maybe_start_crossfade()
         g_player->set_af(af);
         g_fade_player->set_af(af);
     }
+
+    // Video plays with a hard cut: never start or continue an audio fade
+    // while the video surface is up or a video is being preloaded (the idle
+    // player is busy with that preload).
+    if (g_state.video_active || g_state.video_loading.load())
+        return;
 
     // Manual skip fades are timer-driven: the outgoing file does not reach
     // EOF, so promote the helper once the ramp has run its course.
@@ -1148,6 +1846,8 @@ void maybe_start_crossfade()
     g_cf.user_volume = (float)g_player->get_property_double("volume");
     if (g_cf.user_volume <= 0.0f)
         g_cf.user_volume = 100.0f;
+    // The helper player must be free for this fade.
+    stop_video_target(false);
     g_fade_player->set_stream_record("");
     g_fade_player->set_volume(0);
     g_cf.seconds = cf;
@@ -1178,6 +1878,7 @@ bool advance_playback(bool manual)
 
 void handle_player_event(const std::string &event, MprisPlayer *mpris)
 {
+    DLOG("EVENT %s", event.c_str());
     if (event == "start") {
         static bool logged_first_audio = false;
         if (!logged_first_audio)
@@ -1188,6 +1889,22 @@ void handle_player_event(const std::string &event, MprisPlayer *mpris)
         g_state.loading = false;
         g_state.status_text = "Playing";
         g_state.repaint_requested = true;
+
+        if (g_state.video_open_on_start)
+        {
+            g_state.video_open_on_start = false;
+            begin_video_playback();
+        }
+
+        // Video page following the queue: the new track's audio is playing
+        // now, so preload its video on the idle player and swap when a real
+        // frame is ready (audio keeps running in the meantime).
+        if (g_video_follow_track)
+        {
+            g_video_follow_track = false;
+            DLOG("video: follow track start -> preload");
+            begin_video_playback();
+        }
 
         bool was_manual = g_state.pending_manual_play.exchange(false);
         if (was_manual) {

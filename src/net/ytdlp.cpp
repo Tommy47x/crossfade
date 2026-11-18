@@ -109,6 +109,9 @@ static BackendChannel g_backend;
 static BackendChannel g_play_backend;
 static BackendChannel g_prefetch_backend;
 static std::atomic<bool> g_backend_stopping{false};
+// Set from the backend's ready handshake: true when it started without a
+// usable sign-in and is limited to public (unauthenticated) browsing.
+static std::atomic<bool> g_backend_guest{false};
 static std::atomic<bool> g_optional_backends_enabled{true};
 static std::atomic<bool> g_backend_deferred{false};
 
@@ -186,6 +189,20 @@ BackendError take_backend_error()
     BackendError e = g_backend_error;
     g_backend_error.clear();
     return e;
+}
+
+// The ready handshake says whether the backend started without a usable
+// sign-in. Tolerant of spacing so older/compact JSON both work.
+static bool ready_says_guest(const std::string &ready)
+{
+    size_t pos = ready.find("\"guest\"");
+    if (pos == std::string::npos)
+        return false;
+    pos = ready.find(':', pos);
+    if (pos == std::string::npos)
+        return false;
+    pos = ready.find_first_not_of(" \t", pos + 1);
+    return pos != std::string::npos && ready.compare(pos, 4, "true") == 0;
 }
 
 // Map the Python {"kind": "..."} tag to the enum. Unknown/missing kinds fall
@@ -718,6 +735,7 @@ static bool spawn_backend(BackendChannel &ch)
         ch.ready_cv.notify_all();
         return false;
     }
+    g_backend_guest.store(ready_says_guest(ready), std::memory_order_relaxed);
     ch.ready.store(true, std::memory_order_release);
     ch.ready_cv.notify_all();
     return true;
@@ -809,6 +827,7 @@ static bool spawn_backend(BackendChannel &ch)
         ch.ready_cv.notify_all();
         return false;
     }
+    g_backend_guest.store(ready_says_guest(ready), std::memory_order_relaxed);
     ch.ready.store(true, std::memory_order_release);
     ch.ready_cv.notify_all();
     return true;
@@ -839,7 +858,6 @@ bool start_backend()
     // optimizations: spawning them takes ~2.5 s of Python startup, so they
     // come up in the background and stay on the main channel until ready.
     bool main_ok = spawn_backend(g_backend);
-
     // A backend restart during the session must not assign over a still
     // joinable thread (std::terminate).
     if (g_optional_backend_thread.joinable())
@@ -857,6 +875,11 @@ bool start_backend()
                             "warmups share the main backend channel.\n");
     });
     return main_ok;
+}
+
+bool backend_is_guest()
+{
+    return g_backend_guest.load(std::memory_order_relaxed);
 }
 
 void cancel_backend_startup()
@@ -2862,6 +2885,133 @@ std::string fetch_stream_url_fresh(const std::string &video_id)
     return json_get_string(response, "url");
 }
 
+VideoStreamUrls fetch_video_stream_urls(const std::string &video_id, bool fresh, int max_height,
+                                        bool fast)
+{
+    VideoStreamUrls out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    if (max_height <= 0)
+        max_height = 720;
+    std::string cmd;
+    if (fast && !fresh)
+        cmd = "play_video_fast ";
+    else
+        cmd = fresh ? "play_video_fresh " : "play_video ";
+    std::string response =
+        send_play_command(cmd + video_id + " " + std::to_string(max_height));
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.video = json_get_string(response, "video");
+    out.audio = json_get_string(response, "audio");
+    out.error = json_get_string(response, "error");
+    return out;
+}
+
+VideoSyncResult fetch_video_sync_cached(const std::string &song_id, const std::string &video_id)
+{
+    VideoSyncResult out;
+    if (song_id.empty() || video_id.empty() || is_local_media_id(song_id))
+        return out;
+    // Play channel: already booted for the match/resolve, so the cache hit
+    // does not wait for a cold prefetch process on the critical path.
+    const std::string response =
+        send_play_command("videosync_cached " + song_id + " " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    if (response.find("\"error\"") != std::string::npos)
+    {
+        out.error = jsonutil::get_string(response, "error");
+        return out;
+    }
+    // `ok` is the command status (true even when the pair is not cached yet).
+    out.ok = jsonutil::get_bool(response, "ok");
+    out.offset = jsonutil::get_double(response, "offset");
+    out.confidence = jsonutil::get_double(response, "confidence");
+    out.confident = jsonutil::get_bool(response, "confident");
+    return out;
+}
+
+VideoSyncResult fetch_video_sync(const std::string &song_id, const std::string &video_id,
+                                 int song_duration_sec)
+{
+    VideoSyncResult out;
+    if (song_id.empty() || video_id.empty() || is_local_media_id(song_id))
+        return out;
+    const std::string cmd = "videosync " + song_id + " " + video_id + " " +
+                            std::to_string(std::max(0, song_duration_sec));
+    const std::string response = send_prefetch_command(cmd);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    if (response.find("\"error\"") != std::string::npos)
+    {
+        out.error = jsonutil::get_string(response, "error");
+        return out;
+    }
+    out.ok = true;
+    out.offset = jsonutil::get_double(response, "offset");
+    out.confidence = jsonutil::get_double(response, "confidence");
+    out.confident = jsonutil::get_bool(response, "confident");
+    return out;
+}
+
+MusicVideoMatch fetch_music_video_prefetch(const std::string &video_id)
+{
+    MusicVideoMatch out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    std::string response = send_prefetch_command("musicvideo " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.error = json_get_string(response, "error");
+    if (!out.error.empty() || response.find("\"error\"") != std::string::npos)
+        return out;
+    out.ok = true;
+    out.id = json_get_string(response, "videoId");
+    out.title = json_get_string(response, "title");
+    out.artist = json_get_string(response, "artist");
+    out.duration_sec = json_get_int(response, "durationSec");
+    out.matched = jsonutil::get_bool(response, "matched");
+    out.self_video = jsonutil::get_bool(response, "self");
+    return out;
+}
+
+MusicVideoMatch fetch_music_video(const std::string &video_id)
+{
+    MusicVideoMatch out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    std::string response = send_play_command("musicvideo " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.error = json_get_string(response, "error");
+    if (!out.error.empty() || response.find("\"error\"") != std::string::npos)
+        return out;
+    out.ok = true;
+    out.id = json_get_string(response, "videoId");
+    out.title = json_get_string(response, "title");
+    out.artist = json_get_string(response, "artist");
+    out.duration_sec = json_get_int(response, "durationSec");
+    out.matched = jsonutil::get_bool(response, "matched");
+    out.self_video = jsonutil::get_bool(response, "self");
+    return out;
+}
+
 std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
     const std::vector<std::string> &video_ids)
 {
@@ -2982,6 +3132,162 @@ std::vector<Track> get_cached_tracks()
     }
 
     return tracks;
+}
+
+// ---------------------------------------------------------------------------
+// Offline video cache (Downloads tab)
+// ---------------------------------------------------------------------------
+static std::string video_cache_dir()
+{
+    std::string dir = cache_dir() + "/video_cache";
+    if (!ensure_dir(dir))
+        return "";
+    return dir;
+}
+
+std::string find_cached_video_path(const std::string &video_id)
+{
+    if (video_id.empty() || is_local_media_id(video_id))
+        return "";
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return "";
+    for (const char *ext : {"mp4", "mkv", "webm"})
+    {
+        const std::string path = dir + "/" + video_id + "." + ext;
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+            return path;
+    }
+    return "";
+}
+
+std::string get_cached_video_path(const std::string &video_id, int max_height)
+{
+    if (video_id.empty() || is_local_media_id(video_id))
+        return "";
+    std::string cached = find_cached_video_path(video_id);
+    if (!cached.empty())
+        return cached;
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return "";
+
+    const int h = std::clamp(max_height > 0 ? max_height : 720, 240, 2160);
+    const std::string hs = std::to_string(h);
+    const std::string format =
+        "bv*[vcodec^=avc1][height<=" + hs + "]+ba/"
+        "bv*[height<=" + hs + "]+ba/b[height<=" + hs + "]";
+    const std::string url = "https://www.youtube.com/watch?v=" + video_id;
+    const std::string output = " -o \"" + dir + "/" + video_id + ".%(ext)s\" ";
+    const std::string base = shell_quote(ytdlp_bin()) + " -f \"" + format +
+                             "\" --merge-output-format mp4 --no-progress "
+                             "--socket-timeout 15 --retries 2" + js_runtime_arg();
+
+    struct Attempt
+    {
+        const char *name;
+        std::string command;
+    };
+    const Attempt attempts[] = {
+        {"cookies", base + cookie_arg() + output + url},
+        {"public", base + output + url},
+        {"visionos", base + " --extractor-args \"youtube:player_client=visionos\"" + output + url},
+    };
+    for (const Attempt &attempt : attempts)
+    {
+        std::string output_text;
+        const int rc = run_capture(attempt.command, output_text);
+        std::string full_path = find_cached_video_path(video_id);
+        if (rc == 0 && !full_path.empty())
+        {
+            Track t = fetch_track_metadata(video_id);
+            if (!t.title.empty())
+                save_metadata(t, full_path);
+            return full_path;
+        }
+        log_download_failure(video_id, attempt.name, rc, output_text, attempt.command);
+    }
+    return "";
+}
+
+std::vector<Track> get_cached_videos()
+{
+    std::vector<Track> tracks;
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return tracks;
+
+    for (const std::string &name : list_dir_names(dir))
+    {
+        if (name == "." || name == "..")
+            continue;
+        size_t dot = name.find_last_of('.');
+        if (dot == std::string::npos)
+            continue;
+        if (name.size() > 10 && name.compare(name.size() - 10, 10, ".meta.json") == 0)
+            continue;
+        if (name.find('.') != dot)
+            continue; // fragments / parts
+
+        const std::string ext = name.substr(dot + 1);
+        if (!(ext == "mp4" || ext == "mkv" || ext == "webm"))
+            continue;
+        const std::string full_path = dir + "/" + name;
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        Track t;
+        t.is_video = true;
+        t.url = full_path;
+        t.id = name.substr(0, dot);
+        const std::string meta_path = full_path + ".meta.json";
+        if (stat(meta_path.c_str(), &st) == 0)
+        {
+            std::ifstream in(meta_path);
+            if (in.good())
+            {
+                std::string json((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+                const std::string stem = name.substr(0, dot);
+                t.id = json_get_string(json, "id");
+                if (t.id.empty())
+                    t.id = stem;
+                t.title = json_get_string(json, "title");
+                if (t.title.empty())
+                    t.title = stem;
+                t.artist = json_get_string(json, "artist");
+                if (t.artist.empty())
+                    t.artist = "Unknown";
+                t.album = json_get_string(json, "album");
+                t.album_id = json_get_string(json, "album_id");
+                t.artist_id = json_get_string(json, "artist_id");
+                t.thumbnail_url = json_get_string(json, "thumbnail_url");
+                t.duration_sec = json_get_int(json, "duration_sec");
+            }
+        }
+        else
+        {
+            t.title = name.substr(0, dot);
+            t.artist = "Unknown";
+        }
+        if (t.thumbnail_url.empty() && !t.id.empty() && !is_local_media_id(t.id))
+            t.thumbnail_url = "https://img.youtube.com/vi/" + t.id + "/hqdefault.jpg";
+        if (!t.title.empty())
+            tracks.push_back(t);
+    }
+    return tracks;
+}
+
+void delete_cached_video(const std::string &video_id)
+{
+    const std::string path = find_cached_video_path(video_id);
+    if (path.empty())
+        return;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path + ".meta.json", ec);
 }
 
 std::string recorded_audio_path(const std::string &video_id, const std::string &ext)

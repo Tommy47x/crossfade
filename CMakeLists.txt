@@ -68,6 +68,7 @@ set(SOURCES
     src/playback/crossfade.cpp
     src/playback/session.cpp
     src/playback/mpvplayer.cpp
+    src/playback/video_surface.cpp
     src/playback/local_audio.cpp
     src/ui/ui_helpers.cpp
     src/ui/format.cpp

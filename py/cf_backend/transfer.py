@@ -52,6 +52,7 @@ SECTIONS = {
     "lyrics": {"dirs": ["lyrics"]},
     "thumbs": {"dirs": ["thumb_cache"]},
     "audio": {"dirs": ["audio_cache"]},
+    "video": {"dirs": ["video_cache"]},
     "logs": {
         "files": ["backend.log"],
         "globs": ["crash-*.log", "hang-*.log", "diagnostics-*.txt"],
@@ -60,7 +61,7 @@ SECTIONS = {
 
 SECTION_NAMES = list(SECTIONS.keys())
 DEFAULT_SECTIONS = ["settings", "auth", "library", "album_cache", "artist_cache",
-                    "podcast_cache", "lyrics", "thumbs"]
+                    "podcast_cache", "lyrics", "thumbs", "video"]
 
 # Never put transient state or previous backups into a new archive.
 EXCLUDED_NAMES = {
@@ -70,7 +71,7 @@ EXCLUDED_NAMES = {
 EXCLUDED_PREFIXES = (".crossfade-import-", ".crossfade-pre-import-")
 EXCLUDED_SUFFIXES = (".tmp", ".zip", ".part")
 STORED_SUFFIXES = (".webm", ".opus", ".m4a", ".mp3", ".flac", ".aac", ".ogg",
-                   ".jpg", ".jpeg", ".png", ".webp", ".gif")
+                   ".mp4", ".mkv", ".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 
 def parse_sections(raw):
@@ -181,7 +182,8 @@ def write_archive(args):
         "dirs": dirs,
     }
 
-    stored_roots = {"audio": "audio_cache/", "thumbs": "thumb_cache/"}
+    stored_roots = {"audio": "audio_cache/", "video": "video_cache/",
+                    "thumbs": "thumb_cache/"}
     stored_prefixes = tuple(prefix for section, prefix in stored_roots.items() if section in sections)
 
     tmp_zip = zip_path.with_name(zip_path.name + ".part")

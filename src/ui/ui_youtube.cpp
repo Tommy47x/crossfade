@@ -16,6 +16,20 @@ void draw_youtube_panel(AppState &state)
     // Playlist fetches publish from workers; hold the same lock for the frame
     // so the vector and id/error strings cannot change mid-draw.
     std::lock_guard<std::recursive_mutex> state_lock(state.youtube_mutex);
+    // Account playlists need a session; keep the tab useful by pointing at
+    // Settings instead of firing account-only fetches.
+    if (backend_is_guest())
+    {
+        if (ui_sign_in_state("Sign in to YouTube Music",
+                             "Your account playlists need a signed-in session. "
+                             "Search, albums, artists and radio work without one.") == 1)
+        {
+            state.settings_focus_auth = true;
+            state.current_tab = Tab::Settings;
+            state.repaint_requested = true;
+        }
+        return;
+    }
     const UiMetrics &m = ui_m();
 
     // Account playlists (the "Liked Music" auto-playlist is included).

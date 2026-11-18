@@ -131,6 +131,10 @@ void ui_searching_state(UiIcon icon, const char *title, const char *subtitle = n
 // Inline error state for a failed fetch: error icon, reason, Retry button.
 // Returns true in the frame Retry is pressed.
 bool ui_error_state(const char *message, const char *retry_label = "Retry");
+// Centered guest/sign-in prompt for account-only surfaces. Returns 1 when
+// "Sign in" is pressed, 2 for the optional secondary action, 0 otherwise.
+int ui_sign_in_state(const char *title, const char *subtitle,
+                     const char *secondary_label = nullptr);
 
 struct MediaCardResult
 {

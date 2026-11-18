@@ -303,6 +303,20 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
         start_radio_from_track(state, track);
     }
 
+    if (!local)
+    {
+        if (track.id == state.current_track_id)
+        {
+            if (ImGui::MenuItem(state.video_active ? "Back to audio" : "Watch video"))
+                state.video_toggle_requested = true;
+        }
+        else if (ImGui::MenuItem("Play with video"))
+        {
+            state.video_open_on_start = true;
+            ui_play_track(state, track, -1);
+        }
+    }
+
     if (!local &&
         (!track.album_id.empty() || !track.album.empty() || !track.id.empty()))
     {
@@ -430,9 +444,31 @@ void ui_track_context_menu(AppState &state, const Track &track, bool allow_delet
     }
 
     const bool cached = !find_cached_audio_path(track.id).empty();
+    const bool video_cached = !track.id.empty() && !find_cached_video_path(track.id).empty();
+    const bool local_row = track.id.rfind("local:", 0) == 0;
     const bool in_downloads = state.current_tab == Tab::Downloads;
     // The Downloads tab already has "Delete download" below; every other list
     // can download/remove the cached file from the right-click menu again.
+    if (!track.id.empty() && !local_row && !show_download)
+    {
+        if (video_cached)
+        {
+            if (ImGui::MenuItem("Remove downloaded video"))
+            {
+                delete_cached_video(track.id);
+                g_downloads_dirty = true;
+                ui_notify(UiNotifyType::Success, "Video removed",
+                          track.title.empty() ? "The cached video was deleted." : track.title,
+                          4.0f);
+            }
+        }
+        else if (ImGui::MenuItem("Download video"))
+        {
+            state.video_download_request_id = track.id;
+            state.video_download_request_title = track.title;
+        }
+    }
+
     if (!track.id.empty() && !(cached && in_downloads))
     {
         ImGui::Separator();
@@ -920,6 +956,8 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     std::string secondary = opt.secondary;
     if (secondary.empty())
         secondary = track.artist.empty() ? "Unknown Artist" : track.artist;
+    if (track.is_video)
+        secondary = "Video  \xC2\xB7  " + secondary;
     if (opt.show_plays)
     {
         int plays = play_count_for(state, track.id);
@@ -1250,6 +1288,43 @@ bool ui_error_state(const char *message, const char *retry_label)
         ImGui::GetCursorScreenPos().x + (avail.x - btn.x) * 0.5f,
         ImGui::GetCursorScreenPos().y + m.space_5));
     return ui_ghost_button(label, btn);
+}
+
+// Centered guest/sign-in prompt. The caller routes the chosen action.
+int ui_sign_in_state(const char *title, const char *subtitle,
+                     const char *secondary_label)
+{
+    ui_empty_state(UiIcon::Artist, title, subtitle);
+    const UiMetrics &m = ui_m();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const char *primary = "Sign in";
+    const bool has_secondary = secondary_label && *secondary_label;
+
+    ImVec2 ts = ImGui::CalcTextSize(primary);
+    ImVec2 primary_btn(std::max(ts.x + m.space_6, m.control_h * 2.0f), m.control_h);
+    ImVec2 secondary_btn{};
+    if (has_secondary)
+    {
+        const ImVec2 ss = ImGui::CalcTextSize(secondary_label);
+        secondary_btn = ImVec2(std::max(ss.x + m.space_6, m.control_h * 2.0f),
+                               m.control_h);
+    }
+    const float total_w = primary_btn.x +
+                          (has_secondary ? m.space_2 + secondary_btn.x : 0.0f);
+    ImGui::SetCursorScreenPos(ImVec2(
+        ImGui::GetCursorScreenPos().x + (avail.x - total_w) * 0.5f,
+        ImGui::GetCursorScreenPos().y + m.space_5));
+
+    int action = 0;
+    if (ui_primary_button(primary, primary_btn))
+        action = 1;
+    if (has_secondary)
+    {
+        ImGui::SameLine(0.0f, m.space_2);
+        if (ui_ghost_button(secondary_label, secondary_btn))
+            action = 2;
+    }
+    return action;
 }
 
 // Animated variant of ui_empty_state for in-progress searches: breathing

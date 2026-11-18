@@ -240,6 +240,8 @@ struct AppState
     // Set by the Party tab's "Party settings" shortcut so the Settings page
     // scrolls straight to the Party section on the next frame.
     bool settings_focus_party = false;
+    // Set by the Home/YouTube guest prompt so Settings opens the sign-in card.
+    bool settings_focus_auth = false;
 
     // Backend diagnostics shown in Settings.
     bool backend_running = false;
@@ -338,10 +340,38 @@ struct AppState
     std::string pending_video_url;
     std::atomic<bool> pending_manual_play{false};
 
+    // Video surface (the main content area showing the current track's
+    // video). `video_active` is owned by the main loop: the UI only raises
+    // the two request flags and the loop drives mpv + the render surface.
+    bool video_active = false;
+    bool video_toggle_requested = false;
+    bool video_close_requested = false;
+    // Set while the video stream is resolving/starting (the page shows a
+    // spinner until the first frame arrives).
+    std::atomic<bool> video_loading{false};
+    // Human-readable note shown on the video page (e.g. why it fell back to
+    // the track's own upload).
+    std::string video_note;
+    // Title of the video actually shown (the matched music video's title
+    // when there is one, otherwise the track title).
+    std::string current_video_title;
+    // Fade/scale of the video page (0..1). UI-owned; the main loop keeps
+    // rendering while it is above zero so the close fade can finish.
+    float video_page_alpha = 0.0f;
+    // Full-window "theater" mode for the video page.
+    bool video_theater = false;
+    // Tab that was active when the video page opened; changing tabs closes it.
+    Tab video_tab = Tab::Home;
+    // Set by a "play with video" action: open the video once playback starts.
+    bool video_open_on_start = false;
+
     // Right-click "Download": the UI queues the request and the main loop
     // starts the background worker (and shows the toast).
     std::string download_request_id;
     std::string download_request_title;
+    // Same for "Download video" (offline video cache).
+    std::string video_download_request_id;
+    std::string video_download_request_title;
 
     // Playback queue. `play_queue` is the single global Up Next list: it
     // contains both host source tracks and guest requests, and playback only

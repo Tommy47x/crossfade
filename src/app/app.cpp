@@ -33,6 +33,7 @@
 #include "paths.h"
 #include "ytdlp.h"
 #include "mpvplayer.h"
+#include "video_surface.h"
 #include "local_audio.h"
 #include "crossfade.h"
 #include "ui.h"
@@ -561,7 +562,7 @@ int app_run(int argc, char **argv)
         g_state.settings.warm_stream_resolver = false;
         diagnostics::log("app", "safe mode enabled");
     }
-    writeback_set_enabled(g_state.settings.server_sync);
+    writeback_set_enabled(g_state.settings.server_sync && !backend_is_guest());
     discord_apply_client_id();
 
     const bool start_hidden = warm_flag;
@@ -772,6 +773,16 @@ int app_run(int argc, char **argv)
         return fatal_exit(1);
     }
     diagnostics::mark("imgui-backend");
+
+    // mpv's render thread asks for a frame when video is playing; post a user
+    // event so SDL_WaitEventTimeout() returns and the frame is presented on
+    // the next render pass (the callback runs off the main thread).
+    video_surface().set_wake_callback([]()
+    {
+        SDL_Event ev{};
+        ev.type = SDL_USEREVENT;
+        SDL_PushEvent(&ev);
+    });
 
     // ---- Mpv ----
     // Download cache cap (0 = unlimited). Re-applied live when the user
@@ -1117,8 +1128,18 @@ int app_run(int argc, char **argv)
             (now - last_activity_time) < std::chrono::milliseconds(1000);
 
         long long interval_ms = 1000;
+        // Video needs a frame every vblank (mpv's update callback also wakes
+        // the loop, but this keeps the cadence honest while the surface shows
+        // moving pictures).
+        // The video page needs vblank cadence while it is animating, playing,
+        // or preloading. Preloading at the idle cadence left the surface
+        // sampling stale frames, which showed up as a stutter at the pop-up.
+        const bool video_animating = g_state.video_active && g_state.video_page_alpha < 0.999f;
+        const bool video_frame = (g_state.video_active && g_state.playing) || video_animating ||
+                                 g_state.video_loading.load() ||
+                                 g_state.video_page_alpha > 0.001f;
         if (animating || g_state.loading || recently_active ||
-            g_cf.pending.load() || g_cf.active.load())
+            g_cf.pending.load() || g_cf.active.load() || video_frame)
             interval_ms = low_power ? 33 : 16;
         else if (g_state.playing)
             interval_ms = low_power ? 250 : 100;
@@ -1223,7 +1244,11 @@ int app_run(int argc, char **argv)
                     }
                     else if (key == SDLK_ESCAPE && !ctrl && !shift)
                     {
-                        if (g_state.party_fullscreen)
+                        if (g_state.video_theater)
+                            g_state.video_theater = false;
+                        else if (g_state.video_active)
+                            g_state.video_close_requested = true;
+                        else if (g_state.party_fullscreen)
                             g_state.party_fullscreen = false;
                         else if (g_state.show_shortcuts)
                             g_state.show_shortcuts = false;
@@ -1251,6 +1276,17 @@ int app_run(int argc, char **argv)
                             g_state.lyrics_requested_id = g_state.current_track_id;
                             g_state.lyrics_refresh_requested = true;
                         }
+                        g_state.repaint_requested = true;
+                    }
+                    else if (key == SDLK_v && !ctrl && !shift && !event.key.repeat)
+                    {
+                        g_state.video_toggle_requested = true;
+                        g_state.repaint_requested = true;
+                    }
+                    else if (key == SDLK_f && !ctrl && !shift && !event.key.repeat &&
+                             g_state.video_active)
+                    {
+                        g_state.video_theater = !g_state.video_theater;
                         g_state.repaint_requested = true;
                     }
                     else if (key == SDLK_s && !ctrl && !shift)
@@ -1367,6 +1403,9 @@ int app_run(int argc, char **argv)
 
         g_player->process_events();
         g_fade_player->process_events();
+        video_sync_poll();
+        if (g_state.video_active && !g_state.video_loading.load())
+            video_active_tick();
 
         // A background worker published data and/or a decoded thumbnail is
         // waiting for a GPU upload -- force a repaint now (not at the next
@@ -1583,7 +1622,56 @@ int app_run(int argc, char **argv)
                 g_state.repaint_requested = true;
             }
 
-            // Handle pending manual play
+            // ---- Video surface ----
+            // The UI only raises requests; entering/leaving video mode touches
+            // mpv, the render surface and the recording state, so it runs
+            // here on the main thread with the GL context current.
+            if (g_state.video_toggle_requested)
+            {
+                g_state.video_toggle_requested = false;
+                DLOG("video: toggle (active=%d loading=%d)",
+                     (int)g_state.video_active, (int)g_state.video_loading.load());
+                if (g_state.video_active || g_state.video_loading.load())
+                    end_video_playback();
+                else
+                    begin_video_playback();
+                g_state.repaint_requested = true;
+            }
+            if (g_state.video_close_requested)
+            {
+                g_state.video_close_requested = false;
+                end_video_playback();
+                g_state.repaint_requested = true;
+            }
+            // Navigating to another tab or starting a search closes the video
+            // page; audio continues in the background.
+            if (g_state.video_active &&
+                (g_state.current_tab != g_state.video_tab ||
+                 g_state.search_buffer[0] != '\0' || g_state.local_search_active ||
+                 g_state.focus_search_requested))
+                g_state.video_close_requested = true;
+
+            // Right-click Download video: start the background video download.
+            if (!g_state.video_download_request_id.empty())
+            {
+                const std::string id = g_state.video_download_request_id;
+                const std::string title = g_state.video_download_request_title;
+                g_state.video_download_request_id.clear();
+                g_state.video_download_request_title.clear();
+                int h = 720;
+                if (g_state.settings.video_quality == 1)
+                    h = 1080;
+                else if (g_state.settings.video_quality == 2)
+                    h = (int)ImGui::GetIO().DisplaySize.y;
+                h = std::clamp(h, 360, 1080);
+                background_video_download(id, h);
+                ui_notify(UiNotifyType::Info, "Downloading video",
+                          title.empty() ? "It will appear in Downloads when ready." : title,
+                          4.0f);
+                g_state.repaint_requested = true;
+            }
+
+                        // Handle pending manual play
             {
                 std::lock_guard<std::mutex> lock(g_data_mutex);
                 if (!defer_play && !g_state.pending_play_url.empty())
@@ -1592,6 +1680,12 @@ int app_run(int argc, char **argv)
                     // that fade before resolving the new track so the helper
                     // player cannot be left playing an orphaned track.
                     settle_inflight_crossfade();
+                    // A new track while the video page is up: the normal audio
+                    // path starts it (audio must never stop), and its video is
+                    // preloaded on the idle player once the audio is running.
+                    if (g_state.video_loading.load())
+                        cancel_video_resolve(false);
+                    g_video_follow_track = g_state.video_active;
                     bool fade_started = false;
                     // Optional skip crossfade for track clicks (scope >= 1).
                     // Session restore never takes this path because the main
@@ -1942,9 +2036,32 @@ int app_run(int argc, char **argv)
                 if (backend_boot_thread.joinable())
                     backend_boot_thread.join();
                 stop_backend();
-                backend_boot_state.store(start_backend() ? 1 : -1,
+                const bool started = start_backend();
+                backend_boot_state.store(started ? 1 : -1,
                                          std::memory_order_release);
                 backend_boot_reported = false;
+                if (started)
+                {
+                    if (!backend_is_guest())
+                    {
+                        // The guest-mode guards may have marked account data
+                        // as loaded; let the newly signed-in backend refill it.
+                        {
+                            std::lock_guard<std::recursive_mutex> lock(g_state.podcast_mutex);
+                            g_state.podcast_library_loaded = false;
+                        }
+                        {
+                            std::lock_guard<std::recursive_mutex> lock(g_state.youtube_mutex);
+                            g_state.youtube_playlists_loaded = false;
+                            g_state.youtube_playlists_refreshed = false;
+                        }
+                    }
+                    // Fresh session: pull the personalized Home feed again
+                    // (a guest start just clears the refreshing flag).
+                    g_state.home_refreshing = true;
+                    tasks::spawn("recommendations",
+                                 []() { load_recommendations(false, true); });
+                }
                 g_state.repaint_requested = true;
             }
             if (g_state.podcast_search_dirty)
@@ -2151,7 +2268,7 @@ int app_run(int argc, char **argv)
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_save_time).count() >= 10)
             {
                 // Pick up Settings changed while running (Discord id, write-back).
-                writeback_set_enabled(g_state.settings.server_sync);
+                writeback_set_enabled(g_state.settings.server_sync && !backend_is_guest());
                 discord_apply_client_id();
 
                 // Signing in (in-app helper, crossfade-login command or another
@@ -2254,7 +2371,8 @@ int app_run(int argc, char **argv)
             const bool want_render =
                 (have_event || repaint_now || animating || g_state.loading ||
                  recently_active || g_cf.pending.load() ||
-                 g_cf.active.load() || (g_state.playing) ||
+                 g_cf.active.load() || (g_state.playing) || g_state.video_active ||
+                 g_state.video_loading.load() || g_state.video_page_alpha > 0.001f ||
                  (now - last_render_time) > std::chrono::seconds(5)) &&
                 !g_window_hidden;
             if (want_render)
@@ -2366,6 +2484,8 @@ int app_run(int argc, char **argv)
                 ImGui::Text("Up / Down        Volume");
                 ImGui::Spacing();
                 ImGui::Text("L                Toggle lyrics panel");
+                ImGui::Text("V                Watch video");
+                ImGui::Text("F                Video theater mode");
                 ImGui::Text("S  Toggle sidebar");
                 ImGui::Text("Q  Up Next queue");
                 ImGui::Text("P  Party mode");
@@ -2385,6 +2505,31 @@ int app_run(int argc, char **argv)
             }
 
             draw_backend_debug(g_state);
+
+            // Video: the page computed the on-screen size while building the
+            // UI; decode/upload the next frame now, before the ImGui draw
+            // list samples the texture. While a preload runs off-screen, a
+            // small preview frame is enough to know the stream has video.
+            if (g_state.video_active || g_state.video_loading.load() ||
+                g_state.video_page_alpha > 0.001f)
+            {
+                if (g_state.video_loading.load())
+                {
+                    video_preload_poll();
+                    if (!g_state.video_active)
+                    {
+                        int tw = 0, th = 0;
+                        video_render_target_size(video_surface().aspect(), tw, th);
+                        video_surface().set_target_size(tw, th);
+                    }
+                    video_surface().render();
+                    video_preload_tick(video_surface().has_frame());
+                }
+                else
+                {
+                    video_surface().render();
+                }
+            }
 
             ImGui::Render();
             glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
@@ -2451,6 +2596,8 @@ int app_run(int argc, char **argv)
     DLOG("shutdown: textures");
     clear_texture_cache();
     DLOG("shutdown: players");
+    // The render context must go before the GL context and the mpv handles.
+    video_surface().detach();
     g_player.reset();
     g_fade_player.reset();
     g_player_raw = nullptr;

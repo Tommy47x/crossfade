@@ -18,6 +18,7 @@ struct Sections
     bool lyrics = true;
     bool thumbs = true;
     bool audio = false;
+    bool video = false;
     bool logs = false;
 };
 

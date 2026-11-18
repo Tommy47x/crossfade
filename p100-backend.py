@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Crossfade backend using browser-cookie authentication.
 
-Create the cookie file once with `ytmusicapi browser`. Everything else is in
-cf_backend.core so the cookie and OAuth entry points stay behaviorally
-identical.
+Create the cookie file once with `ytmusicapi browser`. Without a usable file the
+backend starts in guest mode (public browsing; account commands ask the user to
+sign in). Everything else is in cf_backend.core so the cookie and OAuth entry
+points stay behaviorally identical.
 """
 
 import json
@@ -48,32 +49,30 @@ def main():
         pass
 
     ensure_config_dir(CONFIG_DIR)
+    guest = True
+    yt = None
     if os.path.exists(AUTH_FILE):
         secure_auth_file(AUTH_FILE)
+        try:
+            yt = YTMusic(AUTH_FILE)
+            guest = False
+        except Exception as e:
+            # A broken session must not block public browsing: fall back to
+            # guest and let the UI offer a re-sign-in.
+            print(f"Auth file unusable ({e}); starting as guest.", file=sys.stderr)
 
-    if not os.path.exists(AUTH_FILE):
-        print(
-            json.dumps(
-                _err(
-                    f"Auth file '{AUTH_FILE}' not found. Run `ytmusicapi browser` "
-                    "to generate it, or set P100_AUTH_FILE to its path.",
-                    kind="auth",
-                )
-            )
-        )
-        sys.stdout.flush()
-        return
+    if yt is None:
+        try:
+            yt = YTMusic()  # anonymous default header; public browsing only
+        except Exception as e:
+            print(json.dumps(_err(f"Failed to initialize YTMusic: {str(e)}")))
+            sys.stdout.flush()
+            return
 
-    try:
-        yt = YTMusic(AUTH_FILE)
-    except Exception as e:
-        print(json.dumps(_err(f"Failed to initialize YTMusic: {str(e)}")))
-        sys.stdout.flush()
-        return
-
-    print(json.dumps({"status": "ready"}))
+    print(json.dumps({"status": "ready", "guest": guest},
+                     separators=(",", ":")))
     sys.stdout.flush()
-    run_command_loop(yt)
+    run_command_loop(yt, guest=guest)
 
 
 if __name__ == "__main__":

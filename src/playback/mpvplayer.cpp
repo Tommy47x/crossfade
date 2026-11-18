@@ -3,18 +3,45 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <utility>
+
+namespace
+{
+// Audio-only playback. The backend normally hands us a direct stream URL;
+// bestaudio is the format choice for the watch-URL fallback.
+constexpr const char *kAudioFormat = "bestaudio";
+// Music video: AVC first (hardware-decoded on most GPUs), 720p ceiling, and
+// a progressive single-file fallback when no separate pair is available.
+constexpr const char *kVideoFormat =
+    "bv*[vcodec^=avc1][height<=720]+ba/bv*[height<=720]+ba/b[height<=720]";
+} // namespace
 
 MpvPlayer::MpvPlayer(const std::string &browser)
 {
     mpv_handle *h = mpv_create();
     mpv.reset(h);
 
-    mpv_set_option_string(h, "video", "no");
+    // Video goes through the render API (VideoSurface) so it can be
+    // composited into the ImGui main area. Nothing is decoded by default:
+    // `vid=no` keeps audio-only playback exactly as before, and
+    // `audio-display=no` stops embedded cover art from becoming a still
+    // "video" for music tracks.
+    mpv_set_option_string(h, "vo", "libmpv");
+    mpv_set_option_string(h, "vid", "no");
+    mpv_set_option_string(h, "audio-display", "no");
+    mpv_set_option_string(h, "hwdec", "auto-safe");
+    // The video page's muted player ran with a shallow cache: each render
+    // could wait on the network, which showed up as ~38 ms frame stalls.
+    mpv_set_option_string(h, "cache", "yes");
+    mpv_set_option_string(h, "cache-secs", "30");
+    mpv_set_option_string(h, "demuxer-readahead-secs", "30");
+    mpv_set_option_string(h, "demuxer-max-bytes", "67108864");
+    mpv_set_option_string(h, "demuxer-max-back-bytes", "33554432");
     mpv_set_option_string(h, "terminal", "no");
     mpv_set_option_string(h, "msg-level", "all=status");
 
     mpv_set_option_string(h, "ytdl", "yes");
-    mpv_set_option_string(h, "ytdl-format", "bestaudio");
+    mpv_set_option_string(h, "ytdl-format", kAudioFormat);
     // Direct googlevideo streams are 403 without a YouTube referrer.
     mpv_set_option_string(h, "referrer", "https://www.youtube.com/");
     mpv_set_option_string(h, "user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
@@ -43,6 +70,88 @@ MpvPlayer::~MpvPlayer() = default;
 
 void MpvPlayer::play(const std::string &url)
 {
+    audio_enabled = true; // ordinary audio playback always has sound
+    load_file(url, false);
+}
+
+void MpvPlayer::play_video(const std::string &url)
+{
+    load_file(url, true);
+}
+
+void MpvPlayer::set_video_enabled(bool enabled)
+{
+    // Track selection only: the stream keeps playing, decoding starts or
+    // stops, and the render surface simply has no new frames to show.
+    set_property("vid", enabled ? "auto" : "no");
+}
+
+void MpvPlayer::set_audio_enabled(bool enabled)
+{
+    audio_enabled = enabled;
+    set_property("aid", enabled ? "auto" : "no");
+}
+
+bool MpvPlayer::has_video() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int64_t count = 0;
+    if (mpv_get_property(mpv.get(), "track-list/count", MPV_FORMAT_INT64, &count) < 0)
+        return false;
+    for (int64_t i = 0; i < count; ++i)
+    {
+        const std::string prop = "track-list/" + std::to_string(i) + "/type";
+        char *type = nullptr;
+        if (mpv_get_property(mpv.get(), prop.c_str(), MPV_FORMAT_STRING, &type) < 0)
+            continue;
+        const bool video = type && strcmp(type, "video") == 0;
+        mpv_free(type);
+        if (video)
+            return true;
+    }
+    return false;
+}
+
+int MpvPlayer::track_count() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int64_t count = 0;
+    if (mpv_get_property(mpv.get(), "track-list/count", MPV_FORMAT_INT64, &count) < 0)
+        return 0;
+    return (int)count;
+}
+
+bool MpvPlayer::is_buffering() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int flag = 0;
+    return mpv_get_property(mpv.get(), "paused-for-cache", MPV_FORMAT_FLAG, &flag) >= 0 &&
+           flag != 0;
+}
+
+bool MpvPlayer::is_paused() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int flag = 0;
+    return mpv_get_property(mpv.get(), "pause", MPV_FORMAT_FLAG, &flag) >= 0 && flag != 0;
+}
+
+bool MpvPlayer::is_seeking() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int flag = 0;
+    return mpv_get_property(mpv.get(), "seeking", MPV_FORMAT_FLAG, &flag) >= 0 && flag != 0;
+}
+
+bool MpvPlayer::is_core_idle() const
+{
+    std::lock_guard<std::mutex> lock(prop_mutex);
+    int flag = 0;
+    return mpv_get_property(mpv.get(), "core-idle", MPV_FORMAT_FLAG, &flag) >= 0 && flag != 0;
+}
+
+void MpvPlayer::load_file(const std::string &url, bool video)
+{
     seeked = false; // new file: any prior seek no longer applies
     // Replacing the current file makes mpv report END_FILE reason STOP for it;
     // remember that so process_events() doesn't pass it off as a real stop.
@@ -55,6 +164,9 @@ void MpvPlayer::play(const std::string &url)
     {
         std::lock_guard<std::mutex> lock(prop_mutex);
         mpv_set_property_string(mpv.get(), "ytdl", needs_ytdl ? "yes" : "no");
+        mpv_set_property_string(mpv.get(), "vid", video ? "auto" : "no");
+        mpv_set_property_string(mpv.get(), "aid", audio_enabled ? "auto" : "no");
+        mpv_set_property_string(mpv.get(), "ytdl-format", video ? kVideoFormat : kAudioFormat);
     }
     const char *cmd[] = {"loadfile", url.c_str(), "replace", nullptr};
     mpv_command_async(mpv.get(), 0, cmd);
@@ -128,6 +240,13 @@ void MpvPlayer::process_events()
             playing = true;
             replacing = false; // any swap marker is spent by now
             type = "start";
+            break;
+        case MPV_EVENT_FILE_LOADED:
+            // The demuxer has opened the file and the track list is final.
+            // START_FILE fires earlier, while the previous file's tracks may
+            // still be listed -- callers that inspect track types must wait
+            // for this one.
+            type = "loaded";
             break;
         case MPV_EVENT_END_FILE:
         {
@@ -217,7 +336,11 @@ void MpvPlayer::seek(double position)
     if (!is_position_cached(position))
         seeked = true;
     std::string pos_str = std::to_string(position);
-    const char *cmd[] = {"seek", pos_str.c_str(), "absolute", nullptr};
+    // exact: without it a video stream seeks to the previous keyframe, which
+    // can land up to a couple of seconds early (audible as a skip backwards
+    // at the audio->video hand-over, and wrong after a user seek). Audio-only
+    // streams are unaffected; exact is simply more precise.
+    const char *cmd[] = {"seek", pos_str.c_str(), "absolute+exact", nullptr};
     mpv_command_async(mpv.get(), 0, cmd);
 }
 

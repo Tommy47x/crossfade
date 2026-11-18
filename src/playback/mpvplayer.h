@@ -16,6 +16,24 @@ public:
     ~MpvPlayer();
 
     void play(const std::string &url);      // replaces playlist with this track
+    // Load a video stream (the render surface draws it).
+    void play_video(const std::string &url);
+    // Decode video from the current stream, or stop decoding it. The render
+    // surface stays attached; toggling only changes the track selection.
+    void set_video_enabled(bool enabled);
+    // Select/disable the audio track. Video playback mutes it: the sound
+    // keeps coming from the player that owns audio playback.
+    void set_audio_enabled(bool enabled);
+    // True when the current file has a decodable video track.
+    bool has_video() const;
+    // Number of demuxed tracks. 0 while a ytdl resolve is still in flight
+    // (START_FILE fires before the hook has opened the real file).
+    int track_count() const;
+    // True while the player has stalled to fill its cache.
+    bool is_buffering() const;
+    bool is_paused() const;
+    bool is_seeking() const;
+    bool is_core_idle() const;
     void stop();
     void toggle_pause();
     void set_paused(bool paused);
@@ -62,6 +80,7 @@ public:
     mpv_handle *handle() const { return mpv.get(); }
 
 private:
+    void load_file(const std::string &url, bool video);
     struct Deleter
     {
         void operator()(mpv_handle *h)
@@ -77,6 +96,8 @@ private:
     std::atomic<double> c_volume{-1.0};
     std::atomic<bool> seeked{false};
     std::atomic<std::uint64_t> seek_gen{0};
+    // Audio track selection for the next file (false = muted video player).
+    std::atomic<bool> audio_enabled{true};
     // Set by play(): mpv ends the file we're replacing with reason STOP, which
     // is our track change rather than a real "stop playback" event.
     std::atomic<bool> replacing{false};

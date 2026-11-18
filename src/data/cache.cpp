@@ -79,6 +79,10 @@ void save_lyrics_cache(const std::string &video_id, const Lyrics &lyrics)
 void load_downloaded_tracks(AppState &state)
 {
     state.downloaded_tracks = get_cached_tracks();
+    {
+        auto videos = get_cached_videos();
+        state.downloaded_tracks.insert(state.downloaded_tracks.end(), videos.begin(), videos.end());
+    }
     if (library::available())
         library::save_downloads(state.downloaded_tracks);
     state.downloaded_loaded = true;
@@ -101,6 +105,7 @@ void delete_downloaded_track(AppState &state, std::string id)
         std::filesystem::remove(path);
         std::filesystem::remove(path + ".meta.json");
     }
+    delete_cached_video(id);
     // Also drop cached lyrics so a future re-download starts clean.
     std::filesystem::remove(lyrics_cache_path(id));
 

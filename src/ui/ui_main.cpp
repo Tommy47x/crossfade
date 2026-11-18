@@ -7,6 +7,7 @@
 #include "ui_layout.h"
 #include "ui_theme.h"
 #include "mpvplayer.h"
+#include "video_surface.h"
 #include "ytdlp.h"
 
 #include <algorithm>
@@ -958,9 +959,38 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
             search_failed = state.search_failed;
             search_error = state.search_error_msg;
         }
+        const BackendError backend_status = state.backend_status_snapshot();
+        const bool show_guest = home && !searching && backend_is_guest();
+        const bool show_auth = home && !searching && home_failed &&
+                               backend_status.kind == BackendErrKind::Auth;
         if (hero_tab)
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, anim.stagger(0.12f, 0.5f));
-        if (home && home_failed && !searching)
+        if (show_guest || show_auth)
+        {
+            const char *title = show_guest
+                                    ? "Sign in to YouTube Music"
+                                    : "Your YouTube Music session expired";
+            const char *sub =
+                show_guest
+                    ? "Sign in for personalized recommendations. Search works "
+                      "without an account."
+                    : home_error.c_str();
+            const int action =
+                ui_sign_in_state(title, sub, show_guest ? "Search music" : nullptr);
+            if (action == 1)
+            {
+                state.settings_focus_auth = true;
+                state.current_tab = Tab::Settings;
+                state.repaint_requested = true;
+            }
+            else if (action == 2)
+            {
+                // Stay on Home and focus the top search bar.
+                state.focus_search_requested = true;
+                state.repaint_requested = true;
+            }
+        }
+        else if (home && home_failed && !searching)
         {
             // The home feed fetch failed with nothing on screen: say why and
             // offer a retry instead of an empty "Nothing here".
@@ -1451,11 +1481,166 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
     ImGui::PopID();
 }
 
+// The video page takes over the main content area while the current track is
+// being watched. Everything else (top bar, sidebar, bottom bar) stays exactly
+// as it is, so playback controls, seeking and volume keep their usual place.
+static void draw_video_page(AppState &state, ImVec2 pos, ImVec2 size)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const UiMetrics &m = ui_m();
+    const ImVec2 win_pos = pos;
+    const ImVec2 win_end(pos.x + size.x, pos.y + size.y);
+
+    // Fade + slight scale, used both for the pop-up and the close.
+    static float s_alpha = 0.0f;
+    const float target = state.video_active ? 1.0f : 0.0f;
+    const float dt = std::min(io.DeltaTime, 0.05f);
+    const float step = dt / 0.32f; // ~320 ms: a calmer reveal/hide
+    s_alpha = std::clamp(s_alpha + std::clamp(target - s_alpha, -step, step), 0.0f, 1.0f);
+    state.video_page_alpha = s_alpha;
+    if (s_alpha < 1.0f)
+        ui_anim_request();
+    const float a = s_alpha * s_alpha * (3.0f - 2.0f * s_alpha); // smoothstep
+    const int alpha = (int)(255.0f * a);
+    // The picture reveals faster than the page's motion: playback should be
+    // visible immediately, while the longer fade/scale settles around it.
+    const int image_alpha = (int)(255.0f * std::min(1.0f, s_alpha * 2.4f));
+
+    const float margin = state.video_theater ? m.space_2 : m.space_4;
+    const ImVec2 area_min(win_pos.x + margin, win_pos.y + margin);
+    const ImVec2 area_max(win_end.x - margin, win_end.y - margin);
+    const float avail_w = std::max(1.0f, area_max.x - area_min.x);
+    const float avail_h = std::max(1.0f, area_max.y - area_min.y);
+
+    // Letterbox the reported aspect ratio inside the area.
+    const float aspect = std::clamp(video_surface().aspect(), 0.2f, 4.0f);
+    float img_w = avail_w;
+    float img_h = img_w / aspect;
+    if (img_h > avail_h)
+    {
+        img_h = avail_h;
+        img_w = img_h * aspect;
+    }
+    ImVec2 img_min((area_min.x + area_max.x - img_w) * 0.5f,
+                   (area_min.y + area_max.y - img_h) * 0.5f);
+    ImVec2 img_max(img_min.x + img_w, img_min.y + img_h);
+
+    // The FBO keeps the unscaled letterbox size; the pop-up scale below only
+    // changes the on-screen quad, so the texture isn't re-created every
+    // animation frame (which used to flash the fallback state).
+    int tw = 0, th = 0;
+    video_render_target_size(video_surface().aspect(), tw, th);
+    video_surface().set_target_size(tw, th);
+
+    // Pop-up scale around the centre (1.0 when fully shown).
+    const float scale = 0.94f + 0.06f * a;
+    if (scale < 0.9999f)
+    {
+        const ImVec2 c((img_min.x + img_max.x) * 0.5f, (img_min.y + img_max.y) * 0.5f);
+        const ImVec2 half((img_max.x - img_min.x) * 0.5f * scale,
+                          (img_max.y - img_min.y) * 0.5f * scale);
+        img_min = ImVec2(c.x - half.x, c.y - half.y);
+        img_max = ImVec2(c.x + half.x, c.y + half.y);
+        img_w = half.x * 2.0f;
+        img_h = half.y * 2.0f;
+    }
+
+    const bool have_frame = video_surface().has_frame() && video_surface().texture() != 0;
+    if (have_frame)
+    {
+        dl->AddImage(video_surface().texture(), img_min, img_max, ImVec2(0, 0), ImVec2(1, 1),
+                     IM_COL32(255, 255, 255, image_alpha));
+    }
+    else
+    {
+        dl->AddRectFilled(img_min, img_max, IM_COL32(14, 14, 16, alpha));
+        const ImVec2 c((img_min.x + img_max.x) * 0.5f, (img_min.y + img_max.y) * 0.5f - 14.0f * m.layout_scale);
+        const bool loading = state.video_loading.load();
+        if (loading)
+        {
+            const float radius = 15.0f * m.layout_scale;
+            const float start = (float)ImGui::GetTime() * 4.0f;
+            dl->PathClear();
+            for (int i = 0; i <= 28; ++i)
+            {
+                const float ang = start + 4.52f * ((float)i / 28.0f);
+                dl->PathLineTo(ImVec2(c.x + cosf(ang) * radius, c.y + sinf(ang) * radius));
+            }
+            dl->PathStroke(ui_accent_u32(0.95f * a), 0, 2.2f);
+            ui_anim_request();
+        }
+        if (state.video_active || loading)
+        {
+            const char *msg = "Loading video...";
+            const ImVec2 sz = ImGui::CalcTextSize(msg);
+            dl->AddText(g_ui_fonts.body, 17.0f * m.text_scale,
+                        ImVec2(c.x - sz.x * 0.5f, c.y + 30.0f * m.layout_scale),
+                        ui_with_alpha(ui_text_muted_u32(), a), msg);
+        }
+        if (!state.video_note.empty())
+        {
+            const ImVec2 note_sz = ImGui::CalcTextSize(state.video_note.c_str());
+            dl->AddText(g_ui_fonts.body, 14.0f * m.text_scale,
+                        ImVec2(c.x - note_sz.x * 0.5f, c.y + 56.0f * m.layout_scale),
+                        ui_with_alpha(ui_text_muted_u32(), a), state.video_note.c_str());
+        }
+    }
+
+    if (!state.video_active)
+        return; // fade-out: the page is not interactive any more
+
+    // Click the picture to pause/resume; double-click toggles theater.
+    ImGui::SetCursorScreenPos(img_min);
+    ImGui::InvisibleButton("##video_surface_click", ImVec2(img_w, img_h));
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
+        state.video_theater = !state.video_theater;
+    else if (ImGui::IsItemClicked(0))
+    {
+        if (state.playing)
+            state.user_pause_requested = true;
+        else
+            state.user_play_requested = true;
+    }
+
+    // Close the page but keep the audio playing.
+    const float close_size = 34.0f * m.layout_scale;
+    ImGui::SetCursorScreenPos(ImVec2(win_end.x - close_size - m.space_3, win_pos.y + m.space_3));
+    if (ui_icon_button("##video_close", UiIcon::Close, close_size, false,
+                       IM_COL32(255, 255, 255, alpha), "Back to audio (Esc)"))
+        state.video_close_requested = true;
+
+    // Video title (the matched music video's when there is one), ellipsized
+    // against the close button.
+    const float label_x = win_pos.x + m.space_4;
+    const float label_w = win_end.x - close_size - m.space_3 * 2.0f - label_x;
+    std::string title = state.current_video_title.empty() ? state.current_title
+                                                          : state.current_video_title;
+    if (title.empty())
+        title = "Video";
+    title = ui_ellipsize(g_ui_fonts.medium, 18.0f * m.text_scale, title,
+                         std::max(0.0f, label_w));
+    dl->AddText(g_ui_fonts.medium, 18.0f * m.text_scale,
+                ImVec2(label_x, win_pos.y + m.space_3 + (close_size - 18.0f * m.text_scale) * 0.5f),
+                ui_with_alpha(ui_text_u32(), a), title.c_str());
+}
+
 void draw_main_ui(AppState &state, MpvPlayer &player)
 {
     resolve_current_track_links(state);
     const AppLayout layout = ui_compute_layout(state, ImGui::GetIO());
     const UiMetrics &m = ui_m();
+
+    // Leaving the video page reveals the list again: replay the same page
+    // fade/stagger a tab switch would, so the transition is not a hard cut.
+    static bool s_prev_video_page = false;
+    const bool video_page_visible = state.video_active || state.video_page_alpha > 0.001f;
+    if (s_prev_video_page && !video_page_visible)
+    {
+        ui_anim_reset_list_reveals();
+        ui_bump_page_epoch();
+    }
+    s_prev_video_page = video_page_visible;
 
     // Tab changes replay both the content fade and the list stagger, even
     // when the destination tab still has the same tracks as last time.
@@ -1497,6 +1682,39 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
+
+    // While a video is on screen it owns the body area: the list, the hero
+    // bands and the lyrics drawer step aside. The rest of the window (top bar,
+    // sidebar, bottom bar) is untouched.
+    if (state.video_active || state.video_page_alpha > 0.001f)
+    {
+        if (state.video_theater && state.video_active)
+        {
+            ImGuiIO &vio = ImGui::GetIO();
+            const AppLayout theater_layout = ui_compute_layout(state, vio);
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(ImVec2(vio.DisplaySize.x,
+                                            std::max(1.0f, vio.DisplaySize.y - theater_layout.bottom_h)));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_backdrop_window_bg());
+            ImGui::Begin("VideoTheater", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+            draw_video_page(state, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+            ImGui::End();
+        }
+        else
+        {
+            draw_video_page(state, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+        }
+        ImGui::End();
+        return;
+    }
 
     const float lyrics_w = layout.lyrics_open ? layout.lyrics_w : 0.0f;
     const bool lyrics_only = layout.lyrics_open && !layout.lyrics_docked;

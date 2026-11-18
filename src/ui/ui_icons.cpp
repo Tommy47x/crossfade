@@ -270,6 +270,14 @@ void ui_draw_icon(ImDrawList *dl, UiIcon icon, ImVec2 c, float s, ImU32 col, flo
         }
         break;
     }
+    case UiIcon::Video:
+    {
+        // A screen with a play badge: "watch the video".
+        dl->AddRect(p(c, s, -0.48f, -0.32f), p(c, s, 0.48f, 0.32f), col, s * 0.10f, 0, t);
+        dl->AddTriangleFilled(p(c, s, -0.11f, -0.15f), p(c, s, -0.11f, 0.15f),
+                              p(c, s, 0.17f, 0.0f), col);
+        break;
+    }
     case UiIcon::Studio:
     {
         // Pencil: shaft, nib and tail — "write lyrics".

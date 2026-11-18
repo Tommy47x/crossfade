@@ -442,6 +442,15 @@ bool podcast_grid(AppState &state, const std::vector<PodcastShow> &shows,
 
 void load_podcast_library(AppState &state)
 {
+    if (backend_is_guest())
+    {
+        // Saved shows/episodes are account data. The library pane shows a
+        // sign-in prompt instead; podcast search stays available.
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        state.podcast_library_loaded = true;
+        state.podcast_library_loading = false;
+        return;
+    }
     {
         std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
         if (state.podcast_library_loaded || state.podcast_library_loading)
@@ -718,8 +727,20 @@ void draw_podcasts_panel(AppState &state)
     }
     else if (shows.empty())
     {
-        ImGui::TextColored(ui_c().text_muted,
-                           "No saved shows yet. Search above for a podcast, open it and press Save show.");
+        if (backend_is_guest())
+        {
+            if (ui_sign_in_state("Sign in to see your shows",
+                                 "Saved shows and episodes need an account. "
+                                 "Podcast search still works.") == 1)
+            {
+                state.settings_focus_auth = true;
+                state.current_tab = Tab::Settings;
+                state.repaint_requested = true;
+            }
+        }
+        else
+            ImGui::TextColored(ui_c().text_muted,
+                               "No saved shows yet. Search above for a podcast, open it and press Save show.");
     }
     else
     {

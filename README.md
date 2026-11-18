@@ -102,6 +102,12 @@ playback itself is unchanged. Measured separately with `--low-power`:
 
 ## Common questions
 
+**Do I need an account?**
+No. Without `browser.json` crossfade starts in guest mode: public browsing, playback,
+lyrics, radio, podcasts, downloads and local playlists work. Personalized
+recommendations and your YouTube Music playlists/library need a sign-in; the Home tab
+links straight to the sign-in settings while you are a guest.
+
 **Isn't signing in annoying?**
 One-time, about 30 seconds: copy the request headers, run `crossfade-login`, done.
 Cookies expire every few weeks to months; re-running the same command fixes it. OAuth
@@ -406,8 +412,10 @@ The Windows release installer creates that venv under `%LOCALAPPDATA%`.
 
 ## Sign in
 
-crossfade talks to YouTube Music through `ytmusicapi`, which needs your logged-in session
-once.
+crossfade talks to YouTube Music through `ytmusicapi`. It runs **without an account**
+in guest mode — search, albums, artists, radio, lyrics, podcasts, downloads and local
+playlists all work. Signing in is optional, and unlocks personalized recommendations
+plus your YouTube Music playlists and library.
 
 ### The easy way: copy request headers
 
@@ -456,7 +464,9 @@ An OAuth token is long-lived and refreshes automatically instead of expiring lik
    `CLIENT_ID` / `CLIENT_SECRET` at the top of `p100-backend-oauth.py`). No
    credentials are bundled with the repo.
 3. Switch **Settings → YouTube Music → Authentication → OAuth** and restart crossfade.
-4. On first start the backend opens a browser login once and saves `browseroauth.json`.
+4. If no token exists yet, crossfade starts in guest mode. Run the login command
+   below (or sign in from **Settings → YouTube Music**) to create `browseroauth.json`;
+   the backend restarts and picks it up without a relaunch.
 
 You can also trigger the login-only flow directly:
 
@@ -536,6 +546,33 @@ session; press **Library** again to return to YouTube search.
 - **Shuffle** is available on the list views; **Play all** starts the list and
   queues the rest.
 - **Endless music** (Settings) keeps a radio going when the list and queue run out.
+
+### Music videos
+
+- Press **V** (or the video button in the bottom bar) to show the current track's video
+  in the main area. The top bar, sidebar and bottom bar stay exactly where they are;
+  **Esc**, **V** or the close button returns to the list.
+- Audio keeps playing on its own player: opening, closing, seeking, or the video
+  buffering never interrupts the sound. The page only appears once a real frame is
+  decoded and the picture is running.
+- The track's own upload appears immediately; if an official music video is found, it
+  is swapped into the same page at the current position. Tracks that are already videos
+  are used as-is instead of being matched to something else.
+- Matching is a YouTube video search scored on title, artist and duration, cached in
+  `video_map.json` (30 days). Matched videos are aligned automatically: a one-time
+  cross-correlation of the song and video audio estimates the constant offset, accepted
+  only when three independent windows agree, and cached in `video_sync.json`.
+- While the video page is open, the next track's match is prefetched, and resolved
+  stream URLs are cached on disk for an hour, so reopening is effectively instant.
+- **F** or double-clicking the picture toggles theater mode; **Esc** leaves it first.
+- **Settings → Playback → Music video quality** caps the stream at 720p, 1080p or the
+  window height.
+- **Right-click → Download video** stores an offline copy in `video_cache/`; it appears
+  in **Downloads** (with a video badge) and plays without a network. **Remove downloaded
+  video** deletes it. Video downloads are included in the data-transfer ZIP when the
+  matching section is selected.
+- The one-time alignment analysis is skipped in low power mode (cached offsets are still
+  applied).
 
 ### Downloads and the cache
 
