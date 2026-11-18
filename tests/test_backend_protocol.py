@@ -52,10 +52,10 @@ class FakeYT:
         self.removed = (playlist_id, videos)
 
 
-def run(commands, yt=None):
+def run(commands, yt=None, guest=False):
     out = io.StringIO()
     core.run_command_loop(yt or FakeYT(), stdin=io.StringIO("\n".join(commands) + "\n"),
-                          stdout=out)
+                          stdout=out, guest=guest)
     return [json.loads(line) for line in out.getvalue().splitlines()]
 
 
@@ -141,6 +141,20 @@ def main():
     check(out[24]["error"] == "Missing query", "missing query")
     check(out[24]["kind"] == "backend", "missing query kind")
     check(len(out) == 25, "quit stops the loop")
+
+    # Guest mode: public browsing still works; account surfaces return auth.
+    guest_out = run([
+        "recommendations",
+        "search hello",
+        "library_playlists",
+        'create_playlist {"title":"T"}',
+        "quit",
+    ], guest=True)
+    check(guest_out[0].get("kind") == "auth", "guest recommendations need sign-in")
+    check(guest_out[1][0]["q"] == "hello", "guest search works")
+    check(guest_out[2].get("kind") == "auth", "guest library needs sign-in")
+    check(guest_out[3].get("kind") == "auth", "guest write needs sign-in")
+    check(len(guest_out) == 4, "guest quit stops the loop")
 
     # Auth/network classifier is shared and deterministic.
     check(core._classify_error("auth failed") == "auth", "auth classifier")

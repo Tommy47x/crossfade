@@ -5,10 +5,17 @@ landed on, and the security and testing decisions that keep it contained.
 
 ## Goals
 
-- The host starts a party from the **Party** tab, gets a QR code, and guests
-  add YouTube songs from a phone on the same LAN.
-- No account, no cloud service, no telemetry, no outbound connection beyond the
-  existing `ytmusicapi` / `yt-dlp` backend calls the app already makes.
+- The host starts a party from the **Party** tab and gets a QR code. The default
+  reach is a **public link** through a locally spawned Cloudflare Quick Tunnel,
+  so guests can add YouTube songs from any network; **Start LAN party** next to
+  it is a one-click local override, and **Same Wi-Fi only** remains available as
+  the default in Settings.
+- No account and no telemetry. Same-Wi-Fi mode makes no outbound connection
+  beyond the existing `ytmusicapi` / `yt-dlp` backend calls. Public mode adds
+  only the `cloudflared` tunnel process (Cloudflare terminates TLS at the edge;
+  see the privacy notes below).
+- Guests can tap a song in Up next to move it to the top, and the host can
+  optionally expose play/pause, previous and next buttons on the party page.
 - Party off means **zero** extra threads, sockets, timers or render work.
 - All queue mutation stays on the main/UI thread; HTTP threads only read
   immutable snapshots and push bounded requests into an inbox.
@@ -82,9 +89,25 @@ songs they already have in the queue. New songs are inserted:
 3. interleaved round-robin with other guest items, FIFO within a round.
 
 This gives round-robin interleaving between guests without starving anyone and
-without ever overriding the host's explicit ordering. The guest snapshot is
-capped at 40 upcoming rows so a long host playlist does not bloat every poll;
+without overriding the host's ordering through normal adds. The guest snapshot
+is capped at 40 upcoming rows so a long host playlist does not bloat every poll;
 the guest page shows an "and N more" line for the remainder.
+
+### Guest "play next" and media controls
+
+- Tapping any row in **Up next** posts `/api/bump`. The main thread moves that
+  exact queue entry to index 0, so it plays right after the current song. A row
+  that came from the host's playlist/source is re-tagged as a request from the
+  guest (so a later host source rebuild keeps it); an existing guest request
+  only changes position and keeps its original attribution. Bump requests are
+  token-bucketed per guest (one every two seconds). Turning a host row into a
+  guest request counts against the per-guest quota.
+- `/api/control` accepts `play`, `pause`, `next` and `prev`, but only while
+  **Settings → Party → Let guests control playback** (`allow_controls`, off by
+  default) is enabled. The main thread applies the request through the same
+  `AppState` flags the host UI uses (`user_play_requested`, `next_requested`,
+  ...). Controls are rate-limited per guest and never touch `AppState` from an
+  HTTP worker.
 
 ## Backend protocol
 
@@ -110,6 +133,8 @@ host play, which uses the play channel.
 | GET | `/api/state?v=N` | Full snapshot or `{"unchanged":true}` |
 | POST | `/api/add` | Add a link or bare 11-char id |
 | DELETE | `/api/add/<id>` | Withdraw your own queued/pending song |
+| POST | `/api/bump` | Move a song that is already in Up Next to the top |
+| POST | `/api/control` | Guest play/pause/next/prev, when the host allows it |
 | GET | `/api/search?q=` | Up to 10 tracks via the main backend channel |
 | POST | `/api/name` | Set an optional display name (≤ 24 codepoints) |
 | GET | `/api/art/<id>` | Cached cover art for a validated 11-char id |
@@ -123,11 +148,37 @@ The guest page is served with a restrictive CSP, `X-Content-Type-Options`,
 or JSON explanation rather than an empty body, so a phone never shows a blank
 white page when a cookie is missing or a link is stale.
 
+## Public link lifecycle
+
+- **Start.** Resolve `cloudflared` (Settings override, `P100_CLOUDFLARED`, PATH,
+  then common install locations). If it is missing, the party does not start and
+  the error says how to install it or switch back to Same Wi-Fi. Otherwise the
+  local server starts first and the QR initially shows the LAN link while the
+  tunnel connects.
+- **Live.** The tunnel process prints `https://<random>.trycloudflare.com` on
+  stderr. The reader thread extracts it; the main thread adds that hostname to
+  the Host allowlist, swaps the QR/link to the public URL, and shows a short
+  notification. The exchange is in-memory only, and the join token is never
+  logged.
+- **Failure.** If the process exits or never prints a URL within 30 s, the
+  public link is marked broken, the QR falls back to the LAN link, and the error
+  is shown in the Party tab. A retry runs every 20 s while the party stays up.
+- **Network change.** The existing rebind path restarts the server on the new
+  address and restarts the tunnel with the new origin; the public URL changes.
+- **Stop.** `party_stop()` kills and reaps the tunnel before tearing down guest
+  state. No tunnel process or reader thread survives a stopped party.
+
 ## Security model
 
-- **LAN only.** The server binds to one selected IPv4 interface (or `0.0.0.0`
-  only when the selected address cannot be bound). It is not a public service
-  and does not use HTTPS.
+- **Two reach modes.** The HTTP server always binds to one selected IPv4
+  interface (or `0.0.0.0` only when the selected address cannot be bound). In
+  **Same Wi-Fi only** mode that is the whole surface: plain HTTP on the LAN. In
+  **Public link** mode crossfade spawns `cloudflared tunnel --url
+  http://<lan-ip>:<port> --no-autoupdate`, reads the assigned
+  `https://<random>.trycloudflare.com` URL from its log, and advertises that URL
+  in the QR. Guests reach the same server through Cloudflare; no inbound port
+  is opened and no router forwarding is needed. The server keeps binding to the
+  LAN address, so the tunnel process is the only new outbound connection.
 - **Address selection.** Automatic mode asks the kernel which source address it
   would use for outbound traffic and prefers it. This avoids stale secondary
   DHCP aliases that still answer on the laptop itself but are unreachable from
@@ -136,18 +187,22 @@ white page when a cookie is missing or a link is stale.
   constant time. The token appears only in the QR URL; it is never written to
   disk, logged, or returned by `/api/state`.
 - **Session cookie.** `cf_guest` is a 128-bit random id, `HttpOnly`,
-  `SameSite=Strict`, `Path=/`, 12 h `Max-Age`. Guest ids and names live in
-  memory only and are dropped when the party stops.
+  `SameSite=Strict`, `Path=/`, 12 h `Max-Age`, plus `Secure` when the request
+  arrived over HTTPS (`X-Forwarded-Proto: https` or the tunnel hostname). Guest
+  ids and names live in memory only and are dropped when the party stops.
 - **Host allowlist.** Every request must carry the bound IP (or
-  `localhost`/`127.0.0.1`) and port as its `Host`; anything else gets `421`.
+  `localhost`/`127.0.0.1`) and port, or the exact configured tunnel hostname
+  (with or without `:443`), as its `Host`; anything else gets `421`. The tunnel
+  hostname is set only after `cloudflared` reports the public URL.
 - **CSRF.** State-changing JSON requests require `Content-Type:
   application/json` and `X-CF: 1`. Cookies alone are not accepted. Combined
   with `SameSite=Strict`, another website cannot queue songs.
 - **Input bounds.** 4 KiB request bodies, 2048-character link input, strict
   `^[A-Za-z0-9_-]{11}$` video ids, at most 64 live guests (evicted after 30 min
-  idle), at most 64 queued add/undo requests per inbox, bounded
-  queue/max-per-guest/cooldown/video length, and token buckets for adds and
-  searches.
+  idle), at most 64 queued add/undo/bump/control requests per inbox, bounded
+  queue/max-per-guest/cooldown/video length, token buckets for adds, bumps,
+  searches and controls, and guest controls that are off unless the host
+  enables them.
 - **No filesystem serving.** Art requests are validated ids mapped through the
   in-memory art map to paths that came from `texture.cpp`'s cache. Unknown ids
   are always `404`.
@@ -164,7 +219,8 @@ Only settings are saved, nested under a `party` key in `settings.json`:
   "name": "...", "port": 8484, "interface_ip": "",
   "require_approval": false, "max_per_guest": 3, "cooldown_sec": 5,
   "max_video_minutes": 10, "max_queue": 100,
-  "allow_search": true, "allow_duplicates": false, "show_names": true
+  "allow_search": true, "allow_duplicates": false, "show_names": true,
+  "allow_controls": false
 }
 ```
 
@@ -174,8 +230,9 @@ are **never** persisted. A party never auto-starts on launch.
 ## Rendering
 
 - `ui_settings.cpp` owns the **Settings → Party** configuration form (name,
-  network address, port, approval, limits and guest options). The Party tab's
-  **Party settings** shortcut switches tabs and scrolls that section into view.
+  network address, port, approval, limits and guest options, including
+  **Let guests control playback**). The Party tab's **Party settings**
+  shortcut switches tabs and scrolls that section into view.
 - `ui_party.cpp` draws the Party tab as a Radio-style hero. Before a party it
   shows a single **Start party** action; after starting, the live QR appears
   in-tab with **Copy link**, **Present QR** and **End party**, followed by
@@ -189,6 +246,9 @@ are **never** persisted. A party never auto-starts on launch.
   missing, downloaded in the background for the first 40 upcoming rows (the
   same cap as the guest snapshot). The phone retries the local `/api/art`
   endpoint before showing the music-note fallback.
+- The guest page lists **Up next** rows as tappable "play next" targets
+  (keyboard accessible with Enter/Space) and shows play/pause/previous/next
+  buttons in the now-playing card whenever the host enables guest controls.
 - The demand-driven loop is unchanged. While a party is running, a small
   animation request keeps the live dot, QR rings and scan highlight moving;
   the existing wake event, playback cadence and 1 s safety tick keep guest
@@ -200,13 +260,15 @@ are **never** persisted. A party never auto-starts on launch.
 - `tests/test_party_link.cpp` — URL forms, bare ids, playlist/channel rejection,
   bounds.
 - `tests/test_party_queue.cpp` — host pin preservation, round-robin fairness,
-  duplicates, per-guest counts.
+  duplicates, per-guest counts, and "play next" bumps (host rows keep their
+  provenance through a source rebuild).
 - `tests/test_party_util.cpp` — CSPRNG tokens, constant-time compare, UTF-8
   cleaning, JSON/HTML escaping, accent validation, token bucket.
 - `tests/party_smoke_server.cpp` + `scripts/party-smoke-test.sh` — real
   `party_server.cpp` with stubbed state, exercised with `curl`: health, cookie
-  flags, Host allowlist, CSRF/content-type guards, add/undo/search, art id
-  validation and unknown routes. No GUI, backend or auth files involved.
+  flags, Host allowlist, CSRF/content-type guards, add/undo/search, play-next
+  bumps, gated media controls, art id validation and unknown routes. No GUI,
+  backend or auth files involved.
 
 Build and run:
 
@@ -234,12 +296,23 @@ scripts/party-smoke-test.sh
   seconds and then run permanently late.
 - IPv4 only (the QR URL and Host check are IPv4-based). IPv6 LANs are out of
   scope for this pass.
-- HTTP, not HTTPS. That is appropriate for a trusted home LAN; do not port
-  forward the party server.
+- Same-Wi-Fi mode is HTTP, not HTTPS. That is appropriate for a trusted home
+  LAN; do not port forward the party server. Public mode gets HTTPS from
+  Cloudflare, but Cloudflare terminates TLS at its edge and relays the join
+  link and request paths, so it can see them; use Same-Wi-Fi mode when that is
+  not acceptable.
+- Public mode needs `cloudflared` installed locally. If it is missing, starting
+  a party fails with the install command and the Party tab explains it; the
+  in-app path field supports custom installs. Quick Tunnel addresses are
+  temporary, change on every party start and network change, and are not meant
+  for permanent hosting.
 - Guest search and metadata still depend on the local Python backend and the
   network; failed lookups return a friendly retryable error.
 - Pending approvals are not persisted, so restarting the app ends the party
   and discards them.
+- Guest playback controls (`allow_controls`) can be toggled while a party is
+  running and the guest page picks it up on the next poll. "Play next" taps work
+  for every running party regardless of that setting.
 - Hotspots and public Wi-Fi commonly enable client isolation. The hotspot
   owner's phone can then reach the host while another phone cannot. Party mode
   cannot work around that at the application layer; use a normal router, make

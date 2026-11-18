@@ -7,6 +7,7 @@
 #include "ui_layout.h"
 #include "ui_theme.h"
 #include "mpvplayer.h"
+#include "video_surface.h"
 #include "ytdlp.h"
 
 #include <algorithm>
@@ -324,6 +325,24 @@ static void draw_recent_searches(AppState &state)
     }
 }
 
+// The two-request search page carries only a few album/artist rows (YouTube
+// spends the rest of the page on podcasts and playlists). Opening one of
+// those chips tops that shelf up once per query with a filtered fetch.
+static void ensure_search_category(AppState &state, int filter)
+{
+    if ((filter != 1 && filter != 2) || state.search_buffer[0] == '\0')
+        return;
+    const int search_id = state.search_id.load();
+    std::atomic<int> &fetched = filter == 1 ? state.search_albums_fetched_id
+                                            : state.search_artists_fetched_id;
+    if (fetched.load() == search_id)
+        return;
+    fetched.store(search_id);
+    state.search_category_dirty.store(filter);
+    state.search_loading.store(true);
+    state.repaint_requested = true;
+}
+
 static void draw_search_chips(AppState &state)
 {
     const UiMetrics &m = ui_m();
@@ -336,7 +355,10 @@ static void draw_search_chips(AppState &state)
             ImGui::SameLine(0.0f, gap);
         ImGui::PushID(i);
         if (search_chip(labels[i], state.search_filter == i, width))
+        {
             state.search_filter = i;
+            ensure_search_category(state, i);
+        }
         ImGui::PopID();
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_3));
@@ -591,6 +613,120 @@ static bool draw_list_hero(AppState &state, const std::vector<Track> &tracks,
     return false;
 }
 
+// Search "Top result": the same hero band Radio / Liked / Downloads / Podcasts
+// use, so the search page reads like every other page. The card itself comes
+// from YouTube's intent match, validated by src/app/search_top.cpp.
+static void draw_search_hero(AppState &state, const std::vector<Track> &tracks,
+                             int result_count, const ListPageAnim &anim)
+{
+    auto top = std::atomic_load(&state.search_top);
+    if (!top || top->kind == TopKind::None)
+        return;
+
+    const char *kind = top->kind == TopKind::Artist ? "ARTIST"
+                       : top->kind == TopKind::Album ? "ALBUM"
+                       : (top->video ? "VIDEO" : "SONG");
+    const UiIcon fallback = top->kind == TopKind::Artist ? UiIcon::Artist
+                            : top->kind == TopKind::Album ? UiIcon::Album
+                                                          : UiIcon::Play;
+
+    std::string subtitle;
+    if (top->kind == TopKind::Artist)
+    {
+        subtitle = top->subscribers.empty() ? std::string("Artist")
+                                            : top->subscribers + " monthly listeners";
+    }
+    else if (!top->artist.empty() && !top->album.empty() &&
+             top->kind == TopKind::Song)
+        subtitle = top->artist + "  \xC2\xB7  " + top->album;
+    else
+        subtitle = top->artist.empty() ? top->title : top->artist;
+
+    std::vector<UiHeroChip> chips;
+    chips.push_back({kind, true});
+    if (!top->duration.empty())
+        chips.push_back({top->duration, false});
+    else if (!top->year.empty())
+        chips.push_back({top->year, false});
+    if (top->kind == TopKind::Album && top->track_count > 0)
+        chips.push_back({std::to_string(top->track_count) +
+                             (top->track_count == 1 ? " TRACK" : " TRACKS"),
+                         false});
+    if (top->kind == TopKind::Artist && !top->subscribers.empty())
+        chips.push_back({top->subscribers + " LISTENERS", false});
+    if (result_count > 0)
+        chips.push_back({std::to_string(result_count) +
+                             (result_count == 1 ? " RESULT" : " RESULTS"),
+                         false});
+
+    std::vector<UiHeroAction> actions;
+    int play_index = -1;
+    int open_index = -1;
+    int artist_index = -1;
+    if (top->kind == TopKind::Song)
+    {
+        play_index = (int)actions.size();
+        actions.push_back({"Play", UiIcon::Play, true, !top->id.empty(), "Play"});
+    }
+    else if (top->kind == TopKind::Album)
+    {
+        open_index = (int)actions.size();
+        actions.push_back({"Open album", UiIcon::Album, true, !top->id.empty(), "Album"});
+    }
+    else
+    {
+        open_index = (int)actions.size();
+        actions.push_back({"Open artist", UiIcon::Artist, true, !top->id.empty(), "Artist"});
+    }
+    if (top->kind != TopKind::Artist && !top->artist_id.empty())
+    {
+        artist_index = (int)actions.size();
+        actions.push_back({"View artist", UiIcon::Artist, false, true, "Artist"});
+    }
+
+    const int clicked = ui_hero("TOP RESULT", top->title, subtitle, top->thumbnail_url,
+                                fallback, "search_top", chips, actions, anim, false,
+                                state.settings.hero_backdrop,
+                                state.settings.hero_backdrop_strength);
+    if (clicked < 0)
+        return;
+
+    if (clicked == play_index)
+    {
+        Track track;
+        track.id = top->id;
+        track.title = top->title;
+        track.artist = top->artist;
+        track.artist_id = top->artist_id;
+        track.album = top->album;
+        track.album_id = top->album_id;
+        track.thumbnail_url = top->thumbnail_url;
+        track.duration_sec = top->duration_sec;
+        int index = -1;
+        for (size_t i = 0; i < tracks.size(); ++i)
+        {
+            if (tracks[i].id != top->id)
+                continue;
+            track = tracks[i]; // play the list row: full metadata + neighbours
+            index = (int)i;
+            break;
+        }
+        ui_play_track(state, track, index);
+    }
+    else if (clicked == open_index && top->kind == TopKind::Album)
+    {
+        open_album_view(state, top->id);
+    }
+    else if (clicked == open_index && top->kind == TopKind::Artist)
+    {
+        open_artist_view(state, top->id, top->title);
+    }
+    else if (clicked == artist_index && !top->artist_id.empty())
+    {
+        open_artist_view(state, top->artist_id, top->artist);
+    }
+}
+
 static void draw_list_page(AppState &state, const AppLayout &layout, float width)
 {
     const UiMetrics &m = ui_m();
@@ -729,7 +865,16 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
 
     bool clear_history = false;
     static const std::vector<Track> k_empty_tracks;
-    if (hero_tab)
+    // Search owns a hero band too: "Top result" stays pinned above the chips
+    // on every search tab so switching Songs/Albums/Artists doesn't shift the
+    // page underneath the user.
+    const bool search_top_visible =
+        home_search && std::atomic_load(&state.search_top) != nullptr;
+    if (search_top_visible)
+    {
+        draw_search_hero(state, tracks ? *tracks : k_empty_tracks, count, anim);
+    }
+    else if (hero_tab)
     {
         // The hero band carries title, counts and actions; no plain header.
         clear_history = draw_list_hero(state, tracks ? *tracks : k_empty_tracks,
@@ -803,29 +948,75 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
 
     if (tracks == nullptr || tracks->empty())
     {
+        bool home_failed;
+        std::string home_error;
+        bool search_failed;
+        std::string search_error;
+        {
+            std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+            home_failed = state.home_failed;
+            home_error = state.home_error_msg;
+            search_failed = state.search_failed;
+            search_error = state.search_error_msg;
+        }
+        const BackendError backend_status = state.backend_status_snapshot();
+        const bool show_guest = home && !searching && backend_is_guest();
+        const bool show_auth = home && !searching && home_failed &&
+                               backend_status.kind == BackendErrKind::Auth;
         if (hero_tab)
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, anim.stagger(0.12f, 0.5f));
-        if (home && state.home_failed && !searching)
+        if (show_guest || show_auth)
+        {
+            const char *title = show_guest
+                                    ? "Sign in to YouTube Music"
+                                    : "Your YouTube Music session expired";
+            const char *sub =
+                show_guest
+                    ? "Sign in for personalized recommendations. Search works "
+                      "without an account."
+                    : home_error.c_str();
+            const int action =
+                ui_sign_in_state(title, sub, show_guest ? "Search music" : nullptr);
+            if (action == 1)
+            {
+                state.settings_focus_auth = true;
+                state.current_tab = Tab::Settings;
+                state.repaint_requested = true;
+            }
+            else if (action == 2)
+            {
+                // Stay on Home and focus the top search bar.
+                state.focus_search_requested = true;
+                state.repaint_requested = true;
+            }
+        }
+        else if (home && home_failed && !searching)
         {
             // The home feed fetch failed with nothing on screen: say why and
             // offer a retry instead of an empty "Nothing here".
-            if (ui_error_state(state.home_error_msg.empty()
+            if (ui_error_state(home_error.empty()
                                    ? "Couldn't load your recommendations."
-                                   : state.home_error_msg.c_str()))
+                                   : home_error.c_str()))
             {
-                state.home_failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+                    state.home_failed = false;
+                }
                 state.home_refreshing = true;
                 state.refresh_requested = true;
                 state.repaint_requested = true;
             }
         }
-        else if (home_search && state.search_failed && !state.search_loading)
+        else if (home_search && search_failed && !state.search_loading)
         {
-            if (ui_error_state(state.search_error_msg.empty()
+            if (ui_error_state(search_error.empty()
                                    ? "Couldn't search right now."
-                                   : state.search_error_msg.c_str()))
+                                   : search_error.c_str()))
             {
-                state.search_failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(state.fetch_error_mutex);
+                    state.search_failed = false;
+                }
                 state.search_dirty = true;
                 state.queued_search = state.search_buffer;
                 state.repaint_requested = true;
@@ -1290,11 +1481,166 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
     ImGui::PopID();
 }
 
+// The video page takes over the main content area while the current track is
+// being watched. Everything else (top bar, sidebar, bottom bar) stays exactly
+// as it is, so playback controls, seeking and volume keep their usual place.
+static void draw_video_page(AppState &state, ImVec2 pos, ImVec2 size)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const UiMetrics &m = ui_m();
+    const ImVec2 win_pos = pos;
+    const ImVec2 win_end(pos.x + size.x, pos.y + size.y);
+
+    // Fade + slight scale, used both for the pop-up and the close.
+    static float s_alpha = 0.0f;
+    const float target = state.video_active ? 1.0f : 0.0f;
+    const float dt = std::min(io.DeltaTime, 0.05f);
+    const float step = dt / 0.32f; // ~320 ms: a calmer reveal/hide
+    s_alpha = std::clamp(s_alpha + std::clamp(target - s_alpha, -step, step), 0.0f, 1.0f);
+    state.video_page_alpha = s_alpha;
+    if (s_alpha < 1.0f)
+        ui_anim_request();
+    const float a = s_alpha * s_alpha * (3.0f - 2.0f * s_alpha); // smoothstep
+    const int alpha = (int)(255.0f * a);
+    // The picture reveals faster than the page's motion: playback should be
+    // visible immediately, while the longer fade/scale settles around it.
+    const int image_alpha = (int)(255.0f * std::min(1.0f, s_alpha * 2.4f));
+
+    const float margin = state.video_theater ? m.space_2 : m.space_4;
+    const ImVec2 area_min(win_pos.x + margin, win_pos.y + margin);
+    const ImVec2 area_max(win_end.x - margin, win_end.y - margin);
+    const float avail_w = std::max(1.0f, area_max.x - area_min.x);
+    const float avail_h = std::max(1.0f, area_max.y - area_min.y);
+
+    // Letterbox the reported aspect ratio inside the area.
+    const float aspect = std::clamp(video_surface().aspect(), 0.2f, 4.0f);
+    float img_w = avail_w;
+    float img_h = img_w / aspect;
+    if (img_h > avail_h)
+    {
+        img_h = avail_h;
+        img_w = img_h * aspect;
+    }
+    ImVec2 img_min((area_min.x + area_max.x - img_w) * 0.5f,
+                   (area_min.y + area_max.y - img_h) * 0.5f);
+    ImVec2 img_max(img_min.x + img_w, img_min.y + img_h);
+
+    // The FBO keeps the unscaled letterbox size; the pop-up scale below only
+    // changes the on-screen quad, so the texture isn't re-created every
+    // animation frame (which used to flash the fallback state).
+    int tw = 0, th = 0;
+    video_render_target_size(video_surface().aspect(), tw, th);
+    video_surface().set_target_size(tw, th);
+
+    // Pop-up scale around the centre (1.0 when fully shown).
+    const float scale = 0.94f + 0.06f * a;
+    if (scale < 0.9999f)
+    {
+        const ImVec2 c((img_min.x + img_max.x) * 0.5f, (img_min.y + img_max.y) * 0.5f);
+        const ImVec2 half((img_max.x - img_min.x) * 0.5f * scale,
+                          (img_max.y - img_min.y) * 0.5f * scale);
+        img_min = ImVec2(c.x - half.x, c.y - half.y);
+        img_max = ImVec2(c.x + half.x, c.y + half.y);
+        img_w = half.x * 2.0f;
+        img_h = half.y * 2.0f;
+    }
+
+    const bool have_frame = video_surface().has_frame() && video_surface().texture() != 0;
+    if (have_frame)
+    {
+        dl->AddImage(video_surface().texture(), img_min, img_max, ImVec2(0, 0), ImVec2(1, 1),
+                     IM_COL32(255, 255, 255, image_alpha));
+    }
+    else
+    {
+        dl->AddRectFilled(img_min, img_max, IM_COL32(14, 14, 16, alpha));
+        const ImVec2 c((img_min.x + img_max.x) * 0.5f, (img_min.y + img_max.y) * 0.5f - 14.0f * m.layout_scale);
+        const bool loading = state.video_loading.load();
+        if (loading)
+        {
+            const float radius = 15.0f * m.layout_scale;
+            const float start = (float)ImGui::GetTime() * 4.0f;
+            dl->PathClear();
+            for (int i = 0; i <= 28; ++i)
+            {
+                const float ang = start + 4.52f * ((float)i / 28.0f);
+                dl->PathLineTo(ImVec2(c.x + cosf(ang) * radius, c.y + sinf(ang) * radius));
+            }
+            dl->PathStroke(ui_accent_u32(0.95f * a), 0, 2.2f);
+            ui_anim_request();
+        }
+        if (state.video_active || loading)
+        {
+            const char *msg = "Loading video...";
+            const ImVec2 sz = ImGui::CalcTextSize(msg);
+            dl->AddText(g_ui_fonts.body, 17.0f * m.text_scale,
+                        ImVec2(c.x - sz.x * 0.5f, c.y + 30.0f * m.layout_scale),
+                        ui_with_alpha(ui_text_muted_u32(), a), msg);
+        }
+        if (!state.video_note.empty())
+        {
+            const ImVec2 note_sz = ImGui::CalcTextSize(state.video_note.c_str());
+            dl->AddText(g_ui_fonts.body, 14.0f * m.text_scale,
+                        ImVec2(c.x - note_sz.x * 0.5f, c.y + 56.0f * m.layout_scale),
+                        ui_with_alpha(ui_text_muted_u32(), a), state.video_note.c_str());
+        }
+    }
+
+    if (!state.video_active)
+        return; // fade-out: the page is not interactive any more
+
+    // Click the picture to pause/resume; double-click toggles theater.
+    ImGui::SetCursorScreenPos(img_min);
+    ImGui::InvisibleButton("##video_surface_click", ImVec2(img_w, img_h));
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
+        state.video_theater = !state.video_theater;
+    else if (ImGui::IsItemClicked(0))
+    {
+        if (state.playing)
+            state.user_pause_requested = true;
+        else
+            state.user_play_requested = true;
+    }
+
+    // Close the page but keep the audio playing.
+    const float close_size = 34.0f * m.layout_scale;
+    ImGui::SetCursorScreenPos(ImVec2(win_end.x - close_size - m.space_3, win_pos.y + m.space_3));
+    if (ui_icon_button("##video_close", UiIcon::Close, close_size, false,
+                       IM_COL32(255, 255, 255, alpha), "Back to audio (Esc)"))
+        state.video_close_requested = true;
+
+    // Video title (the matched music video's when there is one), ellipsized
+    // against the close button.
+    const float label_x = win_pos.x + m.space_4;
+    const float label_w = win_end.x - close_size - m.space_3 * 2.0f - label_x;
+    std::string title = state.current_video_title.empty() ? state.current_title
+                                                          : state.current_video_title;
+    if (title.empty())
+        title = "Video";
+    title = ui_ellipsize(g_ui_fonts.medium, 18.0f * m.text_scale, title,
+                         std::max(0.0f, label_w));
+    dl->AddText(g_ui_fonts.medium, 18.0f * m.text_scale,
+                ImVec2(label_x, win_pos.y + m.space_3 + (close_size - 18.0f * m.text_scale) * 0.5f),
+                ui_with_alpha(ui_text_u32(), a), title.c_str());
+}
+
 void draw_main_ui(AppState &state, MpvPlayer &player)
 {
     resolve_current_track_links(state);
     const AppLayout layout = ui_compute_layout(state, ImGui::GetIO());
     const UiMetrics &m = ui_m();
+
+    // Leaving the video page reveals the list again: replay the same page
+    // fade/stagger a tab switch would, so the transition is not a hard cut.
+    static bool s_prev_video_page = false;
+    const bool video_page_visible = state.video_active || state.video_page_alpha > 0.001f;
+    if (s_prev_video_page && !video_page_visible)
+    {
+        ui_anim_reset_list_reveals();
+        ui_bump_page_epoch();
+    }
+    s_prev_video_page = video_page_visible;
 
     // Tab changes replay both the content fade and the list stagger, even
     // when the destination tab still has the same tracks as last time.
@@ -1304,6 +1650,11 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         s_fade_tab = tab_index;
     else if (tab_index != s_fade_tab)
     {
+        // Leaving Studio flushes any pending songwriting edits immediately
+        // instead of waiting for the debounce (the tab may not be reopened).
+        if (s_fade_tab == (int)Tab::Studio && state.studio_project_loaded &&
+            state.studio_project_dirty)
+            save_song_project(state.studio_project);
         s_fade_tab = tab_index;
         ui_anim_reset_list_reveals();
         ui_bump_page_epoch();
@@ -1332,6 +1683,39 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 
+    // While a video is on screen it owns the body area: the list, the hero
+    // bands and the lyrics drawer step aside. The rest of the window (top bar,
+    // sidebar, bottom bar) is untouched.
+    if (state.video_active || state.video_page_alpha > 0.001f)
+    {
+        if (state.video_theater && state.video_active)
+        {
+            ImGuiIO &vio = ImGui::GetIO();
+            const AppLayout theater_layout = ui_compute_layout(state, vio);
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(ImVec2(vio.DisplaySize.x,
+                                            std::max(1.0f, vio.DisplaySize.y - theater_layout.bottom_h)));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_backdrop_window_bg());
+            ImGui::Begin("VideoTheater", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+            draw_video_page(state, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+            ImGui::End();
+        }
+        else
+        {
+            draw_video_page(state, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+        }
+        ImGui::End();
+        return;
+    }
+
     const float lyrics_w = layout.lyrics_open ? layout.lyrics_w : 0.0f;
     const bool lyrics_only = layout.lyrics_open && !layout.lyrics_docked;
     const float list_w = (layout.lyrics_open && layout.lyrics_docked)
@@ -1349,7 +1733,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                               state.current_tab == Tab::Stats ||
                               state.current_tab == Tab::Album ||
                               state.current_tab == Tab::Artist ||
-                              state.current_tab == Tab::YouTube;
+                              state.current_tab == Tab::YouTube ||
+                              state.current_tab == Tab::Studio;
 
     // Divider between the list and a docked lyrics panel: drag to resize.
     // The new width is persisted through settings.json on release.
@@ -1393,7 +1778,10 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         if (state.current_tab == Tab::Album)
             panel_key += "_" + state.album_browse_id;
         else if (state.current_tab == Tab::Artist)
+        {
+            std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
             panel_key += "_" + state.artist_browse_id;
+        }
         ImGui::PushID(panel_key.c_str());
         const bool scroll_self = state.current_tab == Tab::Settings ||
                                  state.current_tab == Tab::Queue ||
@@ -1402,7 +1790,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                                  state.current_tab == Tab::Artists ||
                                  state.current_tab == Tab::Album ||
                                  state.current_tab == Tab::Artist ||
-                                 state.current_tab == Tab::YouTube;
+                                 state.current_tab == Tab::YouTube ||
+                                 state.current_tab == Tab::Studio;
         ImGui::BeginChild("PageContent", ImVec2(list_w, layout.body_size.y),
                           ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
@@ -1433,6 +1822,8 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
             draw_stats_panel(state);
         else if (state.current_tab == Tab::YouTube)
             draw_youtube_panel(state);
+        else if (state.current_tab == Tab::Studio)
+            draw_studio_panel(state, player);
 
         ImGui::EndChild();
         ImGui::PopID();

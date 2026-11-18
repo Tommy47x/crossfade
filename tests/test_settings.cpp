@@ -22,6 +22,9 @@ int main()
     check(!s.eq_enabled, "default eq");
     check(s.ytdl_browser == "firefox", "default browser");
     check(s.auth_mode == "browser", "default auth");
+    check(s.party.public_reach(), "party defaults to a public link");
+    check(s.party.tunnel_path.empty(), "default cloudflared path");
+    check(!s.party.allow_controls, "guest controls default off");
 
     Settings a, b;
     check(a == b, "defaults compare equal");
@@ -45,6 +48,15 @@ int main()
     b = a;
     b.party.allow_duplicates = !b.party.allow_duplicates;
     check(!(a == b), "party setting change compares unequal");
+    b = a;
+    b.party.reach = "lan";
+    check(!(a == b), "party reach change compares unequal");
+    b = a;
+    b.party.tunnel_path = "/opt/cloudflared";
+    check(!(a == b), "party tunnel path change compares unequal");
+    b = a;
+    b.party.allow_controls = true;
+    check(!(a == b), "party guest controls change compares unequal");
 
     if (testutil::failures == 0)
         std::printf("settings: all checks passed\n");

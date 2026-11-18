@@ -40,6 +40,17 @@ def main():
         write(src / "thumb_cache" / "a.jpg", "thumb")
         write(src / "audio_cache" / "a.webm", "audio")
 
+        # Symlinks inside cache trees must not be followed: they could pull
+        # unrelated files into the backup or loop the walk.
+        link_ok = True
+        try:
+            write(base / "outside" / "secret.txt", "secret")
+            os.symlink(base / "outside" / "secret.txt",
+                       src / "thumb_cache" / "link.jpg")
+            os.symlink(base / "outside", src / "thumb_cache" / "linkdir")
+        except (OSError, NotImplementedError):
+            link_ok = False
+
         rc = subprocess.run(
             [sys.executable, str(HELPER), "export", "--zip", str(archive),
              "--config", str(src), "--sections", "settings,auth,library,thumbs"],
@@ -49,6 +60,10 @@ def main():
         with zipfile.ZipFile(archive) as zf:
             names = zf.namelist()
             manifest = json.loads(zf.read("manifest.json"))
+        if link_ok:
+            check("thumb_cache/link.jpg" not in names, "file symlink excluded")
+            check(not any(n.startswith("thumb_cache/linkdir") for n in names),
+                  "directory symlink not followed")
         check("settings.json" in names, "settings included")
         check("browser.json" in names, "auth included")
         check("library.db" in names, "library included")
@@ -84,6 +99,28 @@ def main():
             check=False)
         check(rc.returncode != 0, "unsafe archive rejected")
         check(not (base / "escape.txt").exists(), "no path traversal")
+
+        # Backslash traversal: Windows reads "\" as a separator, so the
+        # archive must be rejected there. On POSIX it is a literal filename
+        # and must stay inside the destination.
+        evil_bs = base / "evil-backslash.zip"
+        bs_name = "..\\..\\escape.txt"
+        with zipfile.ZipFile(evil_bs, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(
+                {"app": "crossfade", "sections": ["settings"],
+                 "files": [bs_name], "dirs": []}))
+            zf.writestr(bs_name, "nope")
+        rc = subprocess.run(
+            [sys.executable, str(HELPER), "import", "--zip", str(evil_bs),
+             "--config", str(dst)],
+            check=False)
+        if os.name == "nt":
+            check(rc.returncode != 0, "backslash archive rejected on Windows")
+        else:
+            check(rc.returncode == 0, "literal backslash name imported on POSIX")
+            check(dst.joinpath(bs_name).is_file(),
+                  "literal backslash name kept in destination")
+        check(not (base / "escape.txt").exists(), "no backslash traversal")
 
     if failures:
         print(f"transfer: {failures} failure(s)", file=sys.stderr)

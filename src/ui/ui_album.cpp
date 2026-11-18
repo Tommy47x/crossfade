@@ -21,6 +21,19 @@ static float clamp01f(float v)
 
 using AlbumsAnim = UiPageAnim;
 
+// Album track rows usually carry no per-track artwork; the album header does.
+// Bake the album cover into the tracks when they are loaded so the queue,
+// auto-advance, notifications and the now-playing/lyrics surfaces all have it
+// (clicking a row used to fall back at draw time, advancing did not).
+static void apply_album_art(std::vector<Track> &tracks, const std::string &art)
+{
+    if (art.empty())
+        return;
+    for (Track &t : tracks)
+        if (t.thumbnail_url.empty())
+            t.thumbnail_url = art;
+}
+
 
 static void play_album_track(AppState &state, int index)
 {
@@ -108,6 +121,7 @@ static void fetch_album_into(AppState &state, const std::string &browse_id)
         state.album_description = album.description;
         state.album_thumbnail_url = album.thumbnail_url;
         state.album_tracks = std::move(album.tracks);
+        apply_album_art(state.album_tracks, state.album_thumbnail_url);
         state.album_failed = false;
         state.album_error_msg.clear();
         state.repaint_requested = true;
@@ -170,6 +184,7 @@ void open_album_view(AppState &state, const std::string &browse_id)
         state.album_description = cached.description;
         state.album_thumbnail_url = cached.thumbnail_url;
         state.album_tracks = std::move(cached.tracks);
+        apply_album_art(state.album_tracks, state.album_thumbnail_url);
         prefetch_urls_for(state.album_tracks, state.album_tracks.size());
     }
     state.album_loading = !had_cache;
@@ -221,7 +236,10 @@ void open_album_from_track(AppState &state, const Track &track)
         if (fetch_album_for_track(track.id, bid, bname))
         {
             if (!bname.empty())
+            {
+                std::lock_guard<std::recursive_mutex> lock(state.album_mutex);
                 state.album_title = bname;
+            }
             Album album;
             if (fetch_album(bid, album))
             {
@@ -245,19 +263,25 @@ void open_album_from_track(AppState &state, const Track &track)
                 else
                     state.album_thumbnail_url = album.thumbnail_url;
                 state.album_tracks = std::move(album.tracks);
+                apply_album_art(state.album_tracks, state.album_thumbnail_url);
                 state.album_failed = false;
                 state.album_error_msg.clear();
             }
         }
-        else if (state.album_tracks.empty())
+        else
         {
-            BackendError err = take_backend_error();
             std::lock_guard<std::recursive_mutex> lock(state.album_mutex);
-            if (err)
+            // Only flag the failure when there's nothing to show; a stale
+            // cached album on screen just gets the toast.
+            if (state.album_tracks.empty())
             {
-                state.album_failed = true;
-                state.album_error_msg = backend_error_user_message(err);
-                ui_notify_backend_error(err);
+                BackendError err = take_backend_error();
+                if (err)
+                {
+                    state.album_failed = true;
+                    state.album_error_msg = backend_error_user_message(err);
+                    ui_notify_backend_error(err);
+                }
             }
         }
         {

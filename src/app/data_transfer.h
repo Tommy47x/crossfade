@@ -14,9 +14,11 @@ struct Sections
     bool library = true;
     bool album_cache = true;
     bool artist_cache = true;
+    bool podcast_cache = true;
     bool lyrics = true;
     bool thumbs = true;
     bool audio = false;
+    bool video = false;
     bool logs = false;
 };
 

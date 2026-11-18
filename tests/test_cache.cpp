@@ -83,6 +83,26 @@ int main()
         }
     check(found_meta, "sidecar track listed");
 
+    // Sidecars written from a truncated yt-dlp capture have no thumbnail or
+    // artist. The standard YouTube grid thumbnail is derived from the id so
+    // the Downloads list can still show a cover.
+    write_file(cache / "empty.webm", "audio");
+    write_file(cache / "empty.webm.meta.json",
+               "{\"id\":\"empty\",\"title\":\"Title only\",\"artist\":\"\","
+               "\"thumbnail_url\":\"\",\"duration_sec\":100}");
+    tracks = get_cached_tracks();
+    bool found_empty = false;
+    for (const auto &t : tracks)
+        if (t.id == "empty")
+        {
+            found_empty = true;
+            check(t.artist == "Unknown", "empty sidecar artist");
+            check(t.thumbnail_url == "https://img.youtube.com/vi/empty/hqdefault.jpg",
+                  "derived sidecar thumbnail");
+            check(t.title == "Title only", "sidecar title kept");
+        }
+    check(found_empty, "incomplete sidecar listed");
+
     // Orphan sidecars are swept.
     write_file(cache / "orphan.webm.meta.json", "{\"id\":\"orphan\",\"title\":\"x\"}");
     (void)get_cached_tracks();

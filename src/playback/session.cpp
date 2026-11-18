@@ -36,6 +36,7 @@ const char *playlist_source_name(PlaylistSource source)
     case PlaylistSource::STATS: return "stats";
     case PlaylistSource::SMART: return "smart";
     case PlaylistSource::YOUTUBE_PLAYLIST: return "youtube_playlist";
+    case PlaylistSource::STUDIO: return "studio";
     }
     return "home";
 }
@@ -48,7 +49,8 @@ PlaylistSource playlist_source_from_name(const std::string &name)
                              PlaylistSource::ALBUM, PlaylistSource::ARTIST,
                              PlaylistSource::PODCAST, PlaylistSource::HISTORY,
                              PlaylistSource::STATS, PlaylistSource::SMART,
-                             PlaylistSource::YOUTUBE_PLAYLIST})
+                             PlaylistSource::YOUTUBE_PLAYLIST,
+                             PlaylistSource::STUDIO})
     {
         if (name == playlist_source_name(s))
             return s;
@@ -58,6 +60,10 @@ PlaylistSource playlist_source_from_name(const std::string &name)
 
 std::string session_json(const AppState &state, double position, int volume)
 {
+    // A worker may be publishing the artist detail fields; take the same lock
+    // the publisher uses so the snapshot is consistent. Mutable mutex: this
+    // reader only has a const view.
+    std::lock_guard<std::recursive_mutex> artist_lock(state.artist_mutex);
     auto esc = [](const std::string &s) { return jsonutil::escape(s); };
 
     std::ostringstream out;

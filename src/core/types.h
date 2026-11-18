@@ -52,7 +52,8 @@ static inline ImVec4 accent_alpha(const ImVec4 &c, float a)
         Settings,
         YouTube,
         Smart,
-        Party
+        Party,
+        Studio
     };
 
     // ----------------------------------------------------------------------
@@ -71,7 +72,8 @@ static inline ImVec4 accent_alpha(const ImVec4 &c, float a)
         ARTIST,
         PODCAST,
         YOUTUBE_PLAYLIST,
-        SMART
+        SMART,
+        STUDIO
     };
 
 // ----------------------------------------------------------------------
@@ -181,6 +183,9 @@ struct Settings
     // from a radio seeded by the last played song.
     bool endless_radio = false;
     std::string ytdl_browser = "firefox";
+    // Video quality: 0 = 720p, 1 = 1080p, 2 = fit the window height (capped
+    // at 1080). Passed to the backend's format selection.
+    int video_quality = 0;
     // Backend authentication: "browser" uses browser.json cookies, "oauth"
     // uses browseroauth.json. Applied at backend startup.
     std::string auth_mode = "browser";

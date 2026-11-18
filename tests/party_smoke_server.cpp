@@ -91,6 +91,42 @@ AddResult undo(const std::string &guest_id, const std::string &video_id)
     return r;
 }
 
+AddResult bump(const std::string &guest_id, const std::string &video_id)
+{
+    (void)guest_id;
+    if (video_id == "bad")
+    {
+        AddResult r;
+        r.http = 400;
+        r.error = "invalid_link";
+        r.message = "That doesn't look like a YouTube song.";
+        return r;
+    }
+    return ok_add();
+}
+
+AddResult control(const std::string &guest_id, const std::string &action)
+{
+    (void)guest_id;
+    AddResult r;
+    if (action == "blocked")
+    {
+        r.http = 403;
+        r.error = "controls_off";
+        r.message = "The host turned off guest playback controls.";
+        return r;
+    }
+    if (action != "play" && action != "pause" && action != "next" && action != "prev")
+    {
+        r.http = 400;
+        r.error = "bad_action";
+        r.message = "Unknown playback control.";
+        return r;
+    }
+    r.http = 200;
+    return r;
+}
+
 bool set_name(const std::string &guest_id, const std::string &name)
 {
     (void)name;
@@ -130,6 +166,9 @@ int main(int argc, char **argv)
     PartyServerConfig cfg;
     cfg.bind_ip = "127.0.0.1";
     cfg.public_ip = "127.0.0.1";
+    // Optional tunnel hostname, so the smoke test can exercise the public
+    // Host allowlist and the Secure cookie without a real tunnel.
+    cfg.public_host = argc > 2 ? argv[2] : "";
     cfg.port = argc > 1 ? std::atoi(argv[1]) : 18084;
     if (cfg.port < 1024 || cfg.port > 65000)
         cfg.port = 18084;

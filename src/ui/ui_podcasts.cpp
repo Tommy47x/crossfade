@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -149,12 +150,17 @@ std::atomic<int> g_podcast_download_done{0};
 std::atomic<int> g_podcast_download_total{0};
 std::string g_podcast_download_show;
 
-void download_episode_async(const std::string &id)
+void download_episode_async(const Track &track)
 {
-    if (id.empty() || !find_cached_audio_path(id).empty())
+    if (track.id.empty() || !find_cached_audio_path(track.id).empty())
         return;
-    tasks::spawn("podcast-fetch", [id]() {
-        const std::string path = get_cached_audio_path(id);
+    tasks::spawn("podcast-fetch", [track]() {
+        const std::string path = get_cached_audio_path(track.id);
+        // Keep the show/artist association: yt-dlp's generic metadata only
+        // knows the episode title, which would make the download look like an
+        // orphan in the Downloads list.
+        if (!path.empty())
+            save_cached_track_metadata(track, path);
         g_downloads_dirty = true;
         if (path.empty())
             ui_notify(UiNotifyType::Error, "Episode download failed",
@@ -169,21 +175,25 @@ void download_all_episodes(AppState &state)
 {
     if (g_podcast_downloading.exchange(true))
         return;
-    std::vector<std::string> ids;
-    ids.reserve(state.podcast_tracks.size());
+    std::vector<Track> tracks;
+    tracks.reserve(state.podcast_tracks.size());
     for (const auto &t : state.podcast_tracks)
         if (!t.id.empty())
-            ids.push_back(t.id);
+            tracks.push_back(t);
     g_podcast_download_show = state.podcast_selected.title;
     g_podcast_download_done = 0;
-    g_podcast_download_total = (int)ids.size();
+    g_podcast_download_total = (int)tracks.size();
     AppState *sp = &state;
-    tasks::spawn("podcast-download", [sp, ids]() {
+    tasks::spawn("podcast-download", [sp, tracks]() {
         int done = 0;
-        for (const auto &id : ids)
+        for (const auto &track : tracks)
         {
-            if (find_cached_audio_path(id).empty())
-                get_cached_audio_path(id);
+            if (find_cached_audio_path(track.id).empty())
+            {
+                const std::string path = get_cached_audio_path(track.id);
+                if (!path.empty())
+                    save_cached_track_metadata(track, path);
+            }
             g_downloads_dirty = true;
             g_podcast_download_done = ++done;
             sp->repaint_requested = true;
@@ -219,30 +229,127 @@ std::vector<Track> tracks_for(const PodcastShow &show,
     return out;
 }
 
+// Fold locally downloaded episodes into a show's episode list. The generic
+// yt-dlp sidecar does not carry a browse id, so the download code stamps the
+// show title into the track's `album`; matching on that (plus the ids the
+// cached episode list already knows) makes downloaded episodes visible even
+// when the show has never been opened online.
+std::vector<PodcastEpisode> with_downloaded_episodes(const PodcastShow &show,
+                                                     std::vector<PodcastEpisode> episodes,
+                                                     const std::vector<Track> &downloads)
+{
+    episodes.erase(std::remove_if(episodes.begin(), episodes.end(),
+                                  [](const PodcastEpisode &e) { return e.video_id.empty(); }),
+                   episodes.end());
+    std::unordered_set<std::string> have;
+    have.reserve(episodes.size() + downloads.size());
+    for (const PodcastEpisode &e : episodes)
+        have.insert(e.video_id);
+
+    if (!show.title.empty())
+    {
+        for (const Track &t : downloads)
+        {
+            if (t.id.empty() || t.album != show.title || !have.insert(t.id).second)
+                continue;
+            PodcastEpisode e;
+            e.video_id = t.id;
+            e.title = t.title.empty() ? t.album : t.title;
+            e.author = t.artist;
+            e.thumbnail_url = t.thumbnail_url;
+            e.duration_sec = t.duration_sec;
+            episodes.push_back(std::move(e));
+        }
+    }
+    return episodes;
+}
+
 void load_show(AppState &state, const PodcastShow &show)
 {
     if (show.browse_id.empty())
         return;
     if (state.search_buffer[0] != '\0')
         ui_reset_search(state);
-    state.podcast_selected = show;
-    state.podcast_details_loading = true;
-    state.podcast_episodes.reset();
-    state.podcast_tracks.clear();
-    state.repaint_requested = true;
+    // Downloads may not have been scanned yet when a show is opened straight
+    // from the Podcasts tab. Snapshot them before the worker starts so it
+    // never reads state.downloaded_tracks concurrently.
+    if (!state.downloaded_loaded)
+        load_downloaded_tracks(state);
+    const std::vector<Track> downloads = state.downloaded_tracks;
+
+    PodcastDetails cached;
+    const bool had_cache = load_podcast_cache(show.browse_id, cached);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        state.podcast_selected = show;
+        std::atomic_store(&state.podcast_episodes,
+                          std::shared_ptr<const std::vector<PodcastEpisode>>{});
+        state.podcast_tracks.clear();
+
+        // Show the cached show + episode list instantly when it exists; the
+        // background fetch below refreshes it silently. This is what makes an
+        // offline open (and episodes downloaded earlier) work.
+        if (had_cache)
+        {
+            if (!cached.show.title.empty())
+                state.podcast_selected = cached.show;
+            auto episodes = std::make_shared<const std::vector<PodcastEpisode>>(
+                with_downloaded_episodes(state.podcast_selected, std::move(cached.episodes),
+                                         downloads));
+            state.podcast_tracks = tracks_for(state.podcast_selected, *episodes);
+            std::atomic_store(&state.podcast_episodes, episodes);
+            state.podcast_details_loading = false;
+        }
+        else
+        {
+            state.podcast_details_loading = true;
+        }
+        state.repaint_requested = true;
+    }
 
     AppState *sp = &state;
     const std::string id = show.browse_id;
-    tasks::spawn("podcast-open", [sp, id]() {
+    tasks::spawn("podcast-open", [sp, id, had_cache, downloads]() {
         PodcastDetails details = fetch_podcast_details(id);
-        if (sp->podcast_selected.browse_id != id)
+        {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
+            if (sp->podcast_selected.browse_id != id)
+                return;
+            if (details.show.title.empty())
+                details.show = sp->podcast_selected;
+        }
+        const bool got = !details.show.title.empty() || !details.episodes.empty();
+        if (!got)
+        {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
+            if (!had_cache)
+                sp->podcast_details_loading = false;
+            sp->repaint_requested = true;
             return;
-        if (details.show.title.empty())
-            details.show = sp->podcast_selected;
-        auto episodes = std::make_shared<const std::vector<PodcastEpisode>>(details.episodes);
-        auto tracks = tracks_for(details.show, details.episodes);
-        std::atomic_store(&sp->podcast_episodes, episodes);
+        }
+        // An empty episode list from the network must not wipe the cached
+        // one (transient backend hiccup, rate limit, show without episodes).
+        if (had_cache && details.episodes.empty())
+        {
+            std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
+            sp->podcast_details_loading = false;
+            sp->repaint_requested = true;
+            return;
+        }
+
+        auto episodes = std::make_shared<const std::vector<PodcastEpisode>>(
+            with_downloaded_episodes(details.show, std::move(details.episodes), downloads));
+        auto tracks = tracks_for(details.show, *episodes);
+
+        PodcastDetails cache_payload;
+        cache_payload.show = details.show;
+        cache_payload.episodes = *episodes;
+        save_podcast_cache(cache_payload);
+
+        std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
         sp->podcast_selected = details.show;
+        std::atomic_store(&sp->podcast_episodes, episodes);
         sp->podcast_tracks = std::move(tracks);
         sp->podcast_details_loading = false;
         sp->repaint_requested = true;
@@ -335,9 +442,21 @@ bool podcast_grid(AppState &state, const std::vector<PodcastShow> &shows,
 
 void load_podcast_library(AppState &state)
 {
-    if (state.podcast_library_loaded || state.podcast_library_loading)
+    if (backend_is_guest())
+    {
+        // Saved shows/episodes are account data. The library pane shows a
+        // sign-in prompt instead; podcast search stays available.
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        state.podcast_library_loaded = true;
+        state.podcast_library_loading = false;
         return;
-    state.podcast_library_loading = true;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
+        if (state.podcast_library_loaded || state.podcast_library_loading)
+            return;
+        state.podcast_library_loading = true;
+    }
     AppState *sp = &state;
     tasks::spawn("podcast", [sp]() {
         auto shows = fetch_podcast_library();
@@ -346,6 +465,7 @@ void load_podcast_library(AppState &state)
                           std::make_shared<const std::vector<PodcastShow>>(std::move(shows)));
         std::atomic_store(&sp->podcast_later,
                           std::make_shared<const std::vector<PodcastEpisode>>(std::move(later)));
+        std::lock_guard<std::recursive_mutex> lock(sp->podcast_mutex);
         sp->podcast_library_loaded = true;
         sp->podcast_library_loading = false;
         sp->repaint_requested = true;
@@ -354,14 +474,19 @@ void load_podcast_library(AppState &state)
 
 void close_podcast_show(AppState &state)
 {
+    std::lock_guard<std::recursive_mutex> lock(state.podcast_mutex);
     state.podcast_selected = PodcastShow{};
-    state.podcast_episodes.reset();
+    std::atomic_store(&state.podcast_episodes,
+                      std::shared_ptr<const std::vector<PodcastEpisode>>{});
     state.podcast_tracks.clear();
     state.repaint_requested = true;
 }
 
 void draw_podcasts_panel(AppState &state)
 {
+    // The open-show worker publishes selected/episodes/tracks; hold the same
+    // lock for the frame so it cannot swap them mid-draw.
+    std::lock_guard<std::recursive_mutex> state_lock(state.podcast_mutex);
     const UiMetrics &m = ui_m();
     const float width = std::min(1080.0f * m.layout_scale, ImGui::GetContentRegionAvail().x);
     const bool searching = state.search_buffer[0] != '\0';
@@ -556,7 +681,7 @@ void draw_podcasts_panel(AppState &state)
                 if (row.download_remove)
                     delete_downloaded_track(state, state.podcast_tracks[i].id);
                 else
-                    download_episode_async(state.podcast_tracks[i].id);
+                    download_episode_async(state.podcast_tracks[i]);
             }
         }
         ImGui::Dummy(ImVec2(1.0f, m.space_2));
@@ -602,8 +727,20 @@ void draw_podcasts_panel(AppState &state)
     }
     else if (shows.empty())
     {
-        ImGui::TextColored(ui_c().text_muted,
-                           "No saved shows yet. Search above for a podcast, open it and press Save show.");
+        if (backend_is_guest())
+        {
+            if (ui_sign_in_state("Sign in to see your shows",
+                                 "Saved shows and episodes need an account. "
+                                 "Podcast search still works.") == 1)
+            {
+                state.settings_focus_auth = true;
+                state.current_tab = Tab::Settings;
+                state.repaint_requested = true;
+            }
+        }
+        else
+            ImGui::TextColored(ui_c().text_muted,
+                               "No saved shows yet. Search above for a podcast, open it and press Save show.");
     }
     else
     {

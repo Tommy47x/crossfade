@@ -71,6 +71,15 @@ bool load_artist_cache(const std::string &browse_id, ArtistInfo &out);
 void save_artist_cache(const ArtistInfo &artist);
 void prefetch_artist_cache(const std::string &browse_id);
 
+// Podcast show data cache (~/.config/p100/podcast_cache/<browse_id>.json).
+// Stores the show header and its episode list so reopening a podcast is
+// instant and works offline. save_podcast_cache() is safe to call from
+// worker threads.
+std::string podcast_cache_dir();
+std::string podcast_cache_path(const std::string &browse_id);
+bool load_podcast_cache(const std::string &browse_id, PodcastDetails &out);
+void save_podcast_cache(const PodcastDetails &details);
+
 // Playback history
 std::string history_file_path();
 void save_playback_history(const std::vector<Track> &tracks);
@@ -97,6 +106,8 @@ void load_podcast_library(AppState &state);
 void draw_party_fullscreen(AppState &state);
 // Small bottom-bar chip shown only while a party is running.
 void draw_party_chip(AppState &state);
+// Semi-transparent debug window: backend channels + live command log.
+void draw_backend_debug(AppState &state);
 
 // Radio station page (~/.config/p100/radio_last.cache holds the last station
 // so the tab opens with content and warm stream URLs).
@@ -154,6 +165,12 @@ int ui_tracks_duration(const std::vector<Track> &tracks);
 std::string ui_format_duration(int seconds);
 void ui_reset_search(AppState &state);
 void ui_set_search(AppState &state, const std::string &query);
+bool ui_open_external_url(const std::string &url);
+void ui_copy_to_clipboard(const std::string &text);
+// Floating search typeahead dropdown. Submitted after every other window so
+// it renders on top without a popup (which would steal the search field's
+// keyboard focus).
+void draw_search_suggestions_overlay(AppState &state);
 bool is_track_liked(const AppState &state, const std::string &id);
 void toggle_like(AppState &state, const Track &track);
 
@@ -162,6 +179,19 @@ void toggle_like(AppState &state, const Track &track);
 // (most recent distinct tracks). Frozen snapshot, refreshed on tab entry.
 void build_smart_view(AppState &state);
 void load_downloaded_tracks(AppState &state);
+// Background repair for downloaded-track metadata. Older sidecars were written
+// from a truncated yt-dlp JSON capture, so they carry a title but no artist or
+// thumbnail. Local play-log/liked/history/queue/playlist entries are used
+// first; when `fetch_missing` is set, the rest are looked up through the
+// backend. Missing thumbnails are derived from the video id immediately.
+// Publishes `state.repaired_meta` for the main loop to apply to the play log.
+void start_download_metadata_repair(AppState &state, bool fetch_missing);
+bool download_metadata_repair_running();
+void download_metadata_repair_progress(int &done, int &total, int &updated);
+// Load the local-song index once. Smart/Stats/Studio need the on-disk paths
+// for "local:" ids that appear in the play log.
+void ensure_local_tracks_loaded(AppState &state);
+std::string local_track_url(const AppState &state, const std::string &id);
 // Fill missing album/artist ids for the current track by finding it in the
 // loaded lists. Needed for sessions saved before those ids were persisted.
 void resolve_current_track_links(AppState &state);
@@ -340,5 +370,6 @@ void draw_album_panel(AppState &state);
 void draw_artists_panel(AppState &state);
 void draw_artist_panel(AppState &state);
 void draw_youtube_panel(AppState &state);
+void draw_studio_panel(AppState &state, MpvPlayer &player);
 void draw_bottom_bar(AppState &state, MpvPlayer &player);
 void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float height);

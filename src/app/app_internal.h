@@ -126,6 +126,25 @@ bool advance_playback(bool manual = false);
 MpvPlayer *display_player();
 void update_discord_presence();
 
+// ---- Video surface (app_playback.cpp) ----
+// Enter/leave the video page's playback mode. Both run on the main thread;
+// the UI only raises state.video_toggle_requested / video_close_requested.
+void begin_video_playback();
+void end_video_playback();
+void cancel_video_resolve(bool notify);
+void finish_video_start();
+// Main-loop side of the async backend resolve: applies a finished result to
+// the idle player.
+void video_preload_poll();
+// Per-frame preload decision (after the surface has rendered a frame).
+void video_preload_tick(bool have_frame);
+// Applies a background A/V offset when it arrives.
+void video_sync_poll();
+// Keeps the muted video player aligned with the audible one while shown.
+void video_active_tick();
+// Whether the next track should also get a video once its audio starts.
+extern bool g_video_follow_track;
+
 void show_notification(const std::string &title, const std::string &body,
                        const std::string &icon_path = "");
 
@@ -133,11 +152,17 @@ void show_notification(const std::string &title, const std::string &body,
 void cover_sweep_worker(std::vector<Track> tracks);
 void maybe_sweep_missing_covers();
 void background_download(const std::string &video_id);
-void load_recommendations(bool force = false);
+void background_video_download(const std::string &video_id, int max_height);
+// `quiet` suppresses the backend-error toast (used by automatic retries that
+// would otherwise repeat the same "no connection" warning every 30 s).
+void load_recommendations(bool force = false, bool quiet = false);
 void artist_search_and_update(const std::string &query, int expect_id);
 bool text_matches_query(const std::string &haystack, const std::string &needle);
 void merge_local_search_results(const std::string &query, SearchAllResult &results);
 void search_all_and_update(const std::string &query, int expect_id);
+void search_category_and_update(const std::string &query, int category, int expect_id);
+void prefetch_hovered_track(const std::string &video_id);
+void search_suggest_and_update(const std::string &query, int expect_id);
 void load_lyrics_worker(std::string track_id, int expect_seq);
 
 // ---- Touch / wheel input (app_input.cpp) ----

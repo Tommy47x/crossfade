@@ -35,6 +35,17 @@ header .tag{margin-left:auto;font-size:12px;color:var(--dim);background:color-mi
 .progress{height:6px;border-radius:999px;background:var(--surface2);margin-top:12px;overflow:hidden}
 .progress i{display:block;height:100%;width:0;background:var(--accent);border-radius:999px;transition:width .9s linear}
 .times{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:5px;font-variant-numeric:tabular-nums}
+.controls{display:flex;align-items:center;justify-content:center;gap:16px;margin-top:14px}
+.ctrl{width:46px;height:46px;border-radius:50%;border:1px solid var(--line);background:color-mix(in srgb,var(--surface2) 86%,transparent);color:var(--text);display:flex;align-items:center;justify-content:center;padding:0;transition:transform .12s ease,background .15s ease,border-color .15s ease}
+.ctrl:hover{background:color-mix(in srgb,var(--accent) 10%,var(--surface2));border-color:color-mix(in srgb,var(--accent) 32%,var(--line))}
+.ctrl:active{transform:scale(.94)}
+.ctrl:disabled{opacity:.4;cursor:default;transform:none}
+.ctrl.main{width:54px;height:54px;border:0;background:var(--accent);color:#08111a}
+.ctrl svg{width:20px;height:20px;fill:currentColor}
+.ctrl.main svg{width:24px;height:24px}
+.ctrl .ic-pause{display:none}
+.ctrl.playing .ic-play{display:none}
+.ctrl.playing .ic-pause{display:block}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.11em;color:var(--muted);margin:22px 2px 9px;font-weight:600}
 .add{display:flex;gap:8px;align-items:stretch}
 .searchwrap{position:relative;flex:1;min-width:0}
@@ -57,6 +68,10 @@ button{font:inherit;cursor:pointer;touch-action:manipulation}
 .item .title{font-size:14px;-webkit-line-clamp:1;display:block;white-space:nowrap;text-overflow:ellipsis}
 .item .artist{font-size:12px}
 .item .right{margin-left:auto;text-align:right;flex:0 0 auto;max-width:92px}
+.item.tappable{cursor:pointer;transition:background .15s ease,border-color .15s ease,transform .12s ease}
+.item.tappable:hover,.item.tappable:focus-visible{background:color-mix(in srgb,var(--accent) 8%,var(--surface));border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
+.item.tappable:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.item.tappable:active{transform:scale(.992)}
 .eta{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 .badge{display:inline-block;font-size:10px;border-radius:999px;padding:2px 7px;margin-top:3px;background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent);white-space:nowrap;max-width:92px;overflow:hidden;text-overflow:ellipsis}
 .badge.pending{background:color-mix(in srgb,var(--warn) 17%,transparent);color:var(--warn)}
@@ -109,6 +124,18 @@ img.art-fallback{opacity:.9;background:linear-gradient(135deg,var(--surface2),co
   </div>
   <div class="progress" role="progressbar" aria-label="Track progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progWrap"><i id="prog"></i></div>
   <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+  <div class="controls" id="controls" hidden>
+    <button class="ctrl" id="prevBtn" type="button" aria-label="Previous song">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14l-11-7z"/><rect x="5" y="5" width="2" height="14" rx="1"/></svg>
+    </button>
+    <button class="ctrl main" id="playBtn" type="button" aria-label="Play">
+      <svg class="ic-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+      <svg class="ic-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+    </button>
+    <button class="ctrl" id="nextBtn" type="button" aria-label="Next song">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14l11-7z"/><rect x="17" y="5" width="2" height="14" rx="1"/></svg>
+    </button>
+  </div>
 </section>
 
 <section aria-label="Add a song">
@@ -122,6 +149,7 @@ img.art-fallback{opacity:.9;background:linear-gradient(135deg,var(--surface2),co
 </section>
 
 <h2>Up next</h2>
+<div class="hint" id="queueHint">Tap a song to play it next.</div>
 <ul class="list" id="queue" aria-live="polite">
   <li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li>
 </ul>
@@ -146,7 +174,7 @@ img.art-fallback{opacity:.9;background:linear-gradient(135deg,var(--surface2),co
 (function(){
 "use strict";
 var ACCENT="__ACCENT__";
-var S={v:-1,data:null,timer:null,hidden:document.hidden,unchanged:0,recvAt:0,myIds:new Set(),queueSig:null,searchTimer:null,searchSeq:0,adding:false};
+var S={v:-1,data:null,timer:null,hidden:document.hidden,unchanged:0,recvAt:0,myIds:new Set(),queueSig:null,searchTimer:null,searchSeq:0,adding:false,bumping:false,controlBusy:false};
 // Monotonic local clock. Progress must not depend on the phone's wall clock
 // matching the host's: phones on a hotspot without internet often have a
 // skewed clock, which made the position stay at 0:00 and then run late.
@@ -174,15 +202,25 @@ img.dataset.artId=id;img.style.visibility="visible";img.classList.remove("art-fa
 function badge(by,pending){if(pending)return el("span",{class:"badge pending"},"waiting for host");if(by)return el("span",{class:"badge"},by);return null;}
 function renderNow(d){var n=d.now||{};setArt($("nowArt"),n.id||"");
 $("nowTitle").textContent=n.title||"Nothing playing";$("nowArtist").textContent=n.artist||"Waiting for the host";
-S.now=n;S.recvAt=mono();updateProgress();}
+S.now=n;S.recvAt=mono();updateProgress();updateControls();}
+function updateControls(){var on=!!(S.data&&S.data.party&&S.data.party.allowControls===true);var box=$("controls");if(!box)return;box.hidden=!on;if(!on)return;
+var n=S.now||{};var has=!!n.id;var playing=has&&!n.paused;
+var b=$("playBtn");b.disabled=!has;if(b.classList)b.classList.toggle("playing",playing);else b.className="ctrl main"+(playing?" playing":"");b.setAttribute("aria-label",playing?"Pause":"Play");
+$("prevBtn").disabled=!has;$("nextBtn").disabled=!has;}
 function updateProgress(){var n=S.now;if(!n||!n.durationSec){$("prog").style.width="0%";$("pos").textContent="0:00";$("dur").textContent="0:00";return;}
 var p=(n.positionSec||0);if(!n.paused&&S.recvAt)p+=(mono()-S.recvAt);p=Math.max(0,Math.min(n.durationSec,p));
 var pct=Math.min(100,(p/n.durationSec)*100);$("prog").style.width=pct+"%";$("progWrap").setAttribute("aria-valuenow",String(Math.round(pct)));$("pos").textContent=fmt(p);$("dur").textContent=fmt(n.durationSec);}
 function queueSig(q){var s="";q.forEach(function(it){s+=it.id+"|"+it.status+"|"+it.by+"|"+(S.myIds.has(it.id)?"1":"0")+";";});return s;}
 function renderQueue(d){var q=d.queue||[];var more=d.queueMore||0;var sig=queueSig(q)+"|"+more;if(sig===S.queueSig)return;S.queueSig=sig;
 var box=$("queue");box.textContent="";
+var hint=$("queueHint");if(hint)hint.hidden=!q.length;
 if(!q.length){var e=el("li",{class:"empty"},"Nothing queued yet. Be the first to add a song!");box.appendChild(e);return;}
-q.forEach(function(it){var li=el("li",{class:"item"});li.appendChild(artFor(it.id,"art"));
+q.forEach(function(it){var li=el("li",{class:"item"});
+if(it.status!=="pending"&&it.id){li.className="item tappable";li.setAttribute("role","button");li.tabIndex=0;li.setAttribute("aria-label","Play "+(it.title||"this song")+" next");
+var cue=function(ev){if(ev&&ev.preventDefault)ev.preventDefault();bumpSong(it.id,it.title);};
+li.addEventListener("click",cue);
+li.addEventListener("keydown",function(ev){if(ev.key==="Enter"||ev.key===" "){cue(ev);}});}
+li.appendChild(artFor(it.id,"art"));
 var m=el("div",{class:"meta"});m.appendChild(el("div",{class:"title"},it.title||"Unknown title"));m.appendChild(el("div",{class:"artist"},it.artist||"Unknown artist"));li.appendChild(m);
 var r=el("div",{class:"right"});var eta=it.status==="pending"?"waiting for host":(it.etaSec>0?mins(it.etaSec):"next up");r.appendChild(el("div",{class:"eta"},eta));
 if(S.myIds.has(it.id))r.appendChild(el("span",{class:"badge",title:"Added by you"},"you"));
@@ -203,6 +241,16 @@ else if(x.s===401||x.s===403||x.s===410){ended();}
 else if(x.s===429){toast(j.message||"Slow down a little.",null);}
 else{toast(j.message||"Couldn't add that song.",null);}
 }).catch(function(){toast("Connection lost. Check the Wi-Fi and try again.",null);}).then(function(){S.adding=false;$("addBtn").disabled=false;});}
+function bumpSong(id,title){if(!id||S.bumping)return;S.bumping=true;setTimeout(function(){S.bumping=false;},900);
+fetch("/api/bump",{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json","X-CF":"1"},body:JSON.stringify({id:id})}).then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});}).then(function(x){var j=x.j||{};if(x.s===200){if(navigator.vibrate)try{navigator.vibrate(18);}catch(e){}
+toast("Playing next"+(title?" \u00b7 "+title:""),null);S.v=-1;doPoll();}
+else if(x.s===401||x.s===410){ended();}
+else toast(j.message||"Couldn't move that song.",null);}).catch(function(){toast("Connection lost. Check the Wi-Fi and try again.",null);});}
+function sendControl(action){if(S.controlBusy)return;S.controlBusy=true;setTimeout(function(){S.controlBusy=false;},650);
+fetch("/api/control",{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json","X-CF":"1"},body:JSON.stringify({action:action})}).then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});}).then(function(x){var j=x.j||{};if(x.s===200){if(S.now){if(action==="play")S.now.paused=false;else if(action==="pause")S.now.paused=true;S.recvAt=mono();}updateProgress();updateControls();}
+else if(x.s===401||x.s===410||(x.s===403&&j.error==="party_closed")){ended();}
+else if(x.s===403&&j.error==="controls_off"){$("controls").hidden=true;toast(j.message||"Guest controls are off.",null);}
+else toast(j.message||"Couldn't control playback.",null);}).catch(function(){toast("Connection lost. Check the Wi-Fi and try again.",null);});}
 function undo(id){if(!id)return;fetch("/api/add/"+encodeURIComponent(id),{method:"DELETE",credentials:"same-origin",headers:{"X-CF":"1"}}).then(function(r){if(r.ok){toast("Removed",null);S.v=-1;doPoll();}else toast("That song already started.",null);}).catch(function(){toast("Could not undo.",null);});}
 function doSearch(q){q=(q||"").trim();if(!q)return;var seq=++S.searchSeq;S.searching=true;setResultsMsg("Searching YouTube...");var url="/api/search?q="+encodeURIComponent(q);fetch(url,{credentials:"same-origin",cache:"no-store"}).then(function(r){if(r.status===429)throw new Error("slow");if(!r.ok)throw new Error("bad");return r.json();}).then(function(list){if(seq!==S.searchSeq)return;S.searching=false;renderResults(Array.isArray(list)?list:[]);}).catch(function(e){if(seq!==S.searchSeq)return;S.searching=false;setResultsMsg("Search is unavailable right now. Paste a link instead.");if(String(e.message)==="slow")toast("One search at a time, please.",null);});}
 function renderResults(list){var box=$("results");box.textContent="";if(!list.length){setResultsMsg("No matches. Try another search or paste a link.");return;}
@@ -217,6 +265,9 @@ $("skipName").addEventListener("click",function(){$("nameDialog").hidden=true;})
 $("addBtn").addEventListener("click",submitInput);
 $("addInput").addEventListener("input",onInput);
 $("addInput").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();submitInput();}});
+$("prevBtn").addEventListener("click",function(){sendControl("prev");});
+$("playBtn").addEventListener("click",function(){sendControl((S.now&&!S.now.paused)?"pause":"play");});
+$("nextBtn").addEventListener("click",function(){sendControl("next");});
 $("undoBtn").addEventListener("click",function(){undo(this.dataset.id);});
 document.addEventListener("visibilitychange",function(){S.hidden=document.hidden;if(!S.hidden&&!S.timer&&!document.getElementById("ended").classList.contains("show")){S.unchanged=0;doPoll();}});
 updateProgress();setInterval(updateProgress,1000);

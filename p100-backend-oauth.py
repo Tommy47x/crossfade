@@ -16,8 +16,6 @@ from ytmusicapi import OAuthCredentials, YTMusic
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py"))
 from cf_backend.core import (  # noqa: E402
-    _classify_error,
-    _err,
     check_logged_in,
     ensure_config_dir,
     run_command_loop,
@@ -92,38 +90,43 @@ def main():
         pass
 
     _ensure_config_dir()
+    guest = False
+    yt = None
     if not CLIENT_ID or not CLIENT_SECRET:
-        print(
-            json.dumps(
-                {
-                    "error": "Set P100_OAUTH_CLIENT_ID and P100_OAUTH_CLIENT_SECRET "
-                    "or pass --login after configuring the OAuth client.",
-                    "kind": "auth",
-                }
+        print("OAuth client keys are not configured; starting as guest.",
+              file=sys.stderr)
+        guest = True
+    elif not os.path.exists(OAUTH_FILE):
+        print("No saved OAuth login; starting as guest. Sign in from Settings.",
+              file=sys.stderr)
+        guest = True
+    else:
+        secure_auth_file(OAUTH_FILE)
+        try:
+            yt = YTMusic(auth=OAUTH_FILE, oauth_credentials=_credentials())
+        except Exception as e:
+            # Never block public browsing on a stale token; the UI offers a
+            # re-sign-in and the --login path refreshes it.
+            print(f"Stored OAuth login invalid ({e}); starting as guest.",
+                  file=sys.stderr)
+            guest = True
+
+    if yt is None:
+        yt = YTMusic()  # anonymous default header; public browsing only
+
+    if not guest:
+        logged_in, err = check_logged_in(yt)
+        if not logged_in:
+            print(
+                f"Note: logged_in check was inconclusive ({err}). "
+                "Continuing - will confirm via actual data instead.",
+                file=sys.stderr,
             )
-        )
-        sys.stdout.flush()
-        return
 
-    try:
-        yt = load_or_create_session()
-    except Exception as e:
-        msg = f"Login failed: {e}"
-        print(json.dumps(_err(msg, kind=_classify_error(msg))))
-        sys.stdout.flush()
-        return
-
-    logged_in, err = check_logged_in(yt)
-    if not logged_in:
-        print(
-            f"Note: logged_in check was inconclusive ({err}). "
-            "Continuing - will confirm via actual data instead.",
-            file=sys.stderr,
-        )
-
-    print(json.dumps({"status": "ready"}))
+    print(json.dumps({"status": "ready", "guest": guest},
+                     separators=(",", ":")))
     sys.stdout.flush()
-    run_command_loop(yt)
+    run_command_loop(yt, guest=guest)
 
 
 def login_only():

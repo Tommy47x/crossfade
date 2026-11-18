@@ -57,6 +57,7 @@ set(SOURCES
     src/app/app_input.cpp
     src/app/app_playback.cpp
     src/app/app_workers.cpp
+    src/app/search_top.cpp
     src/app/warm_start.cpp
     src/app/data_transfer.cpp
     src/core/power.cpp
@@ -67,6 +68,8 @@ set(SOURCES
     src/playback/crossfade.cpp
     src/playback/session.cpp
     src/playback/mpvplayer.cpp
+    src/playback/video_surface.cpp
+    src/playback/local_audio.cpp
     src/ui/ui_helpers.cpp
     src/ui/format.cpp
     src/ui/playlists_io.cpp
@@ -91,6 +94,8 @@ set(SOURCES
     src/ui/ui_stats.cpp
     src/ui/ui_party.cpp
     src/ui/ui_podcasts.cpp
+    src/ui/ui_studio.cpp
+    src/ui/ui_backend_debug.cpp
     src/net/texture.cpp
     src/data/writeback.cpp
     src/party/party.cpp
@@ -99,10 +104,12 @@ set(SOURCES
     src/party/party_util.cpp
     src/party/party_net.cpp
     src/party/party_server.cpp
+    src/party/party_tunnel.cpp
     src/net/updater.cpp
     src/data/library.cpp
     src/data/store.cpp
     src/data/cache.cpp
+    src/data/studio_project.cpp
     src/app/diagnostics.cpp
     external/qrcodegen.cpp
     external/sqlite/sqlite3.c
@@ -245,7 +252,7 @@ if(CROSSFADE_BUILD_TESTS)
         target_link_libraries(${target} Threads::Threads)
     endfunction()
 
-    foreach(party_test party_link party_queue party_util)
+    foreach(party_test party_link party_queue party_util party_tunnel)
         add_executable(test_${party_test} tests/test_${party_test}.cpp
             src/party/${party_test}.cpp)
         p100_test(test_${party_test})
@@ -259,6 +266,11 @@ if(CROSSFADE_BUILD_TESTS)
         src/playback/crossfade.cpp)
     p100_test(test_crossfade)
     add_test(NAME crossfade COMMAND test_crossfade)
+
+    add_executable(test_search_top tests/test_search_top.cpp
+        src/app/search_top.cpp)
+    p100_test(test_search_top)
+    add_test(NAME search_top COMMAND test_search_top)
 
     add_executable(test_tasks tests/test_tasks.cpp src/core/tasks.cpp)
     p100_test(test_tasks)
@@ -298,6 +310,11 @@ if(CROSSFADE_BUILD_TESTS)
     add_executable(test_settings tests/test_settings.cpp)
     p100_test(test_settings)
     add_test(NAME settings COMMAND test_settings)
+
+    add_executable(test_studio_project tests/test_studio_project.cpp
+        src/data/studio_project.cpp src/data/paths.cpp)
+    p100_test(test_studio_project)
+    add_test(NAME studio_project COMMAND test_studio_project)
 
     # Headless HTTP harness used by scripts/party-smoke-test.sh.
     add_executable(party_smoke_server
@@ -342,7 +359,7 @@ if(CROSSFADE_BUILD_TESTS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         foreach(tgt test_party_link test_party_queue test_party_util test_library
                     test_crossfade test_cache test_json test_session test_playlists
-                    test_settings)
+                    test_settings test_studio_project)
             target_compile_options(${tgt} PRIVATE ${CROSSFADE_WARNINGS})
         endforeach()
     endif()

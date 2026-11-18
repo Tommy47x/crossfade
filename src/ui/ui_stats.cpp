@@ -120,6 +120,7 @@ static void stats_card(const char *label, const std::string &value, float x, flo
 
 void rebuild_stats(AppState &state)
 {
+    ensure_local_tracks_loaded(state);
     int64_t start_ts = period_window_start(state.stats_period, state.stats_week_offset);
     int64_t end_ts = 0;
     if (state.stats_period == 2)
@@ -169,7 +170,14 @@ void rebuild_stats(AppState &state)
         t.title = kv.second.title.empty() ? "Unknown Track" : kv.second.title;
         t.artist = kv.second.artist.empty() ? "Unknown Artist" : kv.second.artist;
         t.thumbnail_url = kv.second.thumb;
-        t.url = "https://www.youtube.com/watch?v=" + kv.first;
+        if (kv.first.rfind("local:", 0) == 0)
+        {
+            t.url = local_track_url(state, kv.first);
+            if (t.url.empty())
+                continue; // local file no longer indexed
+        }
+        else
+            t.url = "https://www.youtube.com/watch?v=" + kv.first;
         state.stats.tracks.push_back(t);
         state.stats.plays.push_back(kv.second.count);
     }
@@ -259,13 +267,25 @@ void rebuild_stats(AppState &state)
 void draw_stats_panel(AppState &state)
 {
     const UiMetrics &m = ui_m();
-    if (state.stats_dirty)
-        rebuild_stats(state);
 
+    // Stats are a snapshot from the moment the page was opened. Rebuild on
+    // entry and when the period/week controls change, but never because a new
+    // song started while the page is visible: that used to reset anim_start
+    // and replay every entrance animation under the user.
     static uint64_t s_last_epoch = (uint64_t)-1;
-    if (s_last_epoch != ui_page_epoch())
-        state.stats.anim_start = ImGui::GetTime(); // replay when the page reappears
-    s_last_epoch = ui_page_epoch();
+    static int s_last_period = -1;
+    static int s_last_week = 0;
+    const uint64_t epoch = ui_page_epoch();
+    const bool clicked = state.stats_refresh_requested;
+    state.stats_refresh_requested = false;
+    if (clicked || s_last_epoch != epoch || s_last_period != state.stats_period ||
+        s_last_week != state.stats_week_offset)
+    {
+        rebuild_stats(state); // also stamps anim_start
+        s_last_epoch = epoch;
+        s_last_period = state.stats_period;
+        s_last_week = state.stats_week_offset;
+    }
     if (state.stats.anim_start <= 0.0)
         state.stats.anim_start = ImGui::GetTime();
 

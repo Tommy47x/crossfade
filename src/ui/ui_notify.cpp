@@ -108,6 +108,11 @@ void ui_notify(UiNotifyType type, const std::string &title, const std::string &m
 
 void ui_notify_backend_error(const BackendError &err)
 {
+    // Guest mode has explicit sign-in prompts in the tabs; do not toast every
+    // account-gated command the backend refuses.
+    if (backend_is_guest() && err.kind == BackendErrKind::Auth)
+        return;
+
     static std::string s_last_msg;
     static double s_last_time = -1e9;
     const double now = notify_now();

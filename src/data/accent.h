@@ -19,3 +19,9 @@ void update_accent(const Settings &settings);
 // Parse/serialise the "#rrggbb" form used by P100_ACCENT and settings.json.
 bool accent_parse_hex(const char *text, ImVec4 &out);
 std::string accent_to_hex(const ImVec4 &color);
+
+// Shared accent bus. The system settings app writes ~/.config/accent/current
+// and ~/.config/accent/mode; every desktop app reads the same value from here.
+std::string accent_shared_dir();
+std::string accent_read_mode();
+void accent_write_shared(const std::string &hex, const std::string &mode);

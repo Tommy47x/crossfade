@@ -20,9 +20,82 @@ static float clamp01f(float v)
 
 using ArtistsAnim = UiPageAnim;
 
+// ui_anim_track_list_reveal() restarts whenever the row count changes, so
+// "Load 5 more songs" re-animates the entire list. Keep the base start across
+// a pure append (same ids in the same order, longer list) and give only the
+// new tail a fresh, slower stagger so the five rows land one after another.
+struct ArtistSongReveal
+{
+    double start = -1.0;        // base reveal (whole-list entrance)
+    double append_start = -1.0; // reveal for rows appended by "load more"
+    int append_from = 0;        // first index using append_start
+};
+
+static ArtistSongReveal artist_song_reveal(const std::string &artist_key,
+                                           const std::vector<Track> &rows)
+{
+    static std::string s_key;
+    static std::vector<std::string> s_ids;
+    static double s_start = -1.0;
+    static double s_append_start = -1.0;
+    static int s_append_from = 0;
+    static uint64_t s_epoch = (uint64_t)-1;
+
+    ArtistSongReveal out;
+    if (!ui_animations_enabled() || rows.empty())
+        return out;
+
+    const uint64_t epoch = ui_page_epoch();
+    const double now = ImGui::GetTime();
+    bool reset = s_start < 0.0 || s_epoch != epoch || s_key != artist_key ||
+                 rows.size() < s_ids.size();
+    if (!reset)
+    {
+        for (size_t i = 0; i < s_ids.size(); ++i)
+        {
+            if (rows[i].id != s_ids[i])
+            {
+                reset = true;
+                break;
+            }
+        }
+    }
+
+    if (reset)
+    {
+        s_start = now;
+        s_append_start = -1.0;
+        s_append_from = (int)rows.size();
+        s_key = artist_key;
+        s_epoch = epoch;
+    }
+    else if (rows.size() > s_ids.size())
+    {
+        s_append_from = (int)s_ids.size();
+        s_append_start = now;
+    }
+
+    s_ids.clear();
+    s_ids.reserve(rows.size());
+    for (const Track &t : rows)
+        s_ids.push_back(t.id);
+
+    const double dur = (double)ui_anim_duration(0.22f);
+    const double append_span = 4.0 * (double)ui_anim_delay(0.045f);
+    if (now - s_start < dur + (double)ui_anim_delay(0.09f) + 0.03 ||
+        (s_append_start > 0.0 && now - s_append_start < dur + append_span + 0.03))
+        ui_anim_request();
+
+    out.start = s_start;
+    out.append_start = s_append_start;
+    out.append_from = s_append_from;
+    return out;
+}
+
 
 static void apply_artist(AppState &state, const ArtistInfo &artist)
 {
+    std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
     state.artist_browse_id = artist.browse_id;
     state.artist_name = artist.name;
     state.artist_description = artist.description;
@@ -83,57 +156,74 @@ static void fetch_artist_into(AppState &state, const std::string &browse_id)
     ArtistInfo artist;
     if (fetch_artist(browse_id, artist))
     {
-        const bool same_artist = state.artist_browse_id == browse_id ||
-                                 state.artist_browse_id == artist.browse_id;
-        const std::vector<Track> previous = same_artist ? state.artist_songs
-                                                         : std::vector<Track>{};
-        const int previous_offset = state.artist_songs_offset;
-        const bool previous_has_more = state.artist_songs_has_more;
-
         prefetch_urls_for(artist.songs, 5);
-        apply_artist(state, artist);
 
-        // A background refresh publishes only the header's top songs. If the
-        // user already expanded this artist, keep those extra rows.
-        if (same_artist && !previous.empty())
+        std::vector<Track> songs_snapshot;
         {
-            for (const Track &old : previous)
+            std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+            const bool same_artist = state.artist_browse_id == browse_id ||
+                                     state.artist_browse_id == artist.browse_id;
+            const std::vector<Track> previous = same_artist ? state.artist_songs
+                                                             : std::vector<Track>{};
+            const int previous_offset = state.artist_songs_offset;
+            const bool previous_has_more = state.artist_songs_has_more;
+
+            apply_artist(state, artist);
+
+            // A background refresh publishes only the header's top songs. If
+            // the user already expanded this artist, keep those extra rows.
+            if (same_artist && !previous.empty())
             {
-                if (old.id.empty())
-                    continue;
-                const bool exists = std::any_of(
-                    state.artist_songs.begin(), state.artist_songs.end(),
-                    [&](const Track &t) { return t.id == old.id; });
-                if (!exists)
-                    state.artist_songs.push_back(old);
+                for (const Track &old : previous)
+                {
+                    if (old.id.empty())
+                        continue;
+                    const bool exists = std::any_of(
+                        state.artist_songs.begin(), state.artist_songs.end(),
+                        [&](const Track &t) { return t.id == old.id; });
+                    if (!exists)
+                        state.artist_songs.push_back(old);
+                }
+                state.artist_songs_offset =
+                    std::max((int)artist.songs.size(), previous_offset);
+                state.artist_songs_has_more =
+                    !state.artist_songs_browse_id.empty() && previous_has_more;
             }
-            state.artist_songs_offset =
-                std::max((int)artist.songs.size(), previous_offset);
-            state.artist_songs_has_more =
-                !state.artist_songs_browse_id.empty() && previous_has_more;
+
+            state.artist_failed = false;
+            state.artist_error_msg.clear();
+            songs_snapshot = state.artist_songs;
         }
 
+        // Cache file I/O stays outside the lock: the draw must not wait on
+        // the disk.
         ArtistInfo cached = artist;
-        cached.songs = state.artist_songs;
+        cached.songs = std::move(songs_snapshot);
         save_artist_cache(cached);
-
-        state.artist_failed = false;
-        state.artist_error_msg.clear();
     }
     else
     {
         BackendError err = take_backend_error();
-        // Only flag the failure when there's nothing to show; a stale cached
-        // artist on screen just gets the toast.
-        if (state.artist_songs.empty() && state.artist_albums.empty() && err)
+        BackendError notify_err;
         {
-            state.artist_failed = true;
-            state.artist_error_msg = backend_error_user_message(err);
-            ui_notify_backend_error(err);
+            std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+            // Only flag the failure when there's nothing to show; a stale
+            // cached artist on screen just gets the toast.
+            if (state.artist_songs.empty() && state.artist_albums.empty() && err)
+            {
+                state.artist_failed = true;
+                state.artist_error_msg = backend_error_user_message(err);
+                notify_err = err;
+            }
         }
+        if (notify_err)
+            ui_notify_backend_error(notify_err);
     }
-    state.artist_loading = false;
-    state.repaint_requested = true;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        state.artist_loading = false;
+        state.repaint_requested = true;
+    }
 }
 
 // Pull the next five songs from the artist's full songs shelf. The backend
@@ -143,46 +233,60 @@ static void load_more_artist_songs(AppState &state, const std::string &artist_id
 {
     std::vector<Track> more;
     const bool ok = fetch_artist_songs(browse_id, offset, 5, more);
-    if (state.artist_browse_id != artist_id ||
-        state.artist_songs_browse_id != browse_id)
-        return; // the user navigated to another artist while this was loading
+
+    std::vector<Track> songs_snapshot;
+    bool added_any = false;
+    BackendError notify_err;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        if (state.artist_browse_id != artist_id ||
+            state.artist_songs_browse_id != browse_id)
+            return; // the user navigated to another artist while this was loading
+        if (ok)
+        {
+            int added = 0;
+            for (const Track &t : more)
+            {
+                if (t.id.empty())
+                    continue;
+                const bool exists = std::any_of(
+                    state.artist_songs.begin(), state.artist_songs.end(),
+                    [&](const Track &existing) { return existing.id == t.id; });
+                if (!exists)
+                {
+                    state.artist_songs.push_back(t);
+                    ++added;
+                }
+            }
+            state.artist_songs_offset = offset + (int)more.size();
+            if ((int)more.size() < 5)
+                state.artist_songs_has_more = false;
+            added_any = added > 0;
+            songs_snapshot = state.artist_songs;
+        }
+        else
+        {
+            notify_err = take_backend_error();
+        }
+        state.artist_songs_loading = false;
+        state.repaint_requested = true;
+    }
+
+    if (notify_err)
+        ui_notify_backend_error(notify_err);
+
     if (ok)
     {
-        int added = 0;
-        for (const Track &t : more)
-        {
-            if (t.id.empty())
-                continue;
-            const bool exists = std::any_of(
-                state.artist_songs.begin(), state.artist_songs.end(),
-                [&](const Track &existing) { return existing.id == t.id; });
-            if (!exists)
-            {
-                state.artist_songs.push_back(t);
-                ++added;
-            }
-        }
-        state.artist_songs_offset = offset + (int)more.size();
-        if ((int)more.size() < 5)
-            state.artist_songs_has_more = false;
-        if (added > 0)
+        if (added_any)
             prefetch_urls_for(more, more.size());
 
         ArtistInfo cached;
-        if (load_artist_cache(state.artist_browse_id, cached))
+        if (load_artist_cache(artist_id, cached))
         {
-            cached.songs = state.artist_songs;
+            cached.songs = std::move(songs_snapshot);
             save_artist_cache(cached);
         }
     }
-    else
-    {
-        BackendError err = take_backend_error();
-        if (err)
-            ui_notify_backend_error(err);
-    }
-    state.artist_songs_loading = false;
-    state.repaint_requested = true;
 }
 
 void open_artist_view(AppState &state, const std::string &browse_id,
@@ -190,44 +294,52 @@ void open_artist_view(AppState &state, const std::string &browse_id,
 {
     if (browse_id.empty())
         return;
-    if (state.current_tab == Tab::Artist && state.artist_browse_id == browse_id)
-        return;
 
-    ui_invalidate_forward(state);
-    state.artist_return_tab = state.current_tab;
-    state.artist_return_source = state.current_playlist_source;
-    if (state.artist_return_source == PlaylistSource::PLAYLIST)
-        state.artist_return_playlist_index = state.selected_playlist_index;
-    else
-        state.artist_return_playlist_index = -1;
-
-    state.artist_browse_id = browse_id;
-    state.artist_name = display_name;
-    state.artist_description.clear();
-    state.artist_subscribers.clear();
-    state.artist_monthly_listeners.clear();
-    state.artist_thumbnail_url.clear();
-    state.artist_songs.clear();
-    state.artist_albums.clear();
-    state.artist_songs_browse_id.clear();
-    state.artist_songs_offset = 0;
-    state.artist_songs_has_more = false;
-    state.artist_songs_loading = false;
-
-    ArtistInfo cached;
-    bool had_cache = load_artist_cache(browse_id, cached);
-    if (had_cache)
+    std::vector<Track> prefetch_songs;
     {
-        apply_artist(state, cached);
-        prefetch_urls_for(state.artist_songs, 5);
-        if (!display_name.empty())
-            state.artist_name = display_name;
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        if (state.current_tab == Tab::Artist && state.artist_browse_id == browse_id)
+            return;
+
+        ui_invalidate_forward(state);
+        state.artist_return_tab = state.current_tab;
+        state.artist_return_source = state.current_playlist_source;
+        if (state.artist_return_source == PlaylistSource::PLAYLIST)
+            state.artist_return_playlist_index = state.selected_playlist_index;
+        else
+            state.artist_return_playlist_index = -1;
+
+        state.artist_browse_id = browse_id;
+        state.artist_name = display_name;
+        state.artist_description.clear();
+        state.artist_subscribers.clear();
+        state.artist_monthly_listeners.clear();
+        state.artist_thumbnail_url.clear();
+        state.artist_songs.clear();
+        state.artist_albums.clear();
+        state.artist_songs_browse_id.clear();
+        state.artist_songs_offset = 0;
+        state.artist_songs_has_more = false;
+        state.artist_songs_loading = false;
+
+        ArtistInfo cached;
+        bool had_cache = load_artist_cache(browse_id, cached);
+        if (had_cache)
+        {
+            apply_artist(state, cached);
+            prefetch_songs = state.artist_songs;
+            if (!display_name.empty())
+                state.artist_name = display_name;
+        }
+        state.artist_loading = !had_cache;
+        state.artist_failed = false;
+        state.artist_error_msg.clear();
+        state.current_tab = Tab::Artist;
+        state.current_playlist_source = PlaylistSource::ARTIST;
     }
-    state.artist_loading = !had_cache;
-    state.artist_failed = false;
-    state.artist_error_msg.clear();
-    state.current_tab = Tab::Artist;
-    state.current_playlist_source = PlaylistSource::ARTIST;
+
+    if (!prefetch_songs.empty())
+        prefetch_urls_for(prefetch_songs, 5);
 
     tasks::spawn("artist-fetch", [&state, browse_id]() {
         fetch_artist_into(state, browse_id);
@@ -244,78 +356,104 @@ void open_artist_from_track(AppState &state, const Track &track)
     if (track.id.empty())
         return;
 
-    ui_invalidate_forward(state);
+    {
+        std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+        ui_invalidate_forward(state);
 
-    state.artist_return_tab = state.current_tab;
-    state.artist_return_source = state.current_playlist_source;
-    if (state.artist_return_source == PlaylistSource::PLAYLIST)
-        state.artist_return_playlist_index = state.selected_playlist_index;
-    else
-        state.artist_return_playlist_index = -1;
+        state.artist_return_tab = state.current_tab;
+        state.artist_return_source = state.current_playlist_source;
+        if (state.artist_return_source == PlaylistSource::PLAYLIST)
+            state.artist_return_playlist_index = state.selected_playlist_index;
+        else
+            state.artist_return_playlist_index = -1;
 
-    state.artist_browse_id.clear();
-    state.artist_name = track.artist;
-    state.artist_description.clear();
-    state.artist_subscribers.clear();
-    state.artist_monthly_listeners.clear();
-    state.artist_thumbnail_url = track.thumbnail_url;
-    state.artist_songs.clear();
-    state.artist_albums.clear();
-    state.artist_songs_browse_id.clear();
-    state.artist_songs_offset = 0;
-    state.artist_songs_has_more = false;
-    state.artist_songs_loading = false;
-    state.artist_loading = true;
-    state.artist_failed = false;
-    state.artist_error_msg.clear();
-    state.current_tab = Tab::Artist;
-    state.current_playlist_source = PlaylistSource::ARTIST;
+        state.artist_browse_id.clear();
+        state.artist_name = track.artist;
+        state.artist_description.clear();
+        state.artist_subscribers.clear();
+        state.artist_monthly_listeners.clear();
+        state.artist_thumbnail_url = track.thumbnail_url;
+        state.artist_songs.clear();
+        state.artist_albums.clear();
+        state.artist_songs_browse_id.clear();
+        state.artist_songs_offset = 0;
+        state.artist_songs_has_more = false;
+        state.artist_songs_loading = false;
+        state.artist_loading = true;
+        state.artist_failed = false;
+        state.artist_error_msg.clear();
+        state.current_tab = Tab::Artist;
+        state.current_playlist_source = PlaylistSource::ARTIST;
+    }
 
     tasks::spawn("artist-open", [&state, track]() {
         std::string artist_id, artist_name;
         if (fetch_artist_for_track(track.id, artist_id, artist_name))
         {
-            state.artist_browse_id = artist_id;
-            if (!artist_name.empty())
-                state.artist_name = artist_name;
             ArtistInfo cached;
-            if (load_artist_cache(artist_id, cached))
+            std::vector<Track> prefetch_songs;
             {
-                apply_artist(state, cached);
-                prefetch_urls_for(state.artist_songs, 5);
+                std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+                state.artist_browse_id = artist_id;
+                if (!artist_name.empty())
+                    state.artist_name = artist_name;
+                if (load_artist_cache(artist_id, cached))
+                {
+                    apply_artist(state, cached);
+                    prefetch_songs = state.artist_songs;
+                }
             }
+            if (!prefetch_songs.empty())
+                prefetch_urls_for(prefetch_songs, 5);
+
             ArtistInfo artist;
             if (fetch_artist(artist_id, artist))
             {
                 prefetch_urls_for(artist.songs, 5);
                 save_artist_cache(artist);
+                std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
                 apply_artist(state, artist);
             }
             else
             {
                 BackendError err = take_backend_error();
-                if (err)
+                BackendError notify_err;
                 {
-                    state.artist_failed = state.artist_songs.empty() &&
-                                          state.artist_albums.empty();
-                    state.artist_error_msg = backend_error_user_message(err);
-                    ui_notify_backend_error(err);
+                    std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+                    if (err)
+                    {
+                        state.artist_failed = state.artist_songs.empty() &&
+                                              state.artist_albums.empty();
+                        state.artist_error_msg = backend_error_user_message(err);
+                        notify_err = err;
+                    }
                 }
+                if (notify_err)
+                    ui_notify_backend_error(notify_err);
             }
         }
         else
         {
             BackendError err = take_backend_error();
-            if (err)
+            BackendError notify_err;
             {
-                state.artist_failed = state.artist_songs.empty() &&
-                                      state.artist_albums.empty();
-                state.artist_error_msg = backend_error_user_message(err);
-                ui_notify_backend_error(err);
+                std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+                if (err)
+                {
+                    state.artist_failed = state.artist_songs.empty() &&
+                                          state.artist_albums.empty();
+                    state.artist_error_msg = backend_error_user_message(err);
+                    notify_err = err;
+                }
             }
+            if (notify_err)
+                ui_notify_backend_error(notify_err);
         }
-        state.artist_loading = false;
-        state.repaint_requested = true;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
+            state.artist_loading = false;
+            state.repaint_requested = true;
+        }
     });
 }
 
@@ -348,6 +486,7 @@ static SavedArtist artist_from_summary(const ArtistSummary &s)
 
 static void save_current_artist(AppState &state)
 {
+    std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
     if (state.artist_browse_id.empty())
         return;
     SavedArtist a;
@@ -361,6 +500,7 @@ static void save_current_artist(AppState &state)
 
 static void refresh_saved_artist_metadata(AppState &state)
 {
+    std::lock_guard<std::recursive_mutex> lock(state.artist_mutex);
     if (state.artist_loading || state.artist_browse_id.empty() || !is_artist_saved(state, state.artist_browse_id))
         return;
     for (auto &a : state.saved_artists)
@@ -517,6 +657,9 @@ void draw_artists_panel(AppState &state)
 
 void draw_artist_panel(AppState &state)
 {
+    // Fetches publish under this lock; hold it for the whole frame so a
+    // completion can never swap artist_songs/artist_albums mid-draw.
+    std::lock_guard<std::recursive_mutex> state_lock(state.artist_mutex);
     const UiMetrics &m = ui_m();
     refresh_saved_artist_metadata(state);
 
@@ -628,7 +771,7 @@ void draw_artist_panel(AppState &state)
     else
     {
         const std::string reveal_key = std::string("artist:") + state.artist_browse_id;
-        const double reveal_start = ui_anim_track_list_reveal(reveal_key.c_str(), state.artist_songs);
+        const ArtistSongReveal reveal = artist_song_reveal(reveal_key, state.artist_songs);
         const float row_pitch = ui_track_row_pitch(44.0f * m.layout_scale);
         const float list_start_y = ImGui::GetCursorPosY();
         ImGuiListClipper clipper;
@@ -641,8 +784,18 @@ void draw_artist_panel(AppState &state)
             opt.rank = i + 1;
             opt.show_duration = true;
             opt.art_size = 44.0f * m.layout_scale;
-            opt.reveal_start = reveal_start;
-            opt.reveal_index = i;
+            // Rows that were already on screen keep their finished reveal;
+            // only the freshly appended five get a new, staggered start.
+            double row_reveal = reveal.start;
+            int row_reveal_index = i;
+            if (reveal.append_start > 0.0 && i >= reveal.append_from)
+            {
+                const int step = i - reveal.append_from;
+                row_reveal = reveal.append_start + (double)ui_anim_delay(0.045f * (float)step);
+                row_reveal_index = 0;
+            }
+            opt.reveal_start = row_reveal;
+            opt.reveal_index = row_reveal_index;
             Track t = state.artist_songs[i];
             if (t.thumbnail_url.empty())
                 t.thumbnail_url = state.artist_thumbnail_url;

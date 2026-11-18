@@ -28,6 +28,19 @@ jobs:
             echo "::error::CMakeLists.txt version $CMAKE_VER does not match PKGBUILD pkgver=$PKG_VER"
             exit 1
           fi
+          # Keep exactly one ebuild, named after the current release.
+          mapfile -t EBUILDS < <(find packaging/gentoo -name 'crossfade-*.ebuild')
+          if [ "${#EBUILDS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one packaging/gentoo/crossfade-*.ebuild, found ${#EBUILDS[@]}"
+            printf '  %s\n' "${EBUILDS[@]}"
+            exit 1
+          fi
+          EBUILD_VER="$(basename "${EBUILDS[0]}" .ebuild)"
+          EBUILD_VER="${EBUILD_VER#crossfade-}"
+          if [ "$EBUILD_VER" != "$CMAKE_VER" ]; then
+            echo "::error::Gentoo ebuild version $EBUILD_VER does not match CMakeLists.txt version $CMAKE_VER"
+            exit 1
+          fi
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF_NAME#v}"
             if [ "$TAG" != "$CMAKE_VER" ]; then

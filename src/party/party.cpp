@@ -5,6 +5,7 @@
 #include "party_net.h"
 #include "party_queue.h"
 #include "party_server.h"
+#include "party_tunnel.h"
 #include "party_util.h"
 #include "guest_page.h"
 #include "texture.h"
@@ -55,6 +56,9 @@ struct Guest
     double last_seen = 0.0;
     party_util::TokenBucket add_bucket{0.2, 1.0, 0.0};
     party_util::TokenBucket search_bucket{1.0, 3.0, 0.0};
+    // "Play next" taps and media buttons are cheap but can still be spammed.
+    party_util::TokenBucket bump_bucket{0.5, 1.0, 0.0};
+    party_util::TokenBucket control_bucket{1.0, 2.0, 0.0};
 };
 
 struct PendingRequest
@@ -76,6 +80,7 @@ struct AddedNotice
     std::string title;
     std::string by;
     bool pending = false;
+    bool bumped = false;
 };
 
 struct InboxAdd
@@ -91,6 +96,21 @@ struct InboxUndo
     std::shared_ptr<AddWaiter> waiter;
     std::string guest_id;
     std::string video_id;
+};
+
+struct InboxBump
+{
+    std::shared_ptr<AddWaiter> waiter;
+    std::string guest_id;
+    std::string video_id;
+    std::string by;
+};
+
+struct InboxControl
+{
+    std::shared_ptr<AddWaiter> waiter;
+    std::string guest_id;
+    std::string action;
 };
 
 struct Snapshot
@@ -118,19 +138,30 @@ std::atomic<PartyRunState> g_state{PartyRunState::Stopped};
 PartySettings g_settings;
 std::string g_token;
 std::string g_url;
+std::string g_lan_url;
 std::string g_ip;
 std::string g_error;
+bool g_public_reach = false;
+std::string g_public_url;
+std::string g_public_host;
+std::string g_tunnel_binary;
+std::string g_tunnel_error;
+double g_tunnel_retry_at = 0.0;
+bool g_tunnel_announced = false;
 int g_port = 0;
 std::string g_accent_hex = "#6db2d0";
 uint64_t g_version = 0;
 int g_requests_added = 0;
 std::string g_last_sig;
 double g_last_build = 0.0;
+double g_last_net_check = 0.0;
 std::shared_ptr<Snapshot> g_snapshot;
 std::unordered_map<std::string, Guest> g_guests;
 std::vector<PendingRequest> g_pending;
 std::deque<InboxAdd> g_add_inbox;
 std::deque<InboxUndo> g_undo_inbox;
+std::deque<InboxBump> g_bump_inbox;
+std::deque<InboxControl> g_control_inbox;
 std::vector<std::shared_ptr<AddWaiter>> g_waiters;
 std::unordered_map<std::string, Track> g_meta_cache;
 std::list<std::string> g_meta_lru;
@@ -309,6 +340,7 @@ std::string build_state_json(AppState &state, const std::vector<Track> &queue,
     j += "\"open\":true,";
     j += std::string("\"requireApproval\":") + (g_settings.require_approval ? "true" : "false") + ",";
     j += std::string("\"allowSearch\":") + (g_settings.allow_search ? "true" : "false") + ",";
+    j += std::string("\"allowControls\":") + (g_settings.allow_controls ? "true" : "false") + ",";
     j += "\"accent\":\"" + accent_hex_locked() + "\"},";
 
     j += "\"now\":{";
@@ -383,6 +415,7 @@ std::string make_sig(AppState &state, const std::vector<PendingRequest> &pending
     s += g_settings.require_approval ? '1' : '0';
     s += g_settings.show_names ? '1' : '0';
     s += g_settings.allow_search ? '1' : '0';
+    s += g_settings.allow_controls ? '1' : '0';
     s += '|';
     for (const Track &t : state.play_queue)
     {
@@ -554,6 +587,100 @@ void process_undo(AppState &state, InboxUndo item)
     finish_waiter(item.waiter, std::move(r));
 }
 
+party_api::AddResult process_bump(AppState &state, InboxBump item)
+{
+    party_api::AddResult r;
+    if (g_state != PartyRunState::Running)
+    {
+        r = error_result(403, "party_closed", "This party has ended.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    auto it = std::find_if(state.play_queue.begin(), state.play_queue.end(),
+                           [&](const Track &t) { return t.id == item.video_id; });
+    if (it == state.play_queue.end())
+    {
+        r = state.current_track_id == item.video_id
+                ? error_result(409, "already_playing", "That song is already playing.")
+                : error_result(409, "gone", "That song already left the queue.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    // Turning a host playlist row into a guest request counts against the
+    // guest quota; moving an existing request does not.
+    if (!it->from_party && g_settings.max_per_guest > 0)
+    {
+        int mine = party_queue::count_guest_items(state.play_queue, item.guest_id);
+        for (const PendingRequest &p : g_pending)
+            if (p.track.guest_id == item.guest_id)
+                ++mine;
+        if (mine >= g_settings.max_per_guest)
+        {
+            r = error_result(429, "quota",
+                             "You already have " + std::to_string(g_settings.max_per_guest) +
+                                 " songs in the queue.",
+                             std::max(0, g_settings.cooldown_sec));
+            finish_waiter(item.waiter, std::move(r));
+            return r;
+        }
+    }
+    const int idx =
+        party_queue::bump_to_top(state.play_queue, item.video_id, item.guest_id, item.by);
+    if (idx < 0)
+    {
+        r = error_result(409, "gone", "That song already left the queue.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    state.queue_dirty = true;
+    state.repaint_requested = true;
+    const Track &moved = state.play_queue[(size_t)idx];
+    // The moved row is next after the current song, so its ETA is the rest of
+    // the current track (the explicit add flow uses the full duration).
+    const double eta = state.current_track_id.empty() ? 0.0 : std::max(0.0, g_now_duration);
+    r.http = 200;
+    r.status = "queued";
+    r.item_json = item_json(moved, "queued", (int)std::lround(eta), item.by);
+    finish_waiter(item.waiter, std::move(r));
+    return r;
+}
+
+party_api::AddResult process_control(AppState &state, InboxControl item)
+{
+    party_api::AddResult r;
+    if (g_state != PartyRunState::Running)
+        r = error_result(403, "party_closed", "This party has ended.");
+    else if (!g_settings.allow_controls)
+        r = error_result(403, "controls_off",
+                         "The host turned off guest playback controls.");
+    else if (item.action == "play")
+    {
+        state.user_play_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "pause")
+    {
+        state.user_pause_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "next")
+    {
+        state.next_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "prev")
+    {
+        state.prev_requested = true;
+        r.http = 200;
+    }
+    else
+        r = error_result(400, "bad_action", "Unknown playback control.");
+    if (r.http == 200)
+        state.repaint_requested = true;
+    finish_waiter(item.waiter, std::move(r));
+    return r;
+}
+
 Track meta_cache_get(const std::string &id)
 {
     auto it = g_meta_cache.find(id);
@@ -632,6 +759,29 @@ bool party_start(const PartySettings &settings, std::string &error)
     if (g_state == PartyRunState::Running)
         party_stop();
 
+    const bool want_public = settings.public_reach();
+    std::string cloudflared;
+    if (want_public && !party_tunnel::available(cloudflared, settings.tunnel_path))
+    {
+        std::string hint;
+#ifdef P100_WINDOWS
+        hint = "winget install --id Cloudflare.cloudflared";
+#elif defined(__APPLE__)
+        hint = "brew install cloudflared";
+#else
+        hint = "your package manager (for example pacman, apt or dnf install cloudflared)";
+#endif
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = PartyRunState::Error;
+        g_error = "cloudflared is not installed, so the public link cannot start. Install "
+                  "it with " + hint +
+                  ", or download it from Cloudflare's downloads page, then try again. You "
+                  "can also use Start LAN party on the Party tab, or switch Guest access to "
+                  "\"Same Wi-Fi only\" in Settings > Party.";
+        error = g_error;
+        return false;
+    }
+
     std::string ip = settings.interface_ip;
     if (!ip.empty())
     {
@@ -677,6 +827,10 @@ bool party_start(const PartySettings &settings, std::string &error)
         return false;
     }
 
+    party_server_set_public_host("");
+    const std::string lan_url =
+        "http://" + ip + ":" + std::to_string(party_server_port()) + "/j/" + token;
+
     {
         std::lock_guard<std::mutex> lock(g_mu);
         g_settings = settings;
@@ -684,18 +838,29 @@ bool party_start(const PartySettings &settings, std::string &error)
         g_token = token;
         g_port = party_server_port();
         g_ip = ip;
-        g_url = "http://" + ip + ":" + std::to_string(g_port) + "/j/" + g_token;
+        g_lan_url = lan_url;
+        g_url = lan_url; // the public URL replaces this when the tunnel is ready
+        g_public_reach = want_public;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_binary = cloudflared;
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
         g_error.clear();
         g_state = PartyRunState::Running;
         g_guests.clear();
         g_pending.clear();
         g_add_inbox.clear();
         g_undo_inbox.clear();
+        g_bump_inbox.clear();
+        g_control_inbox.clear();
         g_waiters.clear();
         g_requests_added = 0;
         g_version = 1;
         g_last_sig.clear();
         g_last_prefetch.clear();
+        g_last_net_check = 0.0;
         g_meta_cache.clear();
         g_meta_lru.clear();
         g_accent_hex = accent_hex_from_ui();
@@ -720,11 +885,25 @@ bool party_start(const PartySettings &settings, std::string &error)
             publish_locked(empty, 0.0, 0.0, true, false);
         }
     }
+
+    if (want_public)
+    {
+        std::string tunnel_error;
+        if (!party_tunnel::start(ip, party_server_port(), cloudflared, tunnel_error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_tunnel_error = tunnel_error.empty() ? "The public link could not start."
+                                                  : tunnel_error;
+        }
+    }
     return true;
 }
 
 void party_stop()
 {
+    // Kill the tunnel before taking g_mu: stop() joins its reader thread, and
+    // that thread may still be delivering log lines.
+    party_tunnel::stop();
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (g_state == PartyRunState::Stopped && !party_server_running())
@@ -743,13 +922,23 @@ void party_stop()
         }
         g_add_inbox.clear();
         g_undo_inbox.clear();
+        g_bump_inbox.clear();
+        g_control_inbox.clear();
         g_guests.clear();
         g_pending.clear();
         g_snapshot.reset();
         g_token.clear();
         g_url.clear();
+        g_lan_url.clear();
         g_ip.clear();
         g_port = 0;
+        g_public_reach = false;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_binary.clear();
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
         g_version = 0;
         g_requests_added = 0;
         g_last_sig.clear();
@@ -772,12 +961,35 @@ bool party_running()
 PartyStatus party_status()
 {
     PartyStatus s;
+    const party_tunnel::Status ts = party_tunnel::status();
     std::lock_guard<std::mutex> lock(g_mu);
     s.state = g_state;
     s.url = g_url;
+    s.lan_url = g_lan_url;
     s.ip = g_ip;
     s.port = g_port;
     s.error = g_error;
+    s.public_reach = g_public_reach;
+    s.tunnel_error = g_tunnel_error;
+    if (g_public_reach)
+    {
+        switch (ts.state)
+        {
+        case party_tunnel::State::Live: s.tunnel_state = PartyTunnelState::Live; break;
+        case party_tunnel::State::Error: s.tunnel_state = PartyTunnelState::Error; break;
+        case party_tunnel::State::Starting:
+        case party_tunnel::State::Stopped:
+        default: s.tunnel_state = PartyTunnelState::Starting; break;
+        }
+        if (ts.state == party_tunnel::State::Live && !ts.url.empty() && !g_token.empty())
+            s.url = ts.url + "/j/" + g_token;
+        if (ts.state == party_tunnel::State::Error && !ts.error.empty())
+            s.tunnel_error = ts.error;
+    }
+    else
+    {
+        s.tunnel_state = PartyTunnelState::Off;
+    }
     s.guests = (int)g_guests.size();
     s.requests_added = g_requests_added;
     return s;
@@ -882,11 +1094,283 @@ void party_approve_all()
     publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
 }
 
+namespace
+{
+// The address a running party should advertise right now. A saved interface
+// wins only while it still exists; otherwise fall back to the best current
+// private address ("" when offline).
+std::string current_party_ip(const std::string &preferred)
+{
+    if (!preferred.empty())
+    {
+        for (const party_net::Interface &i : party_net::list())
+            if (i.ip == preferred)
+                return preferred;
+    }
+    return party_net::best_ip();
+}
+
+// Rebind the listener and refresh the guest URL after the host moved to a
+// different network. Guest cookies/tokens live in this module, so a reboot of
+// the HTTP server keeps already-joined phones valid on the new address.
+bool rebind_party_to(const std::string &new_ip)
+{
+    std::string old_ip;
+    std::string old_public_host;
+    int old_port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        old_ip = g_ip;
+        old_public_host = g_public_host;
+        old_port = g_port > 0 ? g_port : g_settings.port;
+    }
+
+    PartyServerConfig cfg;
+    cfg.bind_ip = new_ip;
+    cfg.public_ip = new_ip;
+    cfg.port = old_port > 0 ? old_port : 8484;
+
+    std::string error;
+    party_server_stop();
+    if (!party_server_start(cfg, error))
+    {
+        // Try the previous address once. If that is gone too, surface the
+        // failure rather than advertising a dead URL.
+        PartyServerConfig old_cfg;
+        old_cfg.bind_ip = old_ip;
+        old_cfg.public_ip = old_ip;
+        old_cfg.public_host = old_public_host;
+        old_cfg.port = cfg.port;
+        if (old_ip.empty() || !party_server_start(old_cfg, error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_state = PartyRunState::Error;
+            g_error = error.empty() ? "Could not rebind the party address." : error;
+            g_url.clear();
+            g_ip.clear();
+            if (g_app)
+            {
+                g_app->repaint_requested = true;
+                publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+            }
+            return false;
+        }
+        return false;
+    }
+
+    bool public_reach = false;
+    std::string tunnel_binary;
+    int new_port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_ip = new_ip;
+        g_port = party_server_port();
+        if (!g_settings.interface_ip.empty())
+            g_settings.interface_ip = new_ip;
+        g_lan_url = "http://" + new_ip + ":" + std::to_string(g_port) + "/j/" + g_token;
+        // The quick-tunnel URL and origin changed with the network; go back to
+        // the LAN link until the new public URL arrives.
+        g_url = g_lan_url;
+        g_public_url.clear();
+        g_public_host.clear();
+        g_tunnel_error.clear();
+        g_tunnel_retry_at = 0.0;
+        g_tunnel_announced = false;
+        g_error.clear();
+        g_state = PartyRunState::Running;
+        public_reach = g_public_reach;
+        tunnel_binary = g_tunnel_binary;
+        new_port = g_port;
+        ++g_version;
+        g_last_sig.clear();
+        if (g_app)
+        {
+            if (!g_app->settings.party.interface_ip.empty())
+                g_app->settings.party.interface_ip = new_ip;
+            g_app->repaint_requested = true;
+            publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+        }
+    }
+
+    party_server_set_public_host("");
+    if (public_reach)
+    {
+        party_tunnel::stop();
+        std::string tunnel_error;
+        if (!party_tunnel::start(new_ip, new_port, tunnel_binary, tunnel_error))
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_tunnel_error = tunnel_error.empty() ? "The public link could not restart."
+                                                  : tunnel_error;
+            if (g_app)
+                g_app->repaint_requested = true;
+        }
+    }
+    return true;
+}
+
+// Apply the tunnel's asynchronous state to the advertised link: swap in the
+// public URL when it arrives, fall back to the LAN link on failure, and retry
+// a dead tunnel with a slow backoff. Runs on the main thread.
+void party_sync_tunnel()
+{
+    bool public_reach = false;
+    std::string origin_ip;
+    std::string binary;
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        public_reach = g_public_reach;
+        origin_ip = g_ip;
+        binary = g_tunnel_binary;
+        port = g_port;
+    }
+    if (!public_reach)
+        return;
+
+    const party_tunnel::Status ts = party_tunnel::status();
+    const double now = now_sec();
+    bool announce = false;
+    bool clear_public_host = false;
+    bool changed = false;
+    std::string set_public_host;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (ts.state == party_tunnel::State::Live && !ts.url.empty() &&
+            ts.url != g_public_url)
+        {
+            g_public_url = ts.url;
+            g_public_host = ts.host;
+            g_url = ts.url + "/j/" + g_token;
+            g_tunnel_error.clear();
+            g_tunnel_retry_at = 0.0;
+            set_public_host = ts.host;
+            changed = true;
+            if (!g_tunnel_announced)
+            {
+                g_tunnel_announced = true;
+                announce = true;
+            }
+        }
+        else if (ts.state == party_tunnel::State::Starting && !g_tunnel_error.empty())
+        {
+            // A retry is in progress; stop showing the previous failure.
+            g_tunnel_error.clear();
+            changed = true;
+        }
+        else if (ts.state == party_tunnel::State::Error)
+        {
+            if (ts.error != g_tunnel_error)
+            {
+                g_tunnel_error = ts.error;
+                changed = true;
+            }
+            if (!g_public_url.empty())
+            {
+                g_public_url.clear();
+                g_public_host.clear();
+                g_url = g_lan_url;
+                clear_public_host = true;
+                changed = true;
+            }
+            if (g_tunnel_retry_at <= 0.0)
+                g_tunnel_retry_at = now + 20.0;
+        }
+        if (changed)
+        {
+            ++g_version;
+            g_last_sig.clear();
+            if (g_app)
+                publish_locked(*g_app, g_last_pos, g_last_dur, g_last_paused, true);
+        }
+    }
+
+    if (!set_public_host.empty())
+        party_server_set_public_host(set_public_host);
+    else if (clear_public_host)
+        party_server_set_public_host("");
+
+    if (announce)
+    {
+        ui_notify(UiNotifyType::Success, "Public party link ready",
+                  "The QR code now works from any network.", 4.5f);
+        if (g_app)
+            g_app->repaint_requested = true;
+    }
+
+    if (ts.state == party_tunnel::State::Error)
+    {
+        double retry_at = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            retry_at = g_tunnel_retry_at;
+        }
+        if (retry_at > 0.0 && now >= retry_at)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_retry_at = now + 20.0;
+            }
+            std::string error;
+            if (!party_tunnel::start(origin_ip, port, binary, error))
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_error = error.empty() ? "The public link could not start." : error;
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_tunnel_announced = false;
+            }
+        }
+    }
+}
+} // namespace
+
 void party_tick(AppState &state, double position_sec, double duration_sec, bool paused)
 {
     g_app = &state;
     if (g_state != PartyRunState::Running)
         return;
+
+    // Follow network changes (new Wi-Fi / hotspot / VPN). The listener is
+    // bound to one address, so without this the QR keeps pointing at an
+    // address the host no longer owns and every guest is stranded.
+    {
+        const double t = now_sec();
+        bool check = false;
+        std::string preferred;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (t - g_last_net_check >= 5.0)
+            {
+                g_last_net_check = t;
+                check = true;
+                preferred = g_settings.interface_ip;
+            }
+        }
+        if (check)
+        {
+            const std::string wanted = current_party_ip(preferred);
+            std::string current_ip;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                current_ip = g_ip;
+            }
+            if (!wanted.empty() && !current_ip.empty() && wanted != current_ip)
+            {
+                if (rebind_party_to(wanted))
+                {
+                    ui_notify(UiNotifyType::Info, "Party address updated",
+                              "The QR code now points at " + wanted + ".", 4.5f);
+                }
+                if (g_app)
+                    g_app->repaint_requested = true;
+            }
+        }
+    }
+
+    party_sync_tunnel();
 
     std::vector<AddedNotice> notifications;
     std::string prefetch_ids;
@@ -921,6 +1405,32 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
             g_undo_inbox.pop_front();
             process_undo(state, std::move(item));
         }
+        while (!g_bump_inbox.empty())
+        {
+            InboxBump item = std::move(g_bump_inbox.front());
+            g_bump_inbox.pop_front();
+            auto git = g_guests.find(item.guest_id);
+            if (git != g_guests.end() && !git->second.name.empty())
+                item.by = git->second.name;
+            // Capture the title before the move for the host notification.
+            std::string title;
+            const std::string by = item.by;
+            for (const Track &t : state.play_queue)
+                if (t.id == item.video_id)
+                {
+                    title = t.title;
+                    break;
+                }
+            party_api::AddResult r = process_bump(state, std::move(item));
+            if (r.http == 200 && !title.empty())
+                notifications.push_back({title, by, false, true});
+        }
+        while (!g_control_inbox.empty())
+        {
+            InboxControl item = std::move(g_control_inbox.front());
+            g_control_inbox.pop_front();
+            process_control(state, std::move(item));
+        }
 
         // Evict guests idle for more than 30 minutes.
         const double t = now_sec();
@@ -933,6 +1443,9 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
         }
 
         g_accent_hex = accent_hex_from_ui();
+        // Guest playback controls can be toggled while a party is running;
+        // every other setting is a snapshot taken at party start.
+        g_settings.allow_controls = state.settings.party.allow_controls;
         remember_art(Track{state.current_track_id, state.current_title, state.current_artist,
                            state.current_artist_id, "", state.current_album_id, 0,
                            state.current_thumbnail_url, (int)duration_sec, "",
@@ -981,7 +1494,8 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
             std::string msg = n.title;
             if (!n.by.empty())
                 msg += " · " + n.by;
-            ui_notify(UiNotifyType::Success, n.pending ? "Song requested" : "Song added",
+            ui_notify(UiNotifyType::Success,
+                      n.bumped ? "Playing next" : (n.pending ? "Song requested" : "Song added"),
                       msg, 5.0f);
         }
     }
@@ -1042,6 +1556,8 @@ bool join(const std::string &token, std::string &guest_id, bool &is_new)
     g.add_bucket = party_util::TokenBucket(
         g_settings.cooldown_sec > 0 ? 1.0 / g_settings.cooldown_sec : 100.0, 1.0, t);
     g.search_bucket = party_util::TokenBucket(1.0, 3.0, t);
+    g.bump_bucket = party_util::TokenBucket(0.5, 1.0, t);
+    g.control_bucket = party_util::TokenBucket(1.0, 2.0, t);
     g_guests[id] = std::move(g);
     guest_id = id;
     is_new = true;
@@ -1225,6 +1741,110 @@ AddResult undo(const std::string &guest_id, const std::string &video_id)
     wake_loop();
     std::unique_lock<std::mutex> lock(waiter->m);
     if (!waiter->cv.wait_for(lock, std::chrono::seconds(5), [&] { return waiter->done; }))
+        return error_result(503, "busy", "The app is busy right now. Try again.");
+    return waiter->result;
+}
+
+AddResult bump(const std::string &guest_id, const std::string &video_id)
+{
+    if (!party_link::valid_video_id(video_id))
+        return error_result(400, "invalid_link", "That doesn't look like a YouTube song.");
+    const double t = now_sec();
+    std::string by;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        auto git = g_guests.find(guest_id);
+        if (git == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        Guest &g = git->second;
+        g.last_seen = t;
+        if (!g.bump_bucket.take(t))
+        {
+            const int retry = std::max(1, (int)std::ceil(g.bump_bucket.retry_after(t)));
+            return error_result(429, "rate_limited", "One song at a time, please.", retry);
+        }
+        by = g.name;
+    }
+
+    auto waiter = std::make_shared<AddWaiter>();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (g_guests.find(guest_id) == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        if (g_bump_inbox.size() >= kMaxInbox)
+            return error_result(503, "busy", "The app is busy right now. Try again.", 2);
+        InboxBump item;
+        item.waiter = waiter;
+        item.guest_id = guest_id;
+        item.video_id = video_id;
+        item.by = by;
+        g_bump_inbox.push_back(std::move(item));
+        g_waiters.push_back(waiter);
+        if (g_waiters.size() > 256)
+            g_waiters.erase(g_waiters.begin(), g_waiters.begin() + 128);
+    }
+    wake_loop();
+
+    std::unique_lock<std::mutex> lock(waiter->m);
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(6), [&] { return waiter->done; }))
+        return error_result(503, "busy", "The app is busy right now. Try again.");
+    return waiter->result;
+}
+
+AddResult control(const std::string &guest_id, const std::string &action)
+{
+    if (action != "play" && action != "pause" && action != "next" && action != "prev")
+        return error_result(400, "bad_action", "Unknown playback control.");
+
+    const double t = now_sec();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (!g_settings.allow_controls)
+            return error_result(403, "controls_off",
+                                "The host turned off guest playback controls.");
+        auto git = g_guests.find(guest_id);
+        if (git == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        Guest &g = git->second;
+        g.last_seen = t;
+        if (!g.control_bucket.take(t))
+        {
+            const int retry = std::max(1, (int)std::ceil(g.control_bucket.retry_after(t)));
+            return error_result(429, "rate_limited", "Slow down a little.", retry);
+        }
+    }
+
+    auto waiter = std::make_shared<AddWaiter>();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (!g_settings.allow_controls)
+            return error_result(403, "controls_off",
+                                "The host turned off guest playback controls.");
+        if (g_guests.find(guest_id) == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        if (g_control_inbox.size() >= kMaxInbox)
+            return error_result(503, "busy", "The app is busy right now. Try again.", 2);
+        InboxControl item;
+        item.waiter = waiter;
+        item.guest_id = guest_id;
+        item.action = action;
+        g_control_inbox.push_back(std::move(item));
+        g_waiters.push_back(waiter);
+        if (g_waiters.size() > 256)
+            g_waiters.erase(g_waiters.begin(), g_waiters.begin() + 128);
+    }
+    wake_loop();
+
+    std::unique_lock<std::mutex> lock(waiter->m);
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(3), [&] { return waiter->done; }))
         return error_result(503, "busy", "The app is busy right now. Try again.");
     return waiter->result;
 }

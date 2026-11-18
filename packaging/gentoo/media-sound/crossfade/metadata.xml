@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>relubadea333@gmail.com</email>
+		<name>XBoom31</name>
+	</maintainer>
+	<longdescription lang="en">
+		A native YouTube Music desktop client focused on low overhead: it uses
+		libmpv for playback and its own OpenGL UI instead of a web view, with
+		real crossfade, caching, playlists and party mode.
+	</longdescription>
+	<use>
+		<flag name="webkit">Use WebKitGTK for the in-app Google/Spotify sign-in popup. Without it, sign-in falls back to importing request headers from a browser.</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">XBoom31/crossfade</remote-id>
+	</upstream>
+</pkgmetadata>

@@ -36,7 +36,9 @@ enum class UiIcon
     Moon,
     Party,
     Podcast,
-    Qr
+    Qr,
+    Studio,
+    Video
 };
 
 void ui_draw_icon(ImDrawList *dl, UiIcon icon, ImVec2 center, float size, ImU32 color,

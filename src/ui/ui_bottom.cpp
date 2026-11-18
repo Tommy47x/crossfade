@@ -17,6 +17,8 @@
 
 static constexpr float kTau = 6.28318530717958647692f;
 static std::unordered_map<ImGuiID, float> g_control_hover;
+// Sub-percent remainder for wheel-over-volume: touchpads send tiny deltas.
+static float s_vol_wheel_accum = 0.0f;
 
 template <typename LabelFn>
 static bool draw_progress_bar(const char *id, float *value01, float width, float height,
@@ -733,16 +735,17 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const bool lyrics_setting = state.settings.lyrics_panel_open;
     const bool lyrics_open = lyrics_setting && l.lyrics_open;
 
-    // Right-hand utility cluster (sleep / queue / lyrics / volume / speed).
-    // It is laid out right-to-left from the window edge: the volume slider
-    // absorbs the free space, and the secondary readouts (speed first, then
-    // the percentage) drop out when the window or the UI scale is too tight.
-    // This keeps the icons from colliding with each other and with the
+    // Right-hand utility cluster (sleep / queue / video / lyrics / volume /
+    // speed). It is laid out right-to-left from the window edge: the volume
+    // slider absorbs the free space, and the secondary readouts (speed first,
+    // then the percentage) drop out when the window or the UI scale is too
+    // tight. This keeps the icons from colliding with each other and with the
     // transport controls at every size.
     const float right_edge = bar_w - side_pad;
     const float icon_gap = m.space_2;
+    constexpr int kUtilityIcons = 4;
     float icon_size = std::min(m.control_h * ctrl_scale, bar_h * 0.52f);
-    float icons_w = icon_size * 3.0f + icon_gap * 2.0f;
+    float icons_w = icon_size * kUtilityIcons + icon_gap * (kUtilityIcons - 1);
     const float right_min_x = center_x + center_w + m.space_3;
     const float right_avail = std::max(0.0f, right_edge - right_min_x);
 
@@ -751,8 +754,8 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     if (right_avail < icons_w && icon_size > 0.0f)
     {
         icon_size = std::max(8.0f * m.layout_scale,
-                             (right_avail - icon_gap * 2.0f) / 3.0f);
-        icons_w = icon_size * 3.0f + icon_gap * 2.0f;
+                             (right_avail - icon_gap * (kUtilityIcons - 1)) / (float)kUtilityIcons);
+        icons_w = icon_size * kUtilityIcons + icon_gap * (kUtilityIcons - 1);
     }
 
     const float vol_icon = 20.0f * m.layout_scale;
@@ -796,7 +799,8 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
 
     const float sleep_x = std::max(right_min_x, right_edge - utility_w);
     const float queue_x = sleep_x + icon_size + icon_gap;
-    const float lyrics_x = queue_x + icon_size + icon_gap;
+    const float video_x = queue_x + icon_size + icon_gap;
+    const float lyrics_x = video_x + icon_size + icon_gap;
     const float vol_x = lyrics_x + icon_size + icon_gap;
     const float vol_y = wp.y + (bar_h - seek_h) * 0.5f;
 
@@ -875,6 +879,14 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
             state.current_tab = Tab::Queue;
         }
     }
+    ImGui::SetCursorScreenPos(ImVec2(video_x, wp.y + (bar_h - icon_size) * 0.5f));
+    const bool video_on = state.video_active || state.video_loading.load();
+    if (ui_icon_button("##video_toggle", UiIcon::Video, icon_size, video_on, 0,
+                       state.video_active ? "Back to audio (V)"
+                       : state.video_loading.load() ? "Finding video... (V to cancel)"
+                                                    : "Watch video (V)"))
+        state.video_toggle_requested = true;
+
     ImGui::SetCursorScreenPos(ImVec2(lyrics_x, wp.y + (bar_h - icon_size) * 0.5f));
     if (ui_icon_button("##lyrics_toggle", UiIcon::Lyrics, icon_size, lyrics_open, 0, "Lyrics"))
     {
@@ -902,6 +914,27 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
 
         ui_draw_icon(dl, UiIcon::Volume, ImVec2(vol_x + vol_icon * 0.5f, wp.y + bar_h * 0.5f),
                      vol_icon, ui_text_muted_u32(), 1.5f);
+
+        // Wheel / two-finger scroll over the slider nudges the volume. The
+        // readme promises this; without it the wheel only scrolled the page
+        // under the pointer, so touchpad users had no mouse volume control.
+        // Fractional touchpad deltas accumulate so slow scrolls still move.
+        const ImVec2 wheel_min(vol_x, vol_y - m.space_2);
+        const ImVec2 wheel_max(bar_x + vol_bar_w, vol_y + seek_h + m.space_2);
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(wheel_min, wheel_max) &&
+            io.MouseWheel != 0.0f)
+        {
+            s_vol_wheel_accum += io.MouseWheel * 5.0f;
+            const int step = (int)s_vol_wheel_accum;
+            if (step != 0)
+            {
+                s_vol_wheel_accum -= (float)step;
+                state.volume_request = std::clamp(vol + step, 0, 100);
+            }
+        }
+        else
+            s_vol_wheel_accum = 0.0f;
+
         ImGui::SetCursorScreenPos(ImVec2(bar_x, vol_y));
         if (draw_progress_bar("##volume", &vol_value01, vol_bar_w, seek_h,
                               ui_accent_u32(1.0f), ui_overlay_u32(0.14f),

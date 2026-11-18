@@ -35,6 +35,13 @@
 #include <dirent.h>
 #endif
 
+// "local:" ids are files on disk, never YouTube videos. Guarding at this level
+// means no caller can accidentally send one to the backend or yt-dlp.
+static bool is_local_media_id(const std::string &id)
+{
+    return id.rfind("local:", 0) == 0;
+}
+
 // Directory listing used by the audio-cache scans. dirent on POSIX,
 // std::filesystem on Windows; both return plain entry names.
 static std::vector<std::string> list_dir_names(const std::string &dir)
@@ -102,8 +109,49 @@ static BackendChannel g_backend;
 static BackendChannel g_play_backend;
 static BackendChannel g_prefetch_backend;
 static std::atomic<bool> g_backend_stopping{false};
+// Set from the backend's ready handshake: true when it started without a
+// usable sign-in and is limited to public (unauthenticated) browsing.
+static std::atomic<bool> g_backend_guest{false};
 static std::atomic<bool> g_optional_backends_enabled{true};
 static std::atomic<bool> g_backend_deferred{false};
+
+// ---- Live backend command log (for the in-app debug window) ----
+static std::mutex g_backend_log_mutex;
+static std::deque<BackendLogEntry> g_backend_log;
+static uint64_t g_backend_log_seq = 0;
+static constexpr size_t kBackendLogCap = 400;
+
+static const char *backend_channel_name(const BackendChannel &ch)
+{
+    if (&ch == &g_backend)
+        return "main";
+    if (&ch == &g_play_backend)
+        return "play";
+    if (&ch == &g_prefetch_backend)
+        return "prefetch";
+    return "?";
+}
+
+static void record_backend_log(const BackendChannel &ch, const std::string &cmd,
+                               uint64_t ms, const std::string &response, bool error)
+{
+    std::lock_guard<std::mutex> lock(g_backend_log_mutex);
+    BackendLogEntry e;
+    e.seq = ++g_backend_log_seq;
+    e.ts_ms = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+    e.channel = backend_channel_name(ch);
+    constexpr size_t kCmdClip = 180;
+    e.command = cmd.size() > kCmdClip ? cmd.substr(0, kCmdClip) + "…" : cmd;
+    e.ms = ms;
+    e.error = error || response.empty() ||
+              response.find("\"error\"") != std::string::npos;
+    e.bytes = response.size();
+    g_backend_log.push_back(std::move(e));
+    while (g_backend_log.size() > kBackendLogCap)
+        g_backend_log.pop_front();
+}
 
 static std::string g_warm_extractor = "1"; // P100_WARM_EXTRACTOR for children
 
@@ -141,6 +189,20 @@ BackendError take_backend_error()
     BackendError e = g_backend_error;
     g_backend_error.clear();
     return e;
+}
+
+// The ready handshake says whether the backend started without a usable
+// sign-in. Tolerant of spacing so older/compact JSON both work.
+static bool ready_says_guest(const std::string &ready)
+{
+    size_t pos = ready.find("\"guest\"");
+    if (pos == std::string::npos)
+        return false;
+    pos = ready.find(':', pos);
+    if (pos == std::string::npos)
+        return false;
+    pos = ready.find_first_not_of(" \t", pos + 1);
+    return pos != std::string::npos && ready.compare(pos, 4, "true") == 0;
 }
 
 // Map the Python {"kind": "..."} tag to the enum. Unknown/missing kinds fall
@@ -189,6 +251,9 @@ static void record_backend_error(const std::string &response)
 // process (or a pipe that lost its reader) previously blocked fgets for good.
 // Everything up to kReadTimeoutSeconds, then a synthesized error response.
 static constexpr int kReadTimeoutSeconds = 45;
+// One backend reply is a single JSON line; anything larger is a bug (or a
+// wedged process) and must not grow a buffer without bound on either OS.
+static constexpr size_t kMaxBackendLine = 10 * 1024 * 1024;
 
 void set_ytdl_browser(const std::string &browser)
 {
@@ -402,6 +467,23 @@ static void backend_reader_thread(BackendChannel *ch)
             return;
         }
         pending.append(buf, (size_t)n);
+        if (pending.size() > kMaxBackendLine)
+        {
+            // Same bound as the POSIX reader: a reply that never terminates
+            // must not grow the buffer forever. The stream is desynced, so
+            // retire the channel after handing over the error.
+            fprintf(stderr, "ERROR: Backend response too large ( > %zu MB). Aborting read.\n",
+                    kMaxBackendLine / (1024 * 1024));
+            ch->dead = true;
+            {
+                std::lock_guard<std::mutex> lock(ch->q_mutex);
+                ch->lines.clear();
+                ch->lines.push_back("{\"error\":\"Response too large\",\"kind\":\"backend\"}");
+                ch->lines.push_back(""); // sentinel: dead, nothing more coming
+            }
+            ch->q_cv.notify_all();
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(ch->q_mutex);
             size_t pos;
@@ -448,10 +530,25 @@ static bool channel_write_line(BackendChannel &ch, const std::string &cmd)
 {
     if (ch.h_in_write == NULL)
         return false;
-    std::string buf = cmd + "\n";
-    DWORD written = 0;
-    return WriteFile(ch.h_in_write, buf.data(), (DWORD)buf.size(), &written, nullptr) &&
-           written == buf.size();
+    const std::string buf = cmd + "\n";
+    // WriteFile may write fewer bytes than requested on a pipe. A partial
+    // write already reached the backend, so returning false here would leave
+    // it waiting on a truncated command; finish the write instead.
+    size_t sent = 0;
+    while (sent < buf.size())
+    {
+        DWORD written = 0;
+        const DWORD chunk = (DWORD)std::min<size_t>(buf.size() - sent, 0x7fffffff);
+        if (!WriteFile(ch.h_in_write, buf.data() + sent, chunk, &written, nullptr) ||
+            written == 0)
+        {
+            // A failed/zero write mid-command desyncs the protocol.
+            ch.dead = true;
+            return false;
+        }
+        sent += written;
+    }
+    return true;
 }
 
 static void channel_close(BackendChannel &ch)
@@ -470,7 +567,6 @@ static std::string backend_read_line(BackendChannel &ch)
     // Raw fd reads (not fgets): stdio buffering hides data from poll(), which
     // would spuriously time out mid-line. One line per command; the backend
     // replies only after a command, so the fd is quiet between reads.
-    static const size_t MAX_LINE_SIZE = 10 * 1024 * 1024;
 
     if (!ch.out)
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
@@ -526,10 +622,10 @@ static std::string backend_read_line(BackendChannel &ch)
         }
         line.append(buf, (size_t)n);
         total_read += (size_t)n;
-        if (total_read > MAX_LINE_SIZE)
+        if (total_read > kMaxBackendLine)
         {
             fprintf(stderr, "ERROR: Backend response too large ( > %zu MB). Aborting read.\n",
-                    MAX_LINE_SIZE / (1024 * 1024));
+                    kMaxBackendLine / (1024 * 1024));
             return "{\"error\":\"Response too large\",\"kind\":\"backend\"}";
         }
     }
@@ -567,6 +663,9 @@ static bool spawn_backend(BackendChannel &ch)
     _putenv_s("P100_YTDLP", ytdlp_bin().c_str());
     _putenv_s("P100_WARM_EXTRACTOR", g_warm_extractor.c_str());
     _putenv_s("PYTHONUNBUFFERED", "1");
+    // The command protocol is UTF-8 on both ends; without this, redirected
+    // stdio uses the ANSI code page and non-Latin titles/queries break.
+    _putenv_s("PYTHONIOENCODING", "utf-8");
     {
         // venv\Scripts first, so yt-dlp resolves like on POSIX.
         std::string dir = python;
@@ -636,6 +735,7 @@ static bool spawn_backend(BackendChannel &ch)
         ch.ready_cv.notify_all();
         return false;
     }
+    g_backend_guest.store(ready_says_guest(ready), std::memory_order_relaxed);
     ch.ready.store(true, std::memory_order_release);
     ch.ready_cv.notify_all();
     return true;
@@ -681,6 +781,9 @@ static bool spawn_backend(BackendChannel &ch)
         setenv("P100_YTDLP", ytdlp_bin().c_str(), 1);
         setenv("P100_WARM_EXTRACTOR", g_warm_extractor.c_str(), 1);
         setenv("PYTHONUNBUFFERED", "1", 1);
+        // The command protocol is UTF-8 on both ends; keep stdio from
+        // falling back to the locale encoding (ASCII under LANG=C).
+        setenv("PYTHONIOENCODING", "utf-8", 1);
         const std::string python = backend_python();
         const std::string script = backend_script();
         size_t python_slash = python.find_last_of('/');
@@ -724,6 +827,7 @@ static bool spawn_backend(BackendChannel &ch)
         ch.ready_cv.notify_all();
         return false;
     }
+    g_backend_guest.store(ready_says_guest(ready), std::memory_order_relaxed);
     ch.ready.store(true, std::memory_order_release);
     ch.ready_cv.notify_all();
     return true;
@@ -754,7 +858,6 @@ bool start_backend()
     // optimizations: spawning them takes ~2.5 s of Python startup, so they
     // come up in the background and stay on the main channel until ready.
     bool main_ok = spawn_backend(g_backend);
-
     // A backend restart during the session must not assign over a still
     // joinable thread (std::terminate).
     if (g_optional_backend_thread.joinable())
@@ -772,6 +875,11 @@ bool start_backend()
                             "warmups share the main backend channel.\n");
     });
     return main_ok;
+}
+
+bool backend_is_guest()
+{
+    return g_backend_guest.load(std::memory_order_relaxed);
 }
 
 void cancel_backend_startup()
@@ -802,6 +910,40 @@ std::string backend_diagnostics()
     out += line("prefetch", g_prefetch_backend);
     out += '\n';
     return out;
+}
+
+BackendDebugSnapshot backend_debug_snapshot()
+{
+    BackendDebugSnapshot snap;
+
+    auto channel = [&](const char *name, BackendChannel &ch) {
+        BackendChannelStats s;
+        s.name = name;
+        s.ready = ch.ready.load(std::memory_order_relaxed);
+        s.dead = ch.dead.load(std::memory_order_relaxed);
+        s.pid = (uintptr_t)ch.pid;
+        s.commands = ch.commands.load(std::memory_order_relaxed);
+        s.errors = ch.errors.load(std::memory_order_relaxed);
+        s.last_ms = ch.last_ms.load(std::memory_order_relaxed);
+        snap.channels.push_back(std::move(s));
+    };
+    channel("main", g_backend);
+    channel("play", g_play_backend);
+    channel("prefetch", g_prefetch_backend);
+
+    {
+        std::lock_guard<std::mutex> lock(g_backend_log_mutex);
+        snap.log.reserve(g_backend_log.size());
+        for (auto it = g_backend_log.rbegin(); it != g_backend_log.rend(); ++it)
+            snap.log.push_back(*it);
+    }
+    return snap;
+}
+
+void backend_debug_clear_log()
+{
+    std::lock_guard<std::mutex> lock(g_backend_log_mutex);
+    g_backend_log.clear();
 }
 
 void stop_backend()
@@ -895,6 +1037,21 @@ static std::string json_find_object(const std::string &json, size_t key_pos)
     return "";
 }
 
+// A usable thumbnail is an http(s) URL that is not a YouTube page link. The
+// watch/youtu.be URLs show up in old caches and in the "thumbnails" fallback
+// below (the object's own "url" field); they are never images.
+static bool thumbnail_url_is_image(const std::string &url)
+{
+    if (url.empty())
+        return false;
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
+        return false;
+    if (url.find("youtube.com/watch") != std::string::npos ||
+        url.find("youtu.be/") != std::string::npos)
+        return false;
+    return true;
+}
+
 // Exposed for liked songs persistence
 static void parse_track_object(const std::string &obj, Track &t)
 {
@@ -908,6 +1065,12 @@ static void parse_track_object(const std::string &obj, Track &t)
     t.album_id = json_get_string(obj, "album_id");
     t.track_number = json_get_int(obj, "track_number");
     t.thumbnail_url = json_get_string(obj, "thumbnail_url");
+    // Older album caches stored the track's YouTube watch link here (the
+    // thumbnails fallback below used to grab the first "url" in the object).
+    // Not an image: clear it so the album-cover fill / video-still fallback
+    // can supply real artwork.
+    if (!t.thumbnail_url.empty() && !thumbnail_url_is_image(t.thumbnail_url))
+        t.thumbnail_url.clear();
     t.duration_sec = json_get_int(obj, "duration_sec");
     if (t.id.empty())
         t.id = json_get_string(obj, "videoId");
@@ -915,11 +1078,21 @@ static void parse_track_object(const std::string &obj, Track &t)
     if (t.artist.empty())
         t.artist = json_get_string(obj, "name");
     if (t.thumbnail_url.empty())
-        t.thumbnail_url = json_get_string(obj, "thumbnail");
+    {
+        const std::string thumb = json_get_string(obj, "thumbnail");
+        if (thumbnail_url_is_image(thumb))
+            t.thumbnail_url = thumb;
+    }
     if (t.thumbnail_url.empty())
     {
-        // thumbnails: [{"url":...}]
-        size_t upos = obj.find("\"url\"");
+        // thumbnails: [{"url":...}] -- search only inside the thumbnails
+        // value: the object also carries the track's own watch URL under
+        // "url", which is not an image.
+        size_t key = obj.find("\"thumbnails\"");
+        if (key == std::string::npos)
+            key = obj.find("\"thumbnail\"");
+        size_t upos = key == std::string::npos ? std::string::npos
+                                               : obj.find("\"url\"", key);
         if (upos != std::string::npos)
         {
             size_t c = obj.find(':', upos);
@@ -930,7 +1103,11 @@ static void parse_track_object(const std::string &obj, Track &t)
                 {
                     size_t q2 = obj.find('"', q + 1);
                     if (q2 != std::string::npos)
-                        t.thumbnail_url = obj.substr(q + 1, q2 - q - 1);
+                    {
+                        const std::string candidate = obj.substr(q + 1, q2 - q - 1);
+                        if (thumbnail_url_is_image(candidate))
+                            t.thumbnail_url = candidate;
+                    }
                 }
             }
         }
@@ -1211,6 +1388,9 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
 #endif
     std::string response = backend_read_line(ch);
+    const uint64_t elapsed_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - cmd_start)
+                                    .count();
     // Remember the failure reason (with its classified kind) so the UI can
     // tell the user what to do (stale cookies → re-run `ytmusicapi browser`,
     // offline → check connection, dead backend → restart).
@@ -1220,13 +1400,11 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
         // make it an explicit error instead.
         g_backend_error.kind = BackendErrKind::Backend;
         g_backend_error.message = "Backend not running";
+        record_backend_log(ch, cmd, elapsed_ms, response, true);
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
     }
     ch.commands.fetch_add(1, std::memory_order_relaxed);
-    ch.last_ms.store((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - cmd_start)
-                         .count(),
-                     std::memory_order_relaxed);
+    ch.last_ms.store(elapsed_ms, std::memory_order_relaxed);
     if (response.find("\"error\"") != std::string::npos)
     {
         ch.errors.fetch_add(1, std::memory_order_relaxed);
@@ -1234,6 +1412,7 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
     }
     else if (g_backend_error.ok())
         g_backend_error.clear();
+    record_backend_log(ch, cmd, elapsed_ms, response, false);
     return response;
 }
 
@@ -1321,12 +1500,20 @@ static int run_capture(const std::string &cmd, std::string &out)
     FILE *pipe = popen((cmd + " 2>&1").c_str(), "r");
     if (!pipe)
         return -1;
+    // yt-dlp's -j JSON for a music video can exceed 100 KB (formats +
+    // thumbnails). The old 64 KB cap silently cut off the tail, which is where
+    // `artist` and `thumbnail` live, so sidecars were written with a title
+    // only. Keep a generous safety cap instead.
+    constexpr size_t kCaptureCap = 8u * 1024u * 1024u;
     char buffer[1024];
     size_t n = 0;
     while ((n = fread(buffer, 1, sizeof(buffer), pipe)) > 0)
     {
-        if (out.size() < 65536)
-            out.append(buffer, n);
+        if (out.size() < kCaptureCap)
+        {
+            const size_t room = kCaptureCap - out.size();
+            out.append(buffer, n < room ? n : room);
+        }
     }
     const int status = pclose(pipe);
     return (status >= 0 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
@@ -1449,6 +1636,24 @@ void with_metadata_writes_blocked(const std::function<void()> &fn)
     g_meta_writes_blocked = prev;
 }
 
+void save_cached_track_metadata(const Track &track, const std::string &audio_path)
+{
+    if (audio_path.empty() || track.title.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_meta_mutex);
+    // A delete may have run while the download was finishing; never write a
+    // sidecar that would resurrect the track in the Downloads list.
+    if (g_meta_writes_blocked)
+        return;
+    if (!track.id.empty() && g_meta_cancelled.count(track.id) != 0)
+        return;
+    std::error_code ec;
+    if (!std::filesystem::exists(audio_path, ec))
+        return;
+    save_metadata(track, audio_path);
+    g_downloads_dirty = true;
+}
+
 // ------------------ Public functions ------------------
 std::vector<Track> fetch_recommendations(bool force_fresh, int limit)
 {
@@ -1521,6 +1726,11 @@ bool fetch_track_meta(const std::string &video_id, Track &out, std::string &erro
         error = "missing video id";
         return false;
     }
+    if (is_local_media_id(video_id))
+    {
+        error = "local file";
+        return false;
+    }
     std::string response = send_command("meta " + video_id);
     if (response.empty())
     {
@@ -1558,6 +1768,8 @@ bool fetch_track_meta(const std::string &video_id, Track &out, std::string &erro
 
 std::vector<Track> fetch_radio(const std::string &video_id)
 {
+    if (is_local_media_id(video_id))
+        return {};
     std::string response = send_command("radio " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return {};
@@ -1567,6 +1779,26 @@ std::vector<Track> fetch_radio(const std::string &video_id)
     if (tracks.size() > 100)
         tracks.resize(100);
     return tracks;
+}
+
+// Tolerant decimal parse for backend-provided counts. Never throws, stops at
+// the first non-digit and saturates instead of overflowing (std::stoi used to
+// throw on malformed/huge input, and an exception in a parser thread kills
+// the process).
+static int parse_bounded_count(const std::string &s, size_t begin, size_t end)
+{
+    int value = 0;
+    for (size_t i = begin; i < end && i < s.size() &&
+                       isdigit((unsigned char)s[i]); ++i)
+    {
+        if (value > 100000000)
+        {
+            value = 1000000000;
+            break;
+        }
+        value = value * 10 + (s[i] - '0');
+    }
+    return value;
 }
 
 std::vector<YouTubePlaylist> parse_youtube_playlists_response(const std::string &response)
@@ -1607,23 +1839,18 @@ std::vector<YouTubePlaylist> parse_youtube_playlists_response(const std::string 
             if (c != std::string::npos)
             {
                 size_t q = obj.find('"', c + 1);
-                if (q != std::string::npos && q < obj.size() - 1 && isdigit((unsigned char)obj[q + 1]))
+                if (q != std::string::npos && q + 1 < obj.size() &&
+                    isdigit((unsigned char)obj[q + 1]))
                 {
                     size_t q2 = obj.find('"', q + 1);
                     if (q2 != std::string::npos)
-                        p.count = std::stoi(obj.substr(q + 1, q2 - q - 1));
+                        p.count = parse_bounded_count(obj, q + 1, q2);
                 }
                 else
                 {
                     size_t d = c + 1;
                     while (d < obj.size() && isspace((unsigned char)obj[d])) d++;
-                    int val = 0;
-                    while (d < obj.size() && isdigit((unsigned char)obj[d]))
-                    {
-                        val = val * 10 + (obj[d] - '0');
-                        d++;
-                    }
-                    p.count = val;
+                    p.count = parse_bounded_count(obj, d, obj.size());
                 }
             }
         }
@@ -1807,6 +2034,80 @@ bool backend_move_playlist_item(const std::string &playlist_id,
     return writeback_ok(send_command("edit_playlist " + payload));
 }
 
+std::vector<std::pair<std::string, std::string>> parse_playlist_item_pairs(
+    const std::string &response)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    // ytmusicapi appends "setVideoId" to each playlist item *after* its
+    // nested artists/album/thumbnails objects, so the enclosing object can't
+    // be found by scanning backwards for the nearest '{' (that lands inside
+    // the last nested object, which carries no videoId). Walk the "tracks"
+    // array and parse each top-level element instead. Order of appearance is
+    // the server order.
+    const size_t key = response.find("\"tracks\"");
+    if (key == std::string::npos)
+        return out;
+    const size_t colon = response.find(':', key + 8);
+    if (colon == std::string::npos)
+        return out;
+    size_t arr = colon + 1;
+    while (arr < response.size() &&
+           (response[arr] == ' ' || response[arr] == '\t' ||
+            response[arr] == '\r' || response[arr] == '\n'))
+        ++arr;
+    if (arr >= response.size() || response[arr] != '[')
+        return out;
+
+    int depth = 0;
+    bool in_str = false, esc = false;
+    size_t obj_start = std::string::npos;
+    for (size_t i = arr + 1; i < response.size(); ++i)
+    {
+        const char c = response[i];
+        if (in_str)
+        {
+            if (esc)
+                esc = false;
+            else if (c == '\\')
+                esc = true;
+            else if (c == '"')
+                in_str = false;
+            continue;
+        }
+        if (c == '"')
+        {
+            in_str = true;
+        }
+        else if (c == '{')
+        {
+            if (depth == 0)
+                obj_start = i;
+            if (++depth > kJsonMaxDepth)
+                return out;
+        }
+        else if (c == '}')
+        {
+            if (depth <= 0)
+                continue; // stray brace outside an element
+            if (--depth == 0 && obj_start != std::string::npos)
+            {
+                const std::string obj =
+                    response.substr(obj_start, i - obj_start + 1);
+                const std::string vid = json_get_string(obj, "videoId");
+                const std::string svid = json_get_string(obj, "setVideoId");
+                if (!vid.empty() && !svid.empty())
+                    out.emplace_back(vid, svid);
+                obj_start = std::string::npos;
+            }
+        }
+        else if (c == ']' && depth == 0)
+        {
+            break; // end of the tracks array
+        }
+    }
+    return out;
+}
+
 std::vector<std::pair<std::string, std::string>> backend_playlist_items(
     const std::string &playlist_id)
 {
@@ -1816,25 +2117,7 @@ std::vector<std::pair<std::string, std::string>> backend_playlist_items(
     std::string response = send_command("playlist " + playlist_id);
     if (response.empty() || response.find("\"error\"") != std::string::npos)
         return out;
-    // Tracks are the objects that carry both videoId and setVideoId; the
-    // playlist header object has neither, so scanning for setVideoId keys
-    // skips it. Order of appearance is the server order.
-    size_t pos = 0;
-    int guard = 0;
-    while ((pos = response.find("\"setVideoId\"", pos)) != std::string::npos && guard < 2000)
-    {
-        std::string obj = json_find_object(response, pos);
-        if (!obj.empty())
-        {
-            std::string vid = json_get_string(obj, "videoId");
-            std::string svid = json_get_string(obj, "setVideoId");
-            if (!vid.empty() && !svid.empty())
-                out.emplace_back(std::move(vid), std::move(svid));
-        }
-        pos += 12;
-        guard++;
-    }
-    return out;
+    return parse_playlist_item_pairs(response);
 }
 
 static PodcastShow parse_podcast_show(const std::string &obj)
@@ -2060,7 +2343,7 @@ bool fetch_album(const std::string &browse_id, Album &out)
 
 bool fetch_album_for_track(const std::string &video_id, std::string &browse_id, std::string &album_name)
 {
-    if (video_id.empty())
+    if (video_id.empty() || is_local_media_id(video_id))
         return false;
     std::string response = send_command("album_of " + video_id);
     if (response.empty() || response.find("\"error\"") != std::string::npos)
@@ -2143,7 +2426,7 @@ bool fetch_artist_songs(const std::string &songs_browse_id, int offset, int coun
 
 bool fetch_artist_for_track(const std::string &video_id, std::string &artist_id, std::string &artist_name)
 {
-    if (video_id.empty())
+    if (video_id.empty() || is_local_media_id(video_id))
         return false;
     std::string response = send_command("artist_of " + video_id);
     if (response.empty() || response.find("\"error\"") != std::string::npos)
@@ -2181,6 +2464,56 @@ std::vector<ArtistSummary> fetch_artist_search(const std::string &query)
     return artists;
 }
 
+SearchSuggestions fetch_search_suggestions(const std::string &query)
+{
+    SearchSuggestions out;
+    std::string response = send_command("suggest " + query);
+    if (response.empty() || response.find("\"error\"") != std::string::npos)
+        return out;
+    for_each_json_object(response, "queries", [&](const std::string &obj) {
+        SearchSuggestionQuery q;
+        q.text = json_get_string(obj, "text");
+        q.history = json_get_bool(obj, "history", false);
+        if (!q.text.empty())
+            out.queries.push_back(std::move(q));
+    });
+    for_each_json_object(response, "items", [&](const std::string &obj) {
+        SearchSuggestionItem it;
+        it.kind = json_get_string(obj, "kind");
+        it.id = json_get_string(obj, "id");
+        it.title = json_get_string(obj, "title");
+        it.artist = json_get_string(obj, "artist");
+        it.album = json_get_string(obj, "album");
+        it.subtitle = json_get_string(obj, "subtitle");
+        it.thumbnail_url = json_get_string(obj, "thumbnail_url");
+        if (!it.id.empty() && !it.title.empty())
+            out.items.push_back(std::move(it));
+    });
+    return out;
+}
+
+std::vector<AlbumSummary> fetch_search_albums(const std::string &query)
+{
+    std::vector<AlbumSummary> albums;
+    if (query.empty())
+        return albums;
+    std::string response = send_command("album_search " + query);
+    if (response.empty() || response.find("\"error\"") != std::string::npos)
+        return albums;
+    for_each_json_array_object(response, [&](const std::string &obj) {
+        AlbumSummary a;
+        a.browse_id = json_get_string(obj, "browse_id");
+        a.title = json_get_string(obj, "title");
+        a.artist = json_get_string(obj, "artist");
+        a.year = json_get_string(obj, "year");
+        a.thumbnail_url = json_get_string(obj, "thumbnail_url");
+        a.track_count = json_get_int(obj, "track_count");
+        if (!a.browse_id.empty() && !a.title.empty())
+            albums.push_back(std::move(a));
+    });
+    return albums;
+}
+
 bool fetch_search_all(const std::string &query, SearchAllResult &out)
 {
     out = SearchAllResult{};
@@ -2189,6 +2522,43 @@ bool fetch_search_all(const std::string &query, SearchAllResult &out)
     std::string response = send_command("search_all " + query);
     if (response.empty() || response.find("\"error\"") != std::string::npos)
         return false;
+
+    // "top": {...} or null -- YouTube Music's own intent match. The backend
+    // only reshapes it; src/app/search_top.cpp decides whether to trust it.
+    const size_t top_key = response.find("\"top\":");
+    if (top_key != std::string::npos)
+    {
+        const size_t brace = response.find_first_not_of(" \t\r\n", top_key + 6);
+        if (brace != std::string::npos && response[brace] == '{')
+        {
+            const size_t end = json_object_end(response, brace);
+            if (end != std::string::npos)
+            {
+                const std::string obj = response.substr(brace, end - brace + 1);
+                const std::string kind = json_get_string(obj, "kind");
+                if (kind == "song" || kind == "video")
+                    out.top.kind = TopKind::Song;
+                else if (kind == "album")
+                    out.top.kind = TopKind::Album;
+                else if (kind == "artist")
+                    out.top.kind = TopKind::Artist;
+                out.top.video = kind == "video";
+                out.top.id = json_get_string(obj, "id");
+                out.top.title = json_get_string(obj, "title");
+                out.top.artist = json_get_string(obj, "artist");
+                out.top.artist_id = json_get_string(obj, "artist_id");
+                out.top.album = json_get_string(obj, "album");
+                out.top.album_id = json_get_string(obj, "album_id");
+                out.top.year = json_get_string(obj, "year");
+                out.top.duration = json_get_string(obj, "duration");
+                out.top.duration_sec = json_get_int(obj, "duration_sec");
+                out.top.subscribers = json_get_string(obj, "subscribers");
+                out.top.thumbnail_url = json_get_string(obj, "thumbnail_url");
+                if (out.top.id.empty() || out.top.title.empty())
+                    out.top = TopResult{};
+            }
+        }
+    }
 
     for_each_json_object(response, "songs", [&](const std::string &obj) {
         Track t;
@@ -2216,13 +2586,159 @@ bool fetch_search_all(const std::string &query, SearchAllResult &out)
         if (!a.browse_id.empty() && !a.name.empty())
             out.artists.push_back(std::move(a));
     });
-    return !out.songs.empty() || !out.albums.empty() || !out.artists.empty();
+    return out.top.kind != TopKind::None || !out.songs.empty() || !out.albums.empty() ||
+           !out.artists.empty();
 }
 
 bool fetch_lyrics(const std::string &video_id, Lyrics &out)
 {
+    if (is_local_media_id(video_id))
+    {
+        // A local file has no YouTube lyrics lookup. Return a definitive
+        // "none" so the panel stops retrying and caches the result.
+        out = Lyrics{};
+        out.ok = true;
+        out.none = true;
+        out.source = "Local file";
+        return true;
+    }
     std::string response = send_command("lyrics " + video_id);
     return parse_lyrics_json(response, out);
+}
+
+// ---- Studio: waveform + beat analysis ---------------------------------
+// The backend decodes with ffmpeg and writes a compact text pyramid so the
+// C++ side never needs a JSON array parser. Format:
+//   CFWAVE 1
+//   duration <sec>
+//   bpm <bpm>
+//   confidence <0..1>
+//   beats <t,t,...>
+//   downbeats <t,t,...>
+//   wave <buckets>   (repeated, coarse -> fine)
+//   <min>,<max>      (buckets lines per wave)
+static void parse_num_list(const std::string &text, std::vector<double> &out)
+{
+    out.clear();
+    size_t start = 0;
+    while (start < text.size())
+    {
+        const size_t comma = text.find(',', start);
+        const std::string tok =
+            text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (!tok.empty())
+        {
+            try
+            {
+                out.push_back(std::stod(tok));
+            }
+            catch (...)
+            {
+            }
+        }
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+}
+
+bool load_studio_analysis_file(const std::string &path, StudioAnalysis &out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good())
+        return false;
+    std::string line;
+    if (!std::getline(in, line))
+        return false;
+    if (line.rfind("CFWAVE", 0) != 0)
+        return false;
+
+    out = StudioAnalysis{};
+    StudioWaveLevel level;
+    int wave_left = 0;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+
+        if (wave_left > 0)
+        {
+            const size_t comma = line.find(',');
+            float lo = 0.0f, hi = 0.0f;
+            if (comma != std::string::npos)
+            {
+                try
+                {
+                    lo = std::stof(line.substr(0, comma));
+                    hi = std::stof(line.substr(comma + 1));
+                }
+                catch (...)
+                {
+                }
+            }
+            level.mins.push_back(lo);
+            level.maxs.push_back(hi);
+            if (--wave_left == 0)
+            {
+                out.waves.push_back(std::move(level));
+                level = StudioWaveLevel{};
+            }
+            continue;
+        }
+
+        const size_t sp = line.find(' ');
+        const std::string key = line.substr(0, sp);
+        const std::string val = sp == std::string::npos ? "" : line.substr(sp + 1);
+        if (key == "duration")
+            out.duration = std::atof(val.c_str());
+        else if (key == "bpm")
+            out.bpm = std::atof(val.c_str());
+        else if (key == "confidence")
+            out.confidence = (float)std::atof(val.c_str());
+        else if (key == "beats")
+            parse_num_list(val, out.beats);
+        else if (key == "downbeats")
+            parse_num_list(val, out.downbeats);
+        else if (key == "wave")
+        {
+            level = StudioWaveLevel{};
+            level.buckets = std::atoi(val.c_str());
+            wave_left = std::max(0, level.buckets);
+        }
+    }
+    out.ok = out.duration > 0.0 && !out.waves.empty();
+    return out.ok;
+}
+
+bool fetch_studio_analysis(const std::string &id, const std::string &audio_path,
+                           const std::string &cache_path, StudioAnalysis &out)
+{
+    out = StudioAnalysis{};
+    if (load_studio_analysis_file(cache_path, out))
+    {
+        out.id = id;
+        return true;
+    }
+
+    // A cache file that failed to parse is stale/partial: remove it so the
+    // backend re-analyses instead of returning the same unreadable file.
+    std::remove(cache_path.c_str());
+
+    const std::string payload =
+        "{\"id\":\"" + jsonutil::escape(id) + "\",\"path\":\"" +
+        jsonutil::escape(audio_path) + "\",\"cache\":\"" +
+        jsonutil::escape(cache_path) + "\"}";
+    // Analysis is CPU-heavy: run it on the prefetch channel so a search or a
+    // user click on the main channel never waits behind it.
+    send_prefetch_command("analyze " + payload);
+    if (load_studio_analysis_file(cache_path, out))
+    {
+        out.id = id;
+        return true;
+    }
+    return false;
 }
 
 // Look up an already-cached audio file for a video id (no download).
@@ -2261,6 +2777,12 @@ std::string playable_track_url(const std::string &id, const std::string &url)
         if (std::filesystem::is_regular_file(url, ec))
             return url;
     }
+    if (id.rfind("local:", 0) == 0)
+    {
+        // A local file path (or empty when missing). Never synthesise a
+        // YouTube URL for a local id.
+        return url;
+    }
     if (!id.empty())
     {
         const std::string cached = find_cached_audio_path(id);
@@ -2274,6 +2796,10 @@ std::string playable_track_url(const std::string &id, const std::string &url)
 std::string get_cached_audio_path(const std::string &video_id)
 {
     if (video_id.empty())
+        return "";
+    // Local files are already on disk. Never hand a "local:" id to yt-dlp:
+    // it would try https://www.youtube.com/watch?v=local:... and spam errors.
+    if (is_local_media_id(video_id))
         return "";
     std::string dir = cache_dir() + "/audio_cache";
     if (!ensure_dir(dir))
@@ -2327,6 +2853,8 @@ std::string get_cached_audio_path(const std::string &video_id)
 // almost immediately instead of waiting for a full file download.
 std::string fetch_stream_url(const std::string &video_id)
 {
+    if (is_local_media_id(video_id))
+        return ""; // a file, not a stream
     std::string response = send_play_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
@@ -2339,6 +2867,8 @@ std::string fetch_stream_url(const std::string &video_id)
 // prefetch rate.
 std::string fetch_stream_url_prefetch(const std::string &video_id)
 {
+    if (is_local_media_id(video_id))
+        return "";
     std::string response = send_prefetch_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
@@ -2347,10 +2877,164 @@ std::string fetch_stream_url_prefetch(const std::string &video_id)
 
 std::string fetch_stream_url_fresh(const std::string &video_id)
 {
+    if (is_local_media_id(video_id))
+        return "";
     std::string response = send_play_command("play_fresh " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
     return json_get_string(response, "url");
+}
+
+VideoStreamUrls fetch_video_stream_urls(const std::string &video_id, bool fresh, int max_height,
+                                        bool fast)
+{
+    VideoStreamUrls out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    if (max_height <= 0)
+        max_height = 720;
+    std::string cmd;
+    if (fast && !fresh)
+        cmd = "play_video_fast ";
+    else
+        cmd = fresh ? "play_video_fresh " : "play_video ";
+    std::string response =
+        send_play_command(cmd + video_id + " " + std::to_string(max_height));
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.video = json_get_string(response, "video");
+    out.audio = json_get_string(response, "audio");
+    out.error = json_get_string(response, "error");
+    return out;
+}
+
+VideoSyncResult fetch_video_sync_cached(const std::string &song_id, const std::string &video_id)
+{
+    VideoSyncResult out;
+    if (song_id.empty() || video_id.empty() || is_local_media_id(song_id))
+        return out;
+    // Play channel: already booted for the match/resolve, so the cache hit
+    // does not wait for a cold prefetch process on the critical path.
+    const std::string response =
+        send_play_command("videosync_cached " + song_id + " " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    if (response.find("\"error\"") != std::string::npos)
+    {
+        out.error = jsonutil::get_string(response, "error");
+        return out;
+    }
+    // `ok` is the command status (true even when the pair is not cached yet).
+    out.ok = jsonutil::get_bool(response, "ok");
+    out.offset = jsonutil::get_double(response, "offset");
+    out.confidence = jsonutil::get_double(response, "confidence");
+    out.confident = jsonutil::get_bool(response, "confident");
+    return out;
+}
+
+VideoSyncResult fetch_video_sync(const std::string &song_id, const std::string &video_id,
+                                 int song_duration_sec)
+{
+    VideoSyncResult out;
+    if (song_id.empty() || video_id.empty() || is_local_media_id(song_id))
+        return out;
+    const std::string cmd = "videosync " + song_id + " " + video_id + " " +
+                            std::to_string(std::max(0, song_duration_sec));
+    const std::string response = send_prefetch_command(cmd);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    if (response.find("\"error\"") != std::string::npos)
+    {
+        out.error = jsonutil::get_string(response, "error");
+        return out;
+    }
+    out.ok = true;
+    out.offset = jsonutil::get_double(response, "offset");
+    out.confidence = jsonutil::get_double(response, "confidence");
+    out.confident = jsonutil::get_bool(response, "confident");
+    return out;
+}
+
+MusicVideoMatch fetch_music_video_prefetch(const std::string &video_id)
+{
+    MusicVideoMatch out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    std::string response = send_prefetch_command("musicvideo " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.error = json_get_string(response, "error");
+    if (!out.error.empty() || response.find("\"error\"") != std::string::npos)
+        return out;
+    out.ok = true;
+    out.id = json_get_string(response, "videoId");
+    out.title = json_get_string(response, "title");
+    out.artist = json_get_string(response, "artist");
+    out.duration_sec = json_get_int(response, "durationSec");
+    out.matched = jsonutil::get_bool(response, "matched");
+    out.self_video = jsonutil::get_bool(response, "self");
+    return out;
+}
+
+MusicVideoMatch fetch_music_video(const std::string &video_id)
+{
+    MusicVideoMatch out;
+    if (video_id.empty() || is_local_media_id(video_id))
+        return out;
+    std::string response = send_play_command("musicvideo " + video_id);
+    if (response.empty())
+    {
+        out.error = "backend unavailable";
+        return out;
+    }
+    out.error = json_get_string(response, "error");
+    if (!out.error.empty() || response.find("\"error\"") != std::string::npos)
+        return out;
+    out.ok = true;
+    out.id = json_get_string(response, "videoId");
+    out.title = json_get_string(response, "title");
+    out.artist = json_get_string(response, "artist");
+    out.duration_sec = json_get_int(response, "durationSec");
+    out.matched = jsonutil::get_bool(response, "matched");
+    out.self_video = jsonutil::get_bool(response, "self");
+    return out;
+}
+
+std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
+    const std::vector<std::string> &video_ids)
+{
+    std::unordered_map<std::string, std::string> urls;
+    std::string cmd = "prefetch";
+    for (const std::string &id : video_ids)
+    {
+        if (id.empty() || is_local_media_id(id))
+            continue;
+        cmd += " " + id;
+    }
+    if (cmd == "prefetch")
+        return urls;
+    std::string response = send_prefetch_command(cmd);
+    if (response.empty() || response.find("\"error\"") != std::string::npos)
+        return urls;
+    for_each_json_array_object(response, [&](const std::string &obj) {
+        const std::string id = json_get_string(obj, "id");
+        const std::string url = json_get_string(obj, "url");
+        if (!id.empty() && !url.empty())
+            urls[id] = url;
+    });
+    return urls;
 }
 
 std::vector<Track> get_cached_tracks()
@@ -2436,11 +3120,174 @@ std::vector<Track> get_cached_tracks()
             t.duration_sec = 0;
         }
 
+        // Old sidecars written while the yt-dlp capture was truncated have no
+        // thumbnail at all. The video id determines YouTube's standard grid
+        // thumbnail, so every YouTube-backed download gets a cover without a
+        // metadata lookup (and the cover sweep can cache it).
+        if (t.thumbnail_url.empty() && !t.id.empty() && !is_local_media_id(t.id))
+            t.thumbnail_url = "https://img.youtube.com/vi/" + t.id + "/hqdefault.jpg";
+
         if (!t.title.empty())
             tracks.push_back(t);
     }
 
     return tracks;
+}
+
+// ---------------------------------------------------------------------------
+// Offline video cache (Downloads tab)
+// ---------------------------------------------------------------------------
+static std::string video_cache_dir()
+{
+    std::string dir = cache_dir() + "/video_cache";
+    if (!ensure_dir(dir))
+        return "";
+    return dir;
+}
+
+std::string find_cached_video_path(const std::string &video_id)
+{
+    if (video_id.empty() || is_local_media_id(video_id))
+        return "";
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return "";
+    for (const char *ext : {"mp4", "mkv", "webm"})
+    {
+        const std::string path = dir + "/" + video_id + "." + ext;
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+            return path;
+    }
+    return "";
+}
+
+std::string get_cached_video_path(const std::string &video_id, int max_height)
+{
+    if (video_id.empty() || is_local_media_id(video_id))
+        return "";
+    std::string cached = find_cached_video_path(video_id);
+    if (!cached.empty())
+        return cached;
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return "";
+
+    const int h = std::clamp(max_height > 0 ? max_height : 720, 240, 2160);
+    const std::string hs = std::to_string(h);
+    const std::string format =
+        "bv*[vcodec^=avc1][height<=" + hs + "]+ba/"
+        "bv*[height<=" + hs + "]+ba/b[height<=" + hs + "]";
+    const std::string url = "https://www.youtube.com/watch?v=" + video_id;
+    const std::string output = " -o \"" + dir + "/" + video_id + ".%(ext)s\" ";
+    const std::string base = shell_quote(ytdlp_bin()) + " -f \"" + format +
+                             "\" --merge-output-format mp4 --no-progress "
+                             "--socket-timeout 15 --retries 2" + js_runtime_arg();
+
+    struct Attempt
+    {
+        const char *name;
+        std::string command;
+    };
+    const Attempt attempts[] = {
+        {"cookies", base + cookie_arg() + output + url},
+        {"public", base + output + url},
+        {"visionos", base + " --extractor-args \"youtube:player_client=visionos\"" + output + url},
+    };
+    for (const Attempt &attempt : attempts)
+    {
+        std::string output_text;
+        const int rc = run_capture(attempt.command, output_text);
+        std::string full_path = find_cached_video_path(video_id);
+        if (rc == 0 && !full_path.empty())
+        {
+            Track t = fetch_track_metadata(video_id);
+            if (!t.title.empty())
+                save_metadata(t, full_path);
+            return full_path;
+        }
+        log_download_failure(video_id, attempt.name, rc, output_text, attempt.command);
+    }
+    return "";
+}
+
+std::vector<Track> get_cached_videos()
+{
+    std::vector<Track> tracks;
+    std::string dir = video_cache_dir();
+    if (dir.empty())
+        return tracks;
+
+    for (const std::string &name : list_dir_names(dir))
+    {
+        if (name == "." || name == "..")
+            continue;
+        size_t dot = name.find_last_of('.');
+        if (dot == std::string::npos)
+            continue;
+        if (name.size() > 10 && name.compare(name.size() - 10, 10, ".meta.json") == 0)
+            continue;
+        if (name.find('.') != dot)
+            continue; // fragments / parts
+
+        const std::string ext = name.substr(dot + 1);
+        if (!(ext == "mp4" || ext == "mkv" || ext == "webm"))
+            continue;
+        const std::string full_path = dir + "/" + name;
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        Track t;
+        t.is_video = true;
+        t.url = full_path;
+        t.id = name.substr(0, dot);
+        const std::string meta_path = full_path + ".meta.json";
+        if (stat(meta_path.c_str(), &st) == 0)
+        {
+            std::ifstream in(meta_path);
+            if (in.good())
+            {
+                std::string json((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+                const std::string stem = name.substr(0, dot);
+                t.id = json_get_string(json, "id");
+                if (t.id.empty())
+                    t.id = stem;
+                t.title = json_get_string(json, "title");
+                if (t.title.empty())
+                    t.title = stem;
+                t.artist = json_get_string(json, "artist");
+                if (t.artist.empty())
+                    t.artist = "Unknown";
+                t.album = json_get_string(json, "album");
+                t.album_id = json_get_string(json, "album_id");
+                t.artist_id = json_get_string(json, "artist_id");
+                t.thumbnail_url = json_get_string(json, "thumbnail_url");
+                t.duration_sec = json_get_int(json, "duration_sec");
+            }
+        }
+        else
+        {
+            t.title = name.substr(0, dot);
+            t.artist = "Unknown";
+        }
+        if (t.thumbnail_url.empty() && !t.id.empty() && !is_local_media_id(t.id))
+            t.thumbnail_url = "https://img.youtube.com/vi/" + t.id + "/hqdefault.jpg";
+        if (!t.title.empty())
+            tracks.push_back(t);
+    }
+    return tracks;
+}
+
+void delete_cached_video(const std::string &video_id)
+{
+    const std::string path = find_cached_video_path(video_id);
+    if (path.empty())
+        return;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path + ".meta.json", ec);
 }
 
 std::string recorded_audio_path(const std::string &video_id, const std::string &ext)

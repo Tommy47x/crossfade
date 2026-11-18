@@ -5,7 +5,7 @@ Uses only the Python standard library so it works with the bundled venv.
 
 Export:
     transfer.py export --zip BACKUP.zip --config CONFIG_DIR \
-        --sections settings,auth,library,album_cache,artist_cache,lyrics,thumbs,audio,logs \
+        --sections settings,auth,library,album_cache,artist_cache,podcast_cache,lyrics,thumbs,audio,logs \
         [--library SNAPSHOT_DB] [--version 0.3.3]
 
 Import (normally started by the app; it waits for the app to exit):
@@ -21,6 +21,12 @@ import sys
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
+
+# A backup is user-chosen, and the audio section is legitimately multi-GB, so
+# extraction itself is not size-capped. The manifest and entry count are
+# metadata, though, and a crafted archive could use them as a zip bomb.
+MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+ARCHIVE_MAX_ENTRIES = 200000
 
 SECTIONS = {
     "settings": {
@@ -42,9 +48,11 @@ SECTIONS = {
     },
     "album_cache": {"dirs": ["album_cache"]},
     "artist_cache": {"dirs": ["artist_cache"]},
+    "podcast_cache": {"dirs": ["podcast_cache"]},
     "lyrics": {"dirs": ["lyrics"]},
     "thumbs": {"dirs": ["thumb_cache"]},
     "audio": {"dirs": ["audio_cache"]},
+    "video": {"dirs": ["video_cache"]},
     "logs": {
         "files": ["backend.log"],
         "globs": ["crash-*.log", "hang-*.log", "diagnostics-*.txt"],
@@ -52,7 +60,8 @@ SECTIONS = {
 }
 
 SECTION_NAMES = list(SECTIONS.keys())
-DEFAULT_SECTIONS = ["settings", "auth", "library", "album_cache", "artist_cache", "lyrics", "thumbs"]
+DEFAULT_SECTIONS = ["settings", "auth", "library", "album_cache", "artist_cache",
+                    "podcast_cache", "lyrics", "thumbs", "video"]
 
 # Never put transient state or previous backups into a new archive.
 EXCLUDED_NAMES = {
@@ -62,7 +71,7 @@ EXCLUDED_NAMES = {
 EXCLUDED_PREFIXES = (".crossfade-import-", ".crossfade-pre-import-")
 EXCLUDED_SUFFIXES = (".tmp", ".zip", ".part")
 STORED_SUFFIXES = (".webm", ".opus", ".m4a", ".mp3", ".flac", ".aac", ".ogg",
-                   ".jpg", ".jpeg", ".png", ".webp", ".gif")
+                   ".mp4", ".mkv", ".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 
 def parse_sections(raw):
@@ -93,10 +102,28 @@ def excluded(rel, include_logs):
     return False
 
 
+def iter_tree_files(root):
+    """Yield regular files under root without following symlinks.
+
+    A symlink inside a cache tree must not pull unrelated files into the
+    backup or create a walk loop. The section root itself may still be a
+    symlink (a cache on another disk), which os.walk() opens normally.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+        for name in filenames:
+            path = base / name
+            if not path.is_symlink():
+                yield path
+
+
 def collect(config, sections, library_snapshot, skipped):
     files, dirs = [], []
 
     def add_file(path, rel=None):
+        if path.is_symlink():
+            return
         rel = Path(rel) if rel is not None else path.relative_to(config)
         if excluded(rel, "logs" in sections):
             return
@@ -123,7 +150,7 @@ def collect(config, sections, library_snapshot, skipped):
                 skipped.append(name + "/")
                 continue
             dirs.append(name)
-            for path in root.rglob("*"):
+            for path in iter_tree_files(root):
                 if path.is_file():
                     add_file(path)
 
@@ -155,7 +182,8 @@ def write_archive(args):
         "dirs": dirs,
     }
 
-    stored_roots = {"audio": "audio_cache/", "thumbs": "thumb_cache/"}
+    stored_roots = {"audio": "audio_cache/", "video": "video_cache/",
+                    "thumbs": "thumb_cache/"}
     stored_prefixes = tuple(prefix for section, prefix in stored_roots.items() if section in sections)
 
     tmp_zip = zip_path.with_name(zip_path.name + ".part")
@@ -176,13 +204,19 @@ def write_archive(args):
 
 
 def safe_rel(name):
+    # ZIP entry names are POSIX paths, but Windows treats a backslash as a
+    # separator: "..\\..\\x" is a single POSIX part, passes the checks below,
+    # then escapes once Path() normalises it. Reject backslashes on Windows.
+    # On POSIX they are ordinary filename characters and stay contained.
+    if os.name == "nt" and "\\" in name:
+        return None
     rel = PurePosixPath(name)
     if not rel.parts:
         return None
     if rel.is_absolute() or ".." in rel.parts:
         return None
     first = rel.parts[0]
-    if ":" in first or first.startswith("\\"):
+    if ":" in first:
         return None
     return Path(*rel.parts)
 
@@ -233,18 +267,32 @@ def import_archive(args):
             shutil.rmtree(temp)
         temp.mkdir(parents=True)
         with zipfile.ZipFile(zip_path) as zf:
+            infos = zf.infolist()
             if "manifest.json" not in zf.namelist():
                 raise RuntimeError("Not a crossfade backup (manifest.json missing)")
+            if len(infos) > ARCHIVE_MAX_ENTRIES:
+                raise RuntimeError(
+                    f"Backup has too many entries ({len(infos)} > {ARCHIVE_MAX_ENTRIES})")
+            manifest_info = zf.getinfo("manifest.json")
+            if manifest_info.file_size > MANIFEST_MAX_BYTES:
+                raise RuntimeError("Backup manifest is too large")
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             if manifest.get("app") != "crossfade":
                 raise RuntimeError("Not a crossfade backup")
-            for info in zf.infolist():
+            temp_root = temp.resolve()
+            for info in infos:
                 if info.is_dir() or info.filename == "manifest.json":
                     continue
                 rel = safe_rel(info.filename)
                 if rel is None:
                     raise RuntimeError(f"Unsafe path in backup: {info.filename}")
                 target = temp / rel
+                # Defence in depth: whatever the name looked like, the file
+                # must land inside the staging directory.
+                try:
+                    target.resolve().relative_to(temp_root)
+                except (ValueError, OSError):
+                    raise RuntimeError(f"Unsafe path in backup: {info.filename}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
