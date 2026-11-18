@@ -139,6 +139,40 @@ int main()
     }
 
     {
+        // A guest tapping a host playlist row moves it to the front and turns
+        // it into a guest request so a host source rebuild keeps it.
+        std::vector<Track> q;
+        Track pl1 = make("pl1", "");
+        pl1.from_queue_source = true;
+        Track pl2 = make("pl2", "");
+        pl2.from_queue_source = true;
+        q.push_back(pl1);
+        q.push_back(pl2);
+        check(party_queue::bump_to_top(q, "pl2", "a", "Alice") == 0, "bump host index");
+        check(ids(q) == "pl2,pl1", "bump host order");
+        check(q[0].from_party && q[0].guest_id == "a" &&
+                  q[0].requested_by == "Alice" && !q[0].from_queue_source,
+              "bumped host track becomes a guest request");
+        check(party_queue::bump_to_top(q, "missing", "a", "Alice") == -1,
+              "bump unknown id");
+    }
+
+    {
+        // Bumping another guest's request only changes position; attribution
+        // and the fair-queue counters stay with the original guest.
+        std::vector<Track> q;
+        party_queue::insert_fair(q, make("a1", "a"));
+        party_queue::insert_fair(q, make("b1", "b"));
+        party_queue::insert_fair(q, make("b2", "b"));
+        check(ids(q) == "a1,b1,b2", "bump setup");
+        check(party_queue::bump_to_top(q, "b2", "a", "Alice") == 0, "bump guest index");
+        check(ids(q) == "b2,a1,b1", "bump guest order");
+        check(q[0].guest_id == "b", "bumped guest keeps attribution");
+        check(party_queue::count_guest_items(q, "b") == 2, "bumped guest count unchanged");
+        check(party_queue::count_guest_items(q, "a") == 1, "bumping guest count unchanged");
+    }
+
+    {
         // Long queue: fairness stays stable and bounded by the guest count.
         std::vector<Track> q;
         for (int i = 0; i < 120; ++i)

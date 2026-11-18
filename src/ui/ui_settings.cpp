@@ -225,6 +225,7 @@ void save_settings(const Settings &settings)
         << ",\"allow_search\":" << (settings.party.allow_search ? "true" : "false")
         << ",\"allow_duplicates\":" << (settings.party.allow_duplicates ? "true" : "false")
         << ",\"show_names\":" << (settings.party.show_names ? "true" : "false")
+        << ",\"allow_controls\":" << (settings.party.allow_controls ? "true" : "false")
         << "}";
     for (const auto &def : ui_element_defs())
         out << ",\"ui_elem_" << def.key << "\":" << elem_value(settings, def.key);
@@ -552,6 +553,8 @@ Settings load_settings()
                     s.party.allow_duplicates = pget_bool("allow_duplicates");
                 if (pj.find("\"show_names\"") != std::string::npos)
                     s.party.show_names = pget_bool("show_names");
+                if (pj.find("\"allow_controls\"") != std::string::npos)
+                    s.party.allow_controls = pget_bool("allow_controls");
             }
         }
     }
@@ -1860,7 +1863,7 @@ void draw_settings_panel(AppState &state)
         PartySettings &ps = state.settings.party;
         if (party_running())
             ImGui::TextColored(ui_c().accent_text,
-                               "A party is running. Changes here apply the next time you start one.");
+                               "A party is running. Changes here apply the next time you start one, except guest playback controls, which apply immediately.");
 
         settings_group_label("Guest access");
         int reach = ps.public_reach() ? 0 : 1;
@@ -2025,6 +2028,10 @@ void draw_settings_panel(AppState &state)
             save = true;
         if (settings_toggle_row("##party_names", "Show guest names next to songs",
                                 &ps.show_names, nullptr))
+            save = true;
+        if (settings_toggle_row("##party_controls", "Let guests control playback",
+                                &ps.allow_controls,
+                                "Adds play/pause, previous and next buttons to the guest page. Guests can also tap any song in Up next to move it to the top of the queue."))
             save = true;
 
         if (state.settings_focus_party)

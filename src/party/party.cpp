@@ -56,6 +56,9 @@ struct Guest
     double last_seen = 0.0;
     party_util::TokenBucket add_bucket{0.2, 1.0, 0.0};
     party_util::TokenBucket search_bucket{1.0, 3.0, 0.0};
+    // "Play next" taps and media buttons are cheap but can still be spammed.
+    party_util::TokenBucket bump_bucket{0.5, 1.0, 0.0};
+    party_util::TokenBucket control_bucket{1.0, 2.0, 0.0};
 };
 
 struct PendingRequest
@@ -77,6 +80,7 @@ struct AddedNotice
     std::string title;
     std::string by;
     bool pending = false;
+    bool bumped = false;
 };
 
 struct InboxAdd
@@ -92,6 +96,21 @@ struct InboxUndo
     std::shared_ptr<AddWaiter> waiter;
     std::string guest_id;
     std::string video_id;
+};
+
+struct InboxBump
+{
+    std::shared_ptr<AddWaiter> waiter;
+    std::string guest_id;
+    std::string video_id;
+    std::string by;
+};
+
+struct InboxControl
+{
+    std::shared_ptr<AddWaiter> waiter;
+    std::string guest_id;
+    std::string action;
 };
 
 struct Snapshot
@@ -141,6 +160,8 @@ std::unordered_map<std::string, Guest> g_guests;
 std::vector<PendingRequest> g_pending;
 std::deque<InboxAdd> g_add_inbox;
 std::deque<InboxUndo> g_undo_inbox;
+std::deque<InboxBump> g_bump_inbox;
+std::deque<InboxControl> g_control_inbox;
 std::vector<std::shared_ptr<AddWaiter>> g_waiters;
 std::unordered_map<std::string, Track> g_meta_cache;
 std::list<std::string> g_meta_lru;
@@ -319,6 +340,7 @@ std::string build_state_json(AppState &state, const std::vector<Track> &queue,
     j += "\"open\":true,";
     j += std::string("\"requireApproval\":") + (g_settings.require_approval ? "true" : "false") + ",";
     j += std::string("\"allowSearch\":") + (g_settings.allow_search ? "true" : "false") + ",";
+    j += std::string("\"allowControls\":") + (g_settings.allow_controls ? "true" : "false") + ",";
     j += "\"accent\":\"" + accent_hex_locked() + "\"},";
 
     j += "\"now\":{";
@@ -393,6 +415,7 @@ std::string make_sig(AppState &state, const std::vector<PendingRequest> &pending
     s += g_settings.require_approval ? '1' : '0';
     s += g_settings.show_names ? '1' : '0';
     s += g_settings.allow_search ? '1' : '0';
+    s += g_settings.allow_controls ? '1' : '0';
     s += '|';
     for (const Track &t : state.play_queue)
     {
@@ -562,6 +585,100 @@ void process_undo(AppState &state, InboxUndo item)
     }
     r = error_result(409, "already_started", "That song already started playing.");
     finish_waiter(item.waiter, std::move(r));
+}
+
+party_api::AddResult process_bump(AppState &state, InboxBump item)
+{
+    party_api::AddResult r;
+    if (g_state != PartyRunState::Running)
+    {
+        r = error_result(403, "party_closed", "This party has ended.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    auto it = std::find_if(state.play_queue.begin(), state.play_queue.end(),
+                           [&](const Track &t) { return t.id == item.video_id; });
+    if (it == state.play_queue.end())
+    {
+        r = state.current_track_id == item.video_id
+                ? error_result(409, "already_playing", "That song is already playing.")
+                : error_result(409, "gone", "That song already left the queue.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    // Turning a host playlist row into a guest request counts against the
+    // guest quota; moving an existing request does not.
+    if (!it->from_party && g_settings.max_per_guest > 0)
+    {
+        int mine = party_queue::count_guest_items(state.play_queue, item.guest_id);
+        for (const PendingRequest &p : g_pending)
+            if (p.track.guest_id == item.guest_id)
+                ++mine;
+        if (mine >= g_settings.max_per_guest)
+        {
+            r = error_result(429, "quota",
+                             "You already have " + std::to_string(g_settings.max_per_guest) +
+                                 " songs in the queue.",
+                             std::max(0, g_settings.cooldown_sec));
+            finish_waiter(item.waiter, std::move(r));
+            return r;
+        }
+    }
+    const int idx =
+        party_queue::bump_to_top(state.play_queue, item.video_id, item.guest_id, item.by);
+    if (idx < 0)
+    {
+        r = error_result(409, "gone", "That song already left the queue.");
+        finish_waiter(item.waiter, std::move(r));
+        return r;
+    }
+    state.queue_dirty = true;
+    state.repaint_requested = true;
+    const Track &moved = state.play_queue[(size_t)idx];
+    // The moved row is next after the current song, so its ETA is the rest of
+    // the current track (the explicit add flow uses the full duration).
+    const double eta = state.current_track_id.empty() ? 0.0 : std::max(0.0, g_now_duration);
+    r.http = 200;
+    r.status = "queued";
+    r.item_json = item_json(moved, "queued", (int)std::lround(eta), item.by);
+    finish_waiter(item.waiter, std::move(r));
+    return r;
+}
+
+party_api::AddResult process_control(AppState &state, InboxControl item)
+{
+    party_api::AddResult r;
+    if (g_state != PartyRunState::Running)
+        r = error_result(403, "party_closed", "This party has ended.");
+    else if (!g_settings.allow_controls)
+        r = error_result(403, "controls_off",
+                         "The host turned off guest playback controls.");
+    else if (item.action == "play")
+    {
+        state.user_play_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "pause")
+    {
+        state.user_pause_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "next")
+    {
+        state.next_requested = true;
+        r.http = 200;
+    }
+    else if (item.action == "prev")
+    {
+        state.prev_requested = true;
+        r.http = 200;
+    }
+    else
+        r = error_result(400, "bad_action", "Unknown playback control.");
+    if (r.http == 200)
+        state.repaint_requested = true;
+    finish_waiter(item.waiter, std::move(r));
+    return r;
 }
 
 Track meta_cache_get(const std::string &id)
@@ -736,6 +853,8 @@ bool party_start(const PartySettings &settings, std::string &error)
         g_pending.clear();
         g_add_inbox.clear();
         g_undo_inbox.clear();
+        g_bump_inbox.clear();
+        g_control_inbox.clear();
         g_waiters.clear();
         g_requests_added = 0;
         g_version = 1;
@@ -803,6 +922,8 @@ void party_stop()
         }
         g_add_inbox.clear();
         g_undo_inbox.clear();
+        g_bump_inbox.clear();
+        g_control_inbox.clear();
         g_guests.clear();
         g_pending.clear();
         g_snapshot.reset();
@@ -1284,6 +1405,32 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
             g_undo_inbox.pop_front();
             process_undo(state, std::move(item));
         }
+        while (!g_bump_inbox.empty())
+        {
+            InboxBump item = std::move(g_bump_inbox.front());
+            g_bump_inbox.pop_front();
+            auto git = g_guests.find(item.guest_id);
+            if (git != g_guests.end() && !git->second.name.empty())
+                item.by = git->second.name;
+            // Capture the title before the move for the host notification.
+            std::string title;
+            const std::string by = item.by;
+            for (const Track &t : state.play_queue)
+                if (t.id == item.video_id)
+                {
+                    title = t.title;
+                    break;
+                }
+            party_api::AddResult r = process_bump(state, std::move(item));
+            if (r.http == 200 && !title.empty())
+                notifications.push_back({title, by, false, true});
+        }
+        while (!g_control_inbox.empty())
+        {
+            InboxControl item = std::move(g_control_inbox.front());
+            g_control_inbox.pop_front();
+            process_control(state, std::move(item));
+        }
 
         // Evict guests idle for more than 30 minutes.
         const double t = now_sec();
@@ -1296,6 +1443,9 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
         }
 
         g_accent_hex = accent_hex_from_ui();
+        // Guest playback controls can be toggled while a party is running;
+        // every other setting is a snapshot taken at party start.
+        g_settings.allow_controls = state.settings.party.allow_controls;
         remember_art(Track{state.current_track_id, state.current_title, state.current_artist,
                            state.current_artist_id, "", state.current_album_id, 0,
                            state.current_thumbnail_url, (int)duration_sec, "",
@@ -1344,7 +1494,8 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
             std::string msg = n.title;
             if (!n.by.empty())
                 msg += " · " + n.by;
-            ui_notify(UiNotifyType::Success, n.pending ? "Song requested" : "Song added",
+            ui_notify(UiNotifyType::Success,
+                      n.bumped ? "Playing next" : (n.pending ? "Song requested" : "Song added"),
                       msg, 5.0f);
         }
     }
@@ -1405,6 +1556,8 @@ bool join(const std::string &token, std::string &guest_id, bool &is_new)
     g.add_bucket = party_util::TokenBucket(
         g_settings.cooldown_sec > 0 ? 1.0 / g_settings.cooldown_sec : 100.0, 1.0, t);
     g.search_bucket = party_util::TokenBucket(1.0, 3.0, t);
+    g.bump_bucket = party_util::TokenBucket(0.5, 1.0, t);
+    g.control_bucket = party_util::TokenBucket(1.0, 2.0, t);
     g_guests[id] = std::move(g);
     guest_id = id;
     is_new = true;
@@ -1588,6 +1741,110 @@ AddResult undo(const std::string &guest_id, const std::string &video_id)
     wake_loop();
     std::unique_lock<std::mutex> lock(waiter->m);
     if (!waiter->cv.wait_for(lock, std::chrono::seconds(5), [&] { return waiter->done; }))
+        return error_result(503, "busy", "The app is busy right now. Try again.");
+    return waiter->result;
+}
+
+AddResult bump(const std::string &guest_id, const std::string &video_id)
+{
+    if (!party_link::valid_video_id(video_id))
+        return error_result(400, "invalid_link", "That doesn't look like a YouTube song.");
+    const double t = now_sec();
+    std::string by;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        auto git = g_guests.find(guest_id);
+        if (git == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        Guest &g = git->second;
+        g.last_seen = t;
+        if (!g.bump_bucket.take(t))
+        {
+            const int retry = std::max(1, (int)std::ceil(g.bump_bucket.retry_after(t)));
+            return error_result(429, "rate_limited", "One song at a time, please.", retry);
+        }
+        by = g.name;
+    }
+
+    auto waiter = std::make_shared<AddWaiter>();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (g_guests.find(guest_id) == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        if (g_bump_inbox.size() >= kMaxInbox)
+            return error_result(503, "busy", "The app is busy right now. Try again.", 2);
+        InboxBump item;
+        item.waiter = waiter;
+        item.guest_id = guest_id;
+        item.video_id = video_id;
+        item.by = by;
+        g_bump_inbox.push_back(std::move(item));
+        g_waiters.push_back(waiter);
+        if (g_waiters.size() > 256)
+            g_waiters.erase(g_waiters.begin(), g_waiters.begin() + 128);
+    }
+    wake_loop();
+
+    std::unique_lock<std::mutex> lock(waiter->m);
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(6), [&] { return waiter->done; }))
+        return error_result(503, "busy", "The app is busy right now. Try again.");
+    return waiter->result;
+}
+
+AddResult control(const std::string &guest_id, const std::string &action)
+{
+    if (action != "play" && action != "pause" && action != "next" && action != "prev")
+        return error_result(400, "bad_action", "Unknown playback control.");
+
+    const double t = now_sec();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (!g_settings.allow_controls)
+            return error_result(403, "controls_off",
+                                "The host turned off guest playback controls.");
+        auto git = g_guests.find(guest_id);
+        if (git == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        Guest &g = git->second;
+        g.last_seen = t;
+        if (!g.control_bucket.take(t))
+        {
+            const int retry = std::max(1, (int)std::ceil(g.control_bucket.retry_after(t)));
+            return error_result(429, "rate_limited", "Slow down a little.", retry);
+        }
+    }
+
+    auto waiter = std::make_shared<AddWaiter>();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_state != PartyRunState::Running)
+            return error_result(403, "party_closed", "This party has ended.");
+        if (!g_settings.allow_controls)
+            return error_result(403, "controls_off",
+                                "The host turned off guest playback controls.");
+        if (g_guests.find(guest_id) == g_guests.end())
+            return error_result(401, "no_session", "Scan the QR code again.");
+        if (g_control_inbox.size() >= kMaxInbox)
+            return error_result(503, "busy", "The app is busy right now. Try again.", 2);
+        InboxControl item;
+        item.waiter = waiter;
+        item.guest_id = guest_id;
+        item.action = action;
+        g_control_inbox.push_back(std::move(item));
+        g_waiters.push_back(waiter);
+        if (g_waiters.size() > 256)
+            g_waiters.erase(g_waiters.begin(), g_waiters.begin() + 128);
+    }
+    wake_loop();
+
+    std::unique_lock<std::mutex> lock(waiter->m);
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(3), [&] { return waiter->done; }))
         return error_result(503, "busy", "The app is busy right now. Try again.");
     return waiter->result;
 }

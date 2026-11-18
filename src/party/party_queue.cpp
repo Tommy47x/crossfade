@@ -48,6 +48,33 @@ int insert_fair(std::vector<Track> &queue, Track item)
     return (int)pos;
 }
 
+int bump_to_top(std::vector<Track> &queue, const std::string &video_id,
+                const std::string &guest_id, const std::string &by)
+{
+    if (video_id.empty())
+        return -1;
+    auto it = std::find_if(queue.begin(), queue.end(),
+                           [&](const Track &t) { return t.id == video_id; });
+    if (it == queue.end())
+        return -1;
+    Track item = std::move(*it);
+    queue.erase(it);
+    if (!item.from_party)
+    {
+        // Clicking a host playlist row turns it into a guest request so it
+        // survives the next source rebuild and shows who asked for it.
+        item.from_party = true;
+        item.guest_id = guest_id;
+        item.requested_by = by;
+        item.from_queue_source = false;
+    }
+    item.party_round = round_for_guest(queue, item.guest_id);
+    // Deliberately above host "Play next" pins: the guest asked for this
+    // song to play now, not merely next in the fair rotation.
+    queue.insert(queue.begin(), std::move(item));
+    return 0;
+}
+
 bool is_duplicate(const std::vector<Track> &queue, const std::string &video_id,
                   const std::string &now_playing_id, bool allow_duplicates)
 {

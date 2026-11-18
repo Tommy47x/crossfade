@@ -2,6 +2,17 @@
 
 All notable changes to crossfade are documented here.
 
+## Unreleased
+
+### Added
+
+- **Party guests can move a song to the top of the queue.** Every song in
+  **Up next** on the guest page is now tappable (and keyboard accessible):
+  tapping one moves it ahead of everything else so it plays next.
+- **Optional guest media controls.** A new **Settings → Party → Let guests
+  control playback** toggle (off by default) adds play/pause, previous and next
+  buttons to the guest page, rate-limited per guest.
+
 ## 0.3.3 - 2026-11-08
 
 ### Fixed
