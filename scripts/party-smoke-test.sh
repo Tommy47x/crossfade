@@ -104,6 +104,24 @@ expect_code 400 "invalid add" -b "$JAR" -H 'Content-Type: application/json' -H '
 expect_code 200 "undo" -b "$JAR" -X DELETE -H 'X-CF: 1' "$BASE/api/add/dQw4w9WgXcQ"
 expect_code 200 "search" -b "$JAR" "$BASE/api/search?q=test"
 
+# "Play next" taps from the guest queue and the gated media controls.
+expect_code 415 "bump without X-CF" -b "$JAR" \
+    -H 'Content-Type: application/json' -d '{"id":"dQw4w9WgXcQ"}' "$BASE/api/bump"
+expect_code 200 "bump" -b "$JAR" -H 'Content-Type: application/json' -H 'X-CF: 1' \
+    -d '{"id":"dQw4w9WgXcQ"}' "$BASE/api/bump"
+expect_code 400 "bump without id" -b "$JAR" -H 'Content-Type: application/json' -H 'X-CF: 1' \
+    -d '{}' "$BASE/api/bump"
+expect_code 415 "control without X-CF" -b "$JAR" \
+    -H 'Content-Type: application/json' -d '{"action":"next"}' "$BASE/api/control"
+expect_code 200 "control next" -b "$JAR" -H 'Content-Type: application/json' -H 'X-CF: 1' \
+    -d '{"action":"next"}' "$BASE/api/control"
+expect_code 403 "control when host disabled it" -b "$JAR" \
+    -H 'Content-Type: application/json' -H 'X-CF: 1' \
+    -d '{"action":"blocked"}' "$BASE/api/control"
+expect_code 400 "control unknown action" -b "$JAR" \
+    -H 'Content-Type: application/json' -H 'X-CF: 1' \
+    -d '{"action":"warp"}' "$BASE/api/control"
+
 # Public tunnel hostname: accepted with or without the edge's :443, and the
 # guest cookie gets Secure when Cloudflare reports an HTTPS request.
 expect_code 200 "public Host header" -H 'Host: smoke.trycloudflare.com' "$BASE/healthz"

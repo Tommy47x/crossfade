@@ -28,6 +28,9 @@ struct PartySettings
     bool allow_search = true;
     bool allow_duplicates = false;
     bool show_names = true;
+    // Guests may play/pause and skip from the party page. Off by default so a
+    // host keeps playback control unless they explicitly hand some of it out.
+    bool allow_controls = false;
 
     bool public_reach() const { return reach != "lan"; }
 
@@ -38,7 +41,8 @@ struct PartySettings
                require_approval == o.require_approval && max_per_guest == o.max_per_guest &&
                cooldown_sec == o.cooldown_sec && max_video_minutes == o.max_video_minutes &&
                max_queue == o.max_queue && allow_search == o.allow_search &&
-               allow_duplicates == o.allow_duplicates && show_names == o.show_names;
+               allow_duplicates == o.allow_duplicates && show_names == o.show_names &&
+               allow_controls == o.allow_controls;
     }
     bool operator!=(const PartySettings &o) const { return !(*this == o); }
 };
@@ -133,6 +137,11 @@ std::string state_json(const std::string &guest_id, const std::string &since);
 
 AddResult add(const std::string &guest_id, const std::string &input);
 AddResult undo(const std::string &guest_id, const std::string &video_id);
+// Move a song that is already in Up Next to the front of the queue.
+AddResult bump(const std::string &guest_id, const std::string &video_id);
+// Guest media controls: "play", "pause", "next" or "prev". Only accepted
+// while the host has guest controls enabled.
+AddResult control(const std::string &guest_id, const std::string &action);
 bool set_name(const std::string &guest_id, const std::string &name);
 
 // Search (main backend channel, rate-limited per guest). Returns a JSON

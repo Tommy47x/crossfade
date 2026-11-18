@@ -469,6 +469,65 @@ bool party_server_start(const PartyServerConfig &config, std::string &error)
                         json_reply(res, r.http, error_json(r.error, r.message, r.retry_after));
                 });
 
+    // Tap a song in Up Next to play it next. The id must already be in the
+    // queue; the main thread moves it to the front.
+    svr->Post("/api/bump", [](const httplib::Request &req, httplib::Response &res) {
+        std::string guest = cookie_value(req, "cf_guest");
+        if (guest.empty() || !party_api::guest_exists(guest))
+        {
+            json_reply(res, 401, error_json("no_session", "Scan the QR code again."));
+            return;
+        }
+        if (!wants_json(req) || !csrf_header(req))
+        {
+            json_reply(res, 415, error_json("bad_request", "Couldn't read that request."));
+            return;
+        }
+        std::string id;
+        if (!parse_json_string_field(req.body, "id", id))
+        {
+            json_reply(res, 400, error_json("invalid_link", "That doesn't look like a YouTube song."));
+            return;
+        }
+        party_api::AddResult r = party_api::bump(guest, id);
+        if (r.http == 200)
+        {
+            json_reply(res, 200,
+                       "{\"ok\":true,\"status\":\"" + party_util::json_escape(r.status) +
+                           "\",\"item\":" + r.item_json + "}");
+        }
+        else
+        {
+            json_reply(res, r.http, error_json(r.error, r.message, r.retry_after));
+        }
+    });
+
+    // Guest media controls. Gated by Settings -> Party -> guest controls.
+    svr->Post("/api/control", [](const httplib::Request &req, httplib::Response &res) {
+        std::string guest = cookie_value(req, "cf_guest");
+        if (guest.empty() || !party_api::guest_exists(guest))
+        {
+            json_reply(res, 401, error_json("no_session", "Scan the QR code again."));
+            return;
+        }
+        if (!wants_json(req) || !csrf_header(req))
+        {
+            json_reply(res, 415, error_json("bad_request", "Couldn't read that request."));
+            return;
+        }
+        std::string action;
+        if (!parse_json_string_field(req.body, "action", action))
+        {
+            json_reply(res, 400, error_json("bad_action", "Unknown playback control."));
+            return;
+        }
+        party_api::AddResult r = party_api::control(guest, action);
+        if (r.http == 200)
+            json_reply(res, 200, "{\"ok\":true}");
+        else
+            json_reply(res, r.http, error_json(r.error, r.message, r.retry_after));
+    });
+
     svr->Get("/api/search", [](const httplib::Request &req, httplib::Response &res) {
         std::string guest = cookie_value(req, "cf_guest");
         if (guest.empty() || !party_api::guest_exists(guest))

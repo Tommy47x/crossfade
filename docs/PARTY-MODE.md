@@ -14,6 +14,8 @@ landed on, and the security and testing decisions that keep it contained.
   beyond the existing `ytmusicapi` / `yt-dlp` backend calls. Public mode adds
   only the `cloudflared` tunnel process (Cloudflare terminates TLS at the edge;
   see the privacy notes below).
+- Guests can tap a song in Up next to move it to the top, and the host can
+  optionally expose play/pause, previous and next buttons on the party page.
 - Party off means **zero** extra threads, sockets, timers or render work.
 - All queue mutation stays on the main/UI thread; HTTP threads only read
   immutable snapshots and push bounded requests into an inbox.
@@ -87,9 +89,25 @@ songs they already have in the queue. New songs are inserted:
 3. interleaved round-robin with other guest items, FIFO within a round.
 
 This gives round-robin interleaving between guests without starving anyone and
-without ever overriding the host's explicit ordering. The guest snapshot is
-capped at 40 upcoming rows so a long host playlist does not bloat every poll;
+without overriding the host's ordering through normal adds. The guest snapshot
+is capped at 40 upcoming rows so a long host playlist does not bloat every poll;
 the guest page shows an "and N more" line for the remainder.
+
+### Guest "play next" and media controls
+
+- Tapping any row in **Up next** posts `/api/bump`. The main thread moves that
+  exact queue entry to index 0, so it plays right after the current song. A row
+  that came from the host's playlist/source is re-tagged as a request from the
+  guest (so a later host source rebuild keeps it); an existing guest request
+  only changes position and keeps its original attribution. Bump requests are
+  token-bucketed per guest (one every two seconds). Turning a host row into a
+  guest request counts against the per-guest quota.
+- `/api/control` accepts `play`, `pause`, `next` and `prev`, but only while
+  **Settings → Party → Let guests control playback** (`allow_controls`, off by
+  default) is enabled. The main thread applies the request through the same
+  `AppState` flags the host UI uses (`user_play_requested`, `next_requested`,
+  ...). Controls are rate-limited per guest and never touch `AppState` from an
+  HTTP worker.
 
 ## Backend protocol
 
@@ -115,6 +133,8 @@ host play, which uses the play channel.
 | GET | `/api/state?v=N` | Full snapshot or `{"unchanged":true}` |
 | POST | `/api/add` | Add a link or bare 11-char id |
 | DELETE | `/api/add/<id>` | Withdraw your own queued/pending song |
+| POST | `/api/bump` | Move a song that is already in Up Next to the top |
+| POST | `/api/control` | Guest play/pause/next/prev, when the host allows it |
 | GET | `/api/search?q=` | Up to 10 tracks via the main backend channel |
 | POST | `/api/name` | Set an optional display name (≤ 24 codepoints) |
 | GET | `/api/art/<id>` | Cached cover art for a validated 11-char id |
@@ -179,9 +199,10 @@ white page when a cookie is missing or a link is stale.
   with `SameSite=Strict`, another website cannot queue songs.
 - **Input bounds.** 4 KiB request bodies, 2048-character link input, strict
   `^[A-Za-z0-9_-]{11}$` video ids, at most 64 live guests (evicted after 30 min
-  idle), at most 64 queued add/undo requests per inbox, bounded
-  queue/max-per-guest/cooldown/video length, and token buckets for adds and
-  searches.
+  idle), at most 64 queued add/undo/bump/control requests per inbox, bounded
+  queue/max-per-guest/cooldown/video length, token buckets for adds, bumps,
+  searches and controls, and guest controls that are off unless the host
+  enables them.
 - **No filesystem serving.** Art requests are validated ids mapped through the
   in-memory art map to paths that came from `texture.cpp`'s cache. Unknown ids
   are always `404`.
@@ -198,7 +219,8 @@ Only settings are saved, nested under a `party` key in `settings.json`:
   "name": "...", "port": 8484, "interface_ip": "",
   "require_approval": false, "max_per_guest": 3, "cooldown_sec": 5,
   "max_video_minutes": 10, "max_queue": 100,
-  "allow_search": true, "allow_duplicates": false, "show_names": true
+  "allow_search": true, "allow_duplicates": false, "show_names": true,
+  "allow_controls": false
 }
 ```
 
@@ -208,8 +230,9 @@ are **never** persisted. A party never auto-starts on launch.
 ## Rendering
 
 - `ui_settings.cpp` owns the **Settings → Party** configuration form (name,
-  network address, port, approval, limits and guest options). The Party tab's
-  **Party settings** shortcut switches tabs and scrolls that section into view.
+  network address, port, approval, limits and guest options, including
+  **Let guests control playback**). The Party tab's **Party settings**
+  shortcut switches tabs and scrolls that section into view.
 - `ui_party.cpp` draws the Party tab as a Radio-style hero. Before a party it
   shows a single **Start party** action; after starting, the live QR appears
   in-tab with **Copy link**, **Present QR** and **End party**, followed by
@@ -223,6 +246,9 @@ are **never** persisted. A party never auto-starts on launch.
   missing, downloaded in the background for the first 40 upcoming rows (the
   same cap as the guest snapshot). The phone retries the local `/api/art`
   endpoint before showing the music-note fallback.
+- The guest page lists **Up next** rows as tappable "play next" targets
+  (keyboard accessible with Enter/Space) and shows play/pause/previous/next
+  buttons in the now-playing card whenever the host enables guest controls.
 - The demand-driven loop is unchanged. While a party is running, a small
   animation request keeps the live dot, QR rings and scan highlight moving;
   the existing wake event, playback cadence and 1 s safety tick keep guest
@@ -234,13 +260,15 @@ are **never** persisted. A party never auto-starts on launch.
 - `tests/test_party_link.cpp` — URL forms, bare ids, playlist/channel rejection,
   bounds.
 - `tests/test_party_queue.cpp` — host pin preservation, round-robin fairness,
-  duplicates, per-guest counts.
+  duplicates, per-guest counts, and "play next" bumps (host rows keep their
+  provenance through a source rebuild).
 - `tests/test_party_util.cpp` — CSPRNG tokens, constant-time compare, UTF-8
   cleaning, JSON/HTML escaping, accent validation, token bucket.
 - `tests/party_smoke_server.cpp` + `scripts/party-smoke-test.sh` — real
   `party_server.cpp` with stubbed state, exercised with `curl`: health, cookie
-  flags, Host allowlist, CSRF/content-type guards, add/undo/search, art id
-  validation and unknown routes. No GUI, backend or auth files involved.
+  flags, Host allowlist, CSRF/content-type guards, add/undo/search, play-next
+  bumps, gated media controls, art id validation and unknown routes. No GUI,
+  backend or auth files involved.
 
 Build and run:
 
@@ -282,6 +310,9 @@ scripts/party-smoke-test.sh
   network; failed lookups return a friendly retryable error.
 - Pending approvals are not persisted, so restarting the app ends the party
   and discards them.
+- Guest playback controls (`allow_controls`) can be toggled while a party is
+  running and the guest page picks it up on the next poll. "Play next" taps work
+  for every running party regardless of that setting.
 - Hotspots and public Wi-Fi commonly enable client isolation. The hotspot
   owner's phone can then reach the host while another phone cannot. Party mode
   cannot work around that at the application layer; use a normal router, make

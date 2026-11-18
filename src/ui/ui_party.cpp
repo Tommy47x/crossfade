@@ -758,7 +758,8 @@ void draw_how_it_works(const PartyAnim &a)
     party_help("1. Click Start party. The QR code appears right here, ready to scan.");
     party_help("2. Guests scan it, paste a YouTube or YouTube Music link, and optionally set a name.");
     party_help("3. Approve requests if you want, or let them join Up Next automatically.");
-    party_help("4. Press P any time to reopen this page. Ending the party invalidates every guest link.");
+    party_help("4. Guests can tap any song in Up next to play it next. Settings > Party can also give them play/pause and skip buttons.");
+    party_help("5. Press P any time to reopen this page. Ending the party invalidates every guest link.");
     ImGui::PopStyleVar();
 }
 
