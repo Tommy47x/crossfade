@@ -2,16 +2,70 @@
 
 All notable changes to crossfade are documented here.
 
-## Unreleased
+## 0.4.0 - 2026-11-18
 
 ### Added
 
+- **Studio (songwriting) mode.** A new **Studio** tab keeps song ideas as
+  projects: pick a beat from the queue or from local audio files, see its
+  waveform and beat analysis on a stationary-playhead timeline, set cues, and
+  write lyrics with a 1:1 cue link per line. Each project is one JSON document,
+  so it survives restarts and exports with the rest of your data.
+- **Music video playback.** Press **V** (or the bottom-bar video button) to
+  show the current track's video in the main area while the audio keeps playing
+  on its own player — pause, seek and track changes stay in lockstep. The
+  track's own upload appears immediately and a matched official video is
+  hot-swapped in at the same position, with the audio/video offset measured
+  once by cross-correlation. Matches are cached for 30 days, resolved stream
+  URLs for an hour, matched videos can be downloaded for offline use, and
+  **F** or double-click toggles theater mode.
+- **Public party links.** A party can now be shared over a Cloudflare tunnel as
+  well as over the same Wi-Fi. `cloudflared` is detected, and Settings → Party
+  says so when it is missing.
 - **Party guests can move a song to the top of the queue.** Every song in
   **Up next** on the guest page is now tappable (and keyboard accessible):
   tapping one moves it ahead of everything else so it plays next.
 - **Optional guest media controls.** A new **Settings → Party → Let guests
   control playback** toggle (off by default) adds play/pause, previous and next
   buttons to the guest page, rate-limited per guest.
+- **Guest mode.** Without `browser.json` the app now starts unauthenticated
+  instead of failing: search, albums, artists, radio, lyrics, podcasts,
+  downloads and local playlists work, and the Home, YouTube and Podcasts tabs
+  link straight to sign-in.
+- **Top result.** Search shows a hero band with the best match above the other
+  results.
+- **Local audio files** can be added to the library and used as Studio beats.
+- **Backend debug window** (**F2**) shows the backend channels and their recent
+  traffic.
+- **Gentoo packaging** under `packaging/gentoo/media-sound/crossfade`.
+
+### Fixed
+
+- Playlist write-back parses ytmusicapi item ids correctly again, so removals
+  and reorders reach the server.
+- Scrolling over the bottom-bar volume slider changes the volume (5% per notch,
+  with fractional touchpad deltas accumulating) as the README always claimed.
+- MPRIS PlayPause updates the app's own play state, and promoting a crossfade
+  preserves a pause.
+- Session restore only seeks the restored track, local files are excluded from
+  radio seeds, and restored queues keep their paused state.
+- Endless radio retries with backoff when a refill comes back empty instead of
+  silently stopping.
+- A manual track pick cancels a stale fade target instead of leaving it set.
+
+### Changed
+
+- **Thread safety:** podcast and YouTube library state is published under a
+  per-view mutex, artist detail data is locked, inline error strings share a
+  leaf mutex, and backend status is read through accessors.
+- The backend prunes and caps its in-memory stream URL cache like the disk
+  cache; backend stdio is pinned to UTF-8 and yt-dlp resolves are time-bounded.
+- ZIP import bounds the manifest size, the entry count and the staging path
+  (including Windows backslash traversal), and export no longer follows
+  symlinks when walking cache trees.
+- On Windows, the backend writer loops until a command is fully sent and
+  oversized replies are capped.
+- Reviewed-but-deferred issues are recorded in `docs/KNOWN-ISSUES.md`.
 
 ## 0.3.3 - 2026-11-08
 
