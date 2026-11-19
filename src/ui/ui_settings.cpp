@@ -19,6 +19,7 @@
 #include "shortcuts.h"
 #include "data_transfer.h"
 #include "power.h"
+#include "updater.h"
 #include "misc/cpp/imgui_stdlib.h"
 #include <fstream>
 #include <filesystem>
@@ -193,6 +194,7 @@ void save_settings(const Settings &settings)
         << "\"warm_close_hides\":" << (settings.warm_close_hides ? "true" : "false") << ","
         << "\"diagnostics_history\":" << (settings.diagnostics_history ? "true" : "false") << ","
         << "\"safe_mode\":" << (settings.safe_mode ? "true" : "false") << ","
+        << "\"check_for_updates\":" << (settings.check_for_updates ? "true" : "false") << ","
         << "\"low_power\":" << (settings.low_power ? "true" : "false") << ","
         << "\"low_power_on_battery\":" << (settings.low_power_on_battery ? "true" : "false") << ","
         << "\"glow_separators\":" << (settings.glow_separators ? "true" : "false") << ","
@@ -473,6 +475,9 @@ Settings load_settings()
             s.diagnostics_history = get_bool("diagnostics_history");
         if (json.find("\"safe_mode\"") != std::string::npos)
             s.safe_mode = get_bool("safe_mode");
+        // Default is ON; only a written "false" turns it off.
+        if (json.find("\"check_for_updates\"") != std::string::npos)
+            s.check_for_updates = get_bool("check_for_updates");
         if (json.find("\"low_power\"") != std::string::npos)
             s.low_power = get_bool("low_power");
         if (json.find("\"low_power_on_battery\"") != std::string::npos)
@@ -667,6 +672,7 @@ enum SettingsCategory
     SC_WARMSTART,
     SC_DATA,
     SC_DIAGNOSTICS,
+    SC_UPDATES,
     SC_TUNABLES,
     SC_NOTES,
     SC_DANGER,
@@ -682,6 +688,46 @@ static std::string s_xfer_import_path;
 static std::string s_xfer_pick_dir;
 static bool s_xfer_pick_open = false;
 static bool s_xfer_confirm_open = false;
+
+static const char *update_state_label(updater::State state)
+{
+    switch (state)
+    {
+    case updater::State::Idle:
+        return "Not checked yet";
+    case updater::State::Checking:
+        return "Checking...";
+    case updater::State::Available:
+        return "Update available";
+    case updater::State::UpToDate:
+        return "Up to date";
+    case updater::State::Downloading:
+        return "Downloading...";
+    case updater::State::Ready:
+        return "Ready to install";
+    case updater::State::Updating:
+        return "Updating...";
+    case updater::State::Failed:
+        return "Update check failed";
+    }
+    return "Unknown";
+}
+
+static std::string update_time_label(long long epoch)
+{
+    if (epoch <= 0)
+        return "Never";
+    const std::time_t t = (std::time_t)epoch;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
+    return buf;
+}
 
 static ImU32 settings_lerp_col(ImU32 a, ImU32 b, float t)
 {
@@ -719,6 +765,7 @@ static const SettingsNavEntry kSettingsNav[] = {
     {SC_WARMSTART, UiIcon::Repeat, "Warm start", nullptr},
     {SC_DATA, UiIcon::Download, "Data transfer", nullptr},
     {SC_DIAGNOSTICS, UiIcon::Stats, "Diagnostics", nullptr},
+    {SC_UPDATES, UiIcon::Refresh, "Updates", nullptr},
     {SC_TUNABLES, UiIcon::Settings, "Tunables", "DEVELOPER"},
     {SC_NOTES, UiIcon::Settings, "Notes", nullptr},
     {SC_DANGER, UiIcon::Close, "Danger Zone", nullptr},
@@ -2867,6 +2914,87 @@ void draw_settings_panel(AppState &state)
         }
     }
 
+    }
+
+    if (s_settings_category == SC_UPDATES)
+    {
+        SettingsCard card("Updates", "Check GitHub for a newer release.", UiIcon::Refresh);
+        settings_help("The daily check fetches one small version.txt from GitHub. "
+                      "There is no telemetry.");
+        const updater::Status us = updater::status();
+        const bool safe_mode_now =
+            diagnostics::safe_mode_requested() || state.settings.safe_mode;
+
+        settings_row_label("Current version", us.current.empty() ? "Unknown" : us.current.c_str(),
+                           nullptr);
+        settings_row_label("Latest release",
+                           us.latest.empty() ? "Not checked yet" : us.latest.c_str(), nullptr);
+        settings_row_label("Install",
+                           us.install.empty() ? "Unknown" : us.install.c_str(), nullptr);
+        settings_row_label("Status", update_state_label(us.state),
+                           us.message.empty() ? nullptr : us.message.c_str());
+        const std::string last_checked = update_time_label(us.last_checked);
+        settings_row_label("Last checked", last_checked.c_str(), nullptr);
+
+        settings_gap();
+        if (settings_toggle_row("##check_updates", "Check for updates automatically",
+                                &state.settings.check_for_updates,
+                                "Once a day, fetch the release's version.txt and show a "
+                                "toast when something newer exists. Manual checks still work "
+                                "when this is off. Safe mode pauses automatic checks and "
+                                "staged updates for that launch."))
+        {
+            save = true;
+            updater::set_auto_check(state.settings.check_for_updates);
+        }
+
+        if (safe_mode_now)
+            settings_help("Safe mode is on for this launch, so automatic checks and "
+                          "automatic installs are paused. You can still check manually.");
+
+        settings_gap();
+        const float bw = std::min(200.0f * m.layout_scale, (content_w - m.space_2) * 0.5f);
+        if (us.state == updater::State::Downloading)
+        {
+            ImGui::TextUnformatted("Downloading and verifying the release...");
+        }
+        else if (us.state == updater::State::Ready)
+        {
+            if (ui_primary_button("Restart & update", ImVec2(bw, m.control_h)))
+                updater::restart_and_update();
+            ImGui::SameLine(0.0f, m.space_2);
+            if (ui_ghost_button("Discard download", ImVec2(bw, m.control_h)))
+                updater::discard_staged();
+        }
+        else
+        {
+            if (ui_ghost_button("Check now", ImVec2(bw, m.control_h)))
+                updater::check_async(true);
+            ImGui::SameLine(0.0f, m.space_2);
+            if (us.can_self_update &&
+                (us.state == updater::State::Available || us.state == updater::State::Failed))
+            {
+                if (ui_primary_button("Update now", ImVec2(bw, m.control_h)))
+                    updater::start_update();
+            }
+            else if (ui_ghost_button("Open release page", ImVec2(bw, m.control_h)))
+            {
+                updater::open_release_page();
+            }
+        }
+
+        settings_gap();
+        if (us.can_self_update)
+            settings_help("Updates download the matching release asset, verify its SHA-256, "
+                          "and replace only crossfade's own files. Your settings, library, "
+                          "downloads and listening history stay put.");
+        else if (us.package_managed)
+            settings_help("This copy is managed by your package manager. crossfade never "
+                          "rewrites a system-owned install; update it with your package "
+                          "manager or from the release page.");
+        else
+            settings_help("This build runs from a source or build tree. Rebuild and re-run "
+                          "./install.sh to update, or use the release page.");
     }
 
     if (s_diag_open)

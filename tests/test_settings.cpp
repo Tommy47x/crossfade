@@ -14,6 +14,7 @@ int main()
     check(s.ui_scale == 1.0f && s.ui_text_scale == 1.0f, "default ui scale");
     check(s.animations == 2, "default animations");
     check(!s.safe_mode, "default safe mode");
+    check(s.check_for_updates, "default update checks on");
     check(!s.low_power, "default low power off");
     check(s.low_power_on_battery, "default low power on battery");
     check(s.backdrop_shader, "default shader");

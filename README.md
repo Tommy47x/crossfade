@@ -393,15 +393,32 @@ llvmpipe software OpenGL, so it starts even without a GL 3.2 driver — remove
 GPU driver instead), a private Python 3.12, the backend venv with
 `ytmusicapi` + `yt-dlp`, and Start Menu shortcuts.
 
-### Updates (Windows)
+### Updates
 
-crossfade checks the latest GitHub release at startup. When a newer version is
-available, a toast offers **Update now**. It launches the one-click installer
-in its own console, which downloads the new build and replaces the installed
-files; when it finishes it asks whether to restart crossfade. The check only
-fetches the release's tiny `version.txt` file — there is no telemetry. Linux
-installs are updated through the package manager or by re-running the
-installer, so the in-app updater is Windows-only for now.
+crossfade checks the latest GitHub release at startup (at most once a day) and
+offers a toast when something newer exists. **Settings -> Updates** shows the
+installed and latest versions, the last check, and lets you check manually or
+turn the automatic check off. The check only fetches the release's tiny
+`version.txt`; there is no telemetry.
+
+- **Windows:** **Update now** launches the one-click installer, which downloads
+  the new build, replaces the installed files, and offers to restart crossfade.
+- **Linux AppImage, release tarball and `install.sh` installs:** **Update now**
+  downloads the matching release asset, verifies it against the release's
+  `SHA256SUMS`, and stages it. A **Restart & update** toast then applies it
+  during a clean shutdown and relaunches crossfade; if you ignore it, the
+  update is applied on the next normal launch. Only crossfade's own files are
+  replaced — settings, library, downloads, and the Python venv are preserved
+  (install.sh and tarball updates refresh the venv when `requirements.txt`
+  changes; the AppImage launcher owns its own venv).
+- **Package-managed installs** (deb, rpm, Arch, Gentoo, or anything under
+  `/usr`/`/usr/local`) are never modified in place. The action opens the
+  release page so your package manager stays in charge.
+- **Safe mode** pauses automatic checks and startup applies for that launch.
+  Manual checks still work, and a staged update is kept for later.
+
+Builds run directly from a source/build tree are not self-updatable; rebuild
+and re-run `./install.sh` (or use the release page).
 
 ## Build on Windows
 

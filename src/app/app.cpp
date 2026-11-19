@@ -567,6 +567,11 @@ int app_run(int argc, char **argv)
     writeback_set_enabled(g_state.settings.server_sync && !backend_is_guest());
     discord_apply_client_id();
 
+    // Apply an update the user downloaded but never restarted for. This runs
+    // before SDL, the window, the warm-start server and the backend exist, so
+    // replacing the running binary and then exec'ing it is safe.
+    updater::apply_staged_at_startup(argc, argv, safe_mode);
+
     const bool start_hidden = warm_flag;
     const bool serve_warm = !new_instance && (warm_flag || g_state.settings.warm_start);
     if (serve_warm)
@@ -694,8 +699,9 @@ int app_run(int argc, char **argv)
     diagnostics::mark("sdl");
     party_init();
     party_set_wake(party_wake_event);
-    if (!safe_mode)
-        updater::init(party_wake_event);
+    updater::init(party_wake_event,
+                  []() { g_state.quit_requested.store(true); },
+                  g_state.settings.check_for_updates && !safe_mode && !power::low_power());
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
@@ -2645,6 +2651,8 @@ int app_run(int argc, char **argv)
     stop_writeback_worker();
     DLOG("shutdown: library");
     library::shutdown();
+    // Stop the update checker from waking a dying loop or posting after SDL quits.
+    updater::shutdown();
     DLOG("shutdown: tasks");
     tasks::shutdown();
     DLOG("shutdown: textures");
@@ -2677,6 +2685,9 @@ int app_run(int argc, char **argv)
 #endif
     data_transfer::mark_shutdown_ready();
     DLOG("shutdown: done");
+    // Apply a staged self-update after every resource has been released and
+    // exec the new build. No-op unless the user chose "Restart & update".
+    updater::finalize_pending_update(argc, argv);
     // GLib/GDBus and SDL can leave atexit/static teardown waiting on helper
     // threads after main returns. Every resource we own has been released
     // above, so leave the process deterministically instead of hanging on a

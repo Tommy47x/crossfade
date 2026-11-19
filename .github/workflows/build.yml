@@ -112,7 +112,7 @@ jobs:
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCROSSFADE_BUILD_TESTS=ON \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          cmake --build build-asan -j2 --target test_party_link test_party_queue test_party_util test_party_tunnel test_library test_crossfade test_search_top test_cache test_json test_session test_playlists test_settings test_studio_project test_tasks
+          cmake --build build-asan -j2 --target test_party_link test_party_queue test_party_util test_party_tunnel test_library test_crossfade test_search_top test_cache test_json test_session test_playlists test_settings test_studio_project test_tasks test_version_compare test_sha256 test_update_apply
           ctest --test-dir build-asan --output-on-failure
       - name: Verify binary exists
         run: test -x ./build/crossfade
@@ -163,7 +163,7 @@ jobs:
           # Ubuntu 20.04, libmpv2 on 22.04+/Debian 12) — allow either.
           fpm -s dir -t deb -n crossfade -v "$VER" --iteration 1               --description "A native YouTube Music desktop player with real crossfade"               --url "https://github.com/XBoom31/crossfade" --license "MIT"               --depends "libsdl2-2.0-0" --depends "libglib2.0-0" --depends "libnotify4"               --depends "libmpv2 | libmpv1" --depends "python3 (>= 3.8)"               --depends "python3-venv" --depends "python3-pip" --depends "curl"               --after-install packaging/linux/after-install.sh               -C "$STAGE" -p "dist/crossfade-${VER}-amd64.deb" usr
           # rpm: mpv-libs lives in RPM Fusion on Fedora — the app needs it.
-          fpm -s dir -t rpm -n crossfade -v "$VER" --iteration 1               --description "A native YouTube Music desktop player with real crossfade"               --url "https://github.com/XBoom31/crossfade" --license "MIT"               --depends "SDL2" --depends "glib2" --depends "libnotify"               --depends "mpv-libs" --depends "python3"               --after-install packaging/linux/after-install.sh               -C "$STAGE" -p "dist/crossfade-${VER}-x86_64.rpm" usr
+          fpm -s dir -t rpm -n crossfade -v "$VER" --iteration 1               --description "A native YouTube Music desktop player with real crossfade"               --url "https://github.com/XBoom31/crossfade" --license "MIT"               --depends "SDL2" --depends "glib2" --depends "libnotify"               --depends "mpv-libs" --depends "python3" --depends "curl"               --after-install packaging/linux/after-install.sh               -C "$STAGE" -p "dist/crossfade-${VER}-x86_64.rpm" usr
       - name: Build AppImage
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -242,7 +242,7 @@ jobs:
           cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
-          cmake --build build-tsan -j2 --target test_party_link test_party_queue test_party_util test_party_tunnel test_library test_crossfade test_search_top test_cache test_json test_session test_playlists test_settings test_studio_project test_tasks
+          cmake --build build-tsan -j2 --target test_party_link test_party_queue test_party_util test_party_tunnel test_library test_crossfade test_search_top test_cache test_json test_session test_playlists test_settings test_studio_project test_tasks test_version_compare test_sha256 test_update_apply
           TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 
   python:
@@ -376,6 +376,13 @@ jobs:
           pattern: crossfade-*-release
           merge-multiple: true
           path: dist
+      - name: Generate checksums
+        # The Linux self-updater fetches this next to version.txt and refuses
+        # to apply anything whose SHA-256 does not match.
+        run: |
+          cd dist
+          sha256sum crossfade-*.tar.gz crossfade-*.deb crossfade-*.rpm \
+            crossfade-*.AppImage crossfade-windows.zip version.txt > SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -389,3 +396,4 @@ jobs:
             dist/install.ps1
             dist/install-crossfade.cmd
             dist/version.txt
+            dist/SHA256SUMS

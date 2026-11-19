@@ -108,6 +108,9 @@ set(SOURCES
     src/party/party_server.cpp
     src/party/party_tunnel.cpp
     src/net/updater.cpp
+    src/net/update_apply.cpp
+    src/net/version_compare.cpp
+    src/net/sha256.cpp
     src/data/library.cpp
     src/data/store.cpp
     src/data/cache.cpp
@@ -317,6 +320,27 @@ if(CROSSFADE_BUILD_TESTS)
     p100_test(test_settings)
     add_test(NAME settings COMMAND test_settings)
 
+    add_executable(test_version_compare tests/test_version_compare.cpp
+        src/net/version_compare.cpp)
+    p100_test(test_version_compare)
+    add_test(NAME version_compare COMMAND test_version_compare)
+
+    add_executable(test_sha256 tests/test_sha256.cpp src/net/sha256.cpp)
+    p100_test(test_sha256)
+    add_test(NAME sha256 COMMAND test_sha256)
+
+    # Self-update file replacement is POSIX-only; the Windows build uses the
+    # one-click installer instead.
+    if(UNIX)
+        add_executable(test_update_apply tests/test_update_apply.cpp
+            src/net/update_apply.cpp src/net/sha256.cpp)
+        p100_test(test_update_apply)
+        add_test(NAME update_apply COMMAND test_update_apply)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_update_apply PRIVATE ${CROSSFADE_WARNINGS})
+        endif()
+    endif()
+
     add_executable(test_studio_project tests/test_studio_project.cpp
         src/data/studio_project.cpp src/data/paths.cpp)
     p100_test(test_studio_project)
@@ -365,7 +389,7 @@ if(CROSSFADE_BUILD_TESTS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         foreach(tgt test_party_link test_party_queue test_party_util test_library
                     test_crossfade test_cache test_json test_session test_playlists
-                    test_settings test_studio_project)
+                    test_settings test_studio_project test_version_compare test_sha256)
             target_compile_options(${tgt} PRIVATE ${CROSSFADE_WARNINGS})
         endforeach()
     endif()

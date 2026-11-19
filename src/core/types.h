@@ -233,6 +233,10 @@ struct Settings
     // Diagnostic switch: next launch disables the shader backdrop, updater
     // checks and optional background integrations.
     bool safe_mode = false;
+    // Check GitHub for a newer release once a day. The check fetches the
+    // release's tiny version.txt; Linux self-updates additionally download a
+    // verified release asset only when the user asks. No telemetry.
+    bool check_for_updates = true;
     // Low power mode: cap the render cadence, disable motion, and skip
     // speculative stream warming / background downloads. Playback itself is
     // unaffected. `low_power_on_battery` turns it on automatically when the
@@ -333,6 +337,7 @@ struct Settings
                hero_backdrop_strength == o.hero_backdrop_strength &&
                backdrop_shader == o.backdrop_shader &&
                safe_mode == o.safe_mode &&
+               check_for_updates == o.check_for_updates &&
                low_power == o.low_power &&
                low_power_on_battery == o.low_power_on_battery &&
                warm_start == o.warm_start &&

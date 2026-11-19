@@ -96,15 +96,22 @@ them via pkg-config, which CMake uses automatically on MSYS2.
 
 ## Updating
 
-`updater.cpp` runs a Windows-only startup check against
-`releases/latest/download/version.txt` (a small asset published by the release
-workflow) and compares it with the compile-time `CROSSFADE_VERSION`. When a
-newer version exists, the normal toast stack offers **Update now**. That action
+`src/net/updater.cpp` is shared by both platforms. A startup check (throttled
+to once a day) fetches `releases/latest/download/version.txt` and compares it
+with the compile-time `CROSSFADE_VERSION`; Settings -> Updates exposes the
+same check manually. On Windows, the toast offers **Update now**, which
 launches `install-crossfade.cmd` from the install directory, falling back to
 downloading the current one from the release page for older installs. The
-installer runs in its own console, replaces the app and asks whether to restart
-it. Linux builds compile the updater as a no-op because distro packages own
-their files.
+installer runs in its own console, replaces the app and asks whether to
+restart it.
+
+On Linux the same check now drives a self-updater for writable, user-owned
+installs (AppImage, release tarball, `./install.sh` prefix): it downloads the
+matching asset, verifies the release `SHA256SUMS`, stages it, and applies it
+during shutdown or on the next launch before SDL starts. Package-managed
+installs (`/usr`, `/usr/local`, deb/rpm/Arch/Gentoo) are never rewritten; the
+action opens the release page instead. Safe mode skips automatic checks and
+startup applies.
 
 ## Known-unknowns (first Windows run will tell)
 

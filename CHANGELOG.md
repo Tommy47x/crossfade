@@ -2,6 +2,25 @@
 
 All notable changes to crossfade are documented here.
 
+## Unreleased
+
+### Added
+
+- **Update checks on Linux.** The existing GitHub release check now runs on
+  every platform (at most once a day), and **Settings -> Updates** shows the
+  installed and latest versions, the last check, a manual **Check now**, and a
+  toggle for automatic checks. A newer release still surfaces as a toast.
+- **Linux self-update** for writable user installs: AppImage, the release
+  tarball, and prefixes created by `./install.sh`. **Update now** downloads the
+  matching asset, verifies it against the release's new `SHA256SUMS`, stages
+  it, and then applies it on **Restart & update** or the next normal launch.
+  Settings, library, downloads and the Python venv are preserved; only the venv
+  requirements are refreshed when they change. Package-managed installs
+  (deb/rpm/Arch/Gentoo, `/usr`, `/usr/local`) are never rewritten and fall back
+  to opening the release page.
+- The release workflow now publishes `SHA256SUMS`, and the rpm package now
+  depends on `curl` (already required for thumbnails and update checks).
+
 ## 0.4.2 - 2026-11-19
 
 ### Added

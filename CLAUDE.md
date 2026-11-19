@@ -173,7 +173,9 @@ All user data lives in one directory, resolved as `$P100_CONFIG_DIR`, then
 directories are migrated once on first launch).
 
 - `session.json` — last-played track, position, volume, playlist source (saved every 10s + on quit)
-- `settings.json` — crossfade duration, volume normalization, notifications, browser choice, lyrics timing offset (±5 s)
+- `settings.json` — crossfade duration, volume normalization, notifications, browser choice, lyrics timing offset (±5 s), automatic update checks
+- `update.json` — last update check, newest known release and the version whose toast was shown
+- `update-staging/` — downloaded and SHA-256-verified release waiting for a restart (Linux AppImage/tarball/`install.sh` installs)
 - `liked.json` — liked tracks
 - `albums.json` — saved albums (metadata for the permanent Albums tab)
 - `artists.json` — saved artists (metadata for the permanent Artists tab)
