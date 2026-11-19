@@ -213,7 +213,7 @@ struct Settings
     // a fixed value caps the fast frame budget at that many Hz. Playback and
     // idle budgets are unaffected, so higher rates only cost CPU while the
     // interface is actually moving.
-    int max_refresh_hz = 60;
+    int max_refresh_hz = 0;
     // Day mode: true = light theme, false = dark theme. Persisted in settings.json.
     bool day_mode = false;
     // Custom accent colour as "#rrggbb". Empty means automatic: follow the

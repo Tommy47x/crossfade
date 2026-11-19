@@ -13,7 +13,7 @@ int main()
     check(!s.shuffle_enabled, "default shuffle off");
     check(s.ui_scale == 1.0f && s.ui_text_scale == 1.0f, "default ui scale");
     check(s.animations == 2, "default animations");
-    check(s.max_refresh_hz == 60, "default refresh cap 60");
+    check(s.max_refresh_hz == 0, "default refresh follows the display");
     check(!s.safe_mode, "default safe mode");
     check(s.check_for_updates, "default update checks on");
     check(!s.low_power, "default low power off");

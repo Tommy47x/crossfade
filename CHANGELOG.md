@@ -2,6 +2,39 @@
 
 All notable changes to crossfade are documented here.
 
+## Unreleased
+
+### Added
+
+- **Resilient sign-in.** Settings → YouTube Music now has a sign-in panel that
+  tries whatever webview engine is installed, with no hard dependency:
+  WebKitGTK 6.0/4.1/4.0, Qt WebEngine (PyQt6/PySide6/PyQt5/PySide2), and
+  Windows WebView2 through the optional `pywebview` package. It shows what was
+  detected, surfaces the helper's output and errors in-app, and falls back to a
+  paste box that accepts any browser's DevTools output. The old path only
+  caught `RuntimeError`, so missing `gi`/WebKit typelibs skipped the fallback
+  and left no visible error.
+- **Import an existing browser session** from Firefox, LibreWolf, Chrome,
+  Chromium, Edge or Brave. It is an explicit action (never automatic), and the
+  imported snapshot is verified before it atomically replaces `browser.json`,
+  so an expired session leaves the current one untouched. Chromium-family
+  decryption is delegated to the already-required yt-dlp.
+- A shared `cf_backend.login` module owns header cleaning, SAPISIDHASH,
+  cookie filtering, verification and atomic replacement; `make_browser_json.py`
+  is now a thin CLI over it. The webview cookie check now requires
+  `__Secure-3PAPISID` as ytmusicapi does.
+- Python regression tests for header cleaning, cookie mapping, SAPISIDHASH,
+  atomic install, yt-dlp cookie extraction and the helper CLI/`--probe`.
+
+### Changed
+
+- **Refresh rate now defaults to Auto**, so 120/144/240 Hz monitors render at
+  their native rate while the interface is moving. 60 Hz displays behave
+  exactly as before; playback and idle budgets are unchanged.
+- **OAuth is hidden from Settings** for now. The backend remains available as
+  an experimental CLI path with your own Google Cloud client. An existing
+  `auth_mode: "oauth"` config shows a one-click switch back to browser cookies.
+
 ## 0.5.0 - 2026-11-19
 
 ### Added
