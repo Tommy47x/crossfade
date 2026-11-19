@@ -466,6 +466,26 @@ void smooth_scroll_begin_frame()
     g_frame_scroll_consumed = false;
 }
 
+// Touch landings inside this rect are handled as a drag rather than a scroll.
+static bool g_touch_drag_zone = false;
+static float g_touch_drag_x0 = 0.0f, g_touch_drag_y0 = 0.0f;
+static float g_touch_drag_x1 = 0.0f, g_touch_drag_y1 = 0.0f;
+
+void ui_set_touch_drag_zone(bool enabled, float x0, float y0, float x1, float y1)
+{
+    g_touch_drag_zone = enabled;
+    g_touch_drag_x0 = x0;
+    g_touch_drag_y0 = y0;
+    g_touch_drag_x1 = x1;
+    g_touch_drag_y1 = y1;
+}
+
+bool ui_touch_drag_zone_contains(float x, float y)
+{
+    return g_touch_drag_zone && x >= g_touch_drag_x0 && x <= g_touch_drag_x1 &&
+           y >= g_touch_drag_y0 && y <= g_touch_drag_y1;
+}
+
 void smooth_scroll_child()
 {
     if (g_frame_scroll_consumed || g_frame_scroll_pixels == 0.0f)

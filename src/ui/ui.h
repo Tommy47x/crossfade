@@ -246,6 +246,13 @@ float take_scroll_clamp_feedback();
 void smooth_scroll_begin_frame();
 void smooth_scroll_child();
 
+// Direct-manipulation touch zones (bottom-bar sliders). A finger that lands
+// inside one is translated into a mouse drag by the input layer instead of a
+// scroll gesture, so the slider tracks the finger. Coordinates are screen
+// space; the zone is republished every frame and cleared when not shown.
+void ui_set_touch_drag_zone(bool enabled, float x0, float y0, float x1, float y1);
+bool ui_touch_drag_zone_contains(float x, float y);
+
 // Lyrics panel animation signal. The panel sets this while its auto-centre
 // scroll / fade-in is running; the main loop consumes it (like
 // UI motion) to keep rendering at 60 FPS until the motion settles.

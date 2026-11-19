@@ -19,6 +19,7 @@ struct TouchGesture
     Uint32 last_move_ticks = 0;
     bool scrolling = false;
     bool long_fired = false;
+    bool widget_drag = false; // touch started on a direct-manipulation control
     float velocity = 0.0f; // pixels/second in scroll direction
 };
 
@@ -137,7 +138,15 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
         g_touch_fling_active = false;
         g_touch_fling_velocity = 0.0f;
         reset_wheel_scroll();
-        ImGui::GetIO().AddMousePosEvent(g_touch.last_x, g_touch.last_y);
+        // A slider (volume) opts into direct manipulation: press and hold with
+        // a real mouse-button-down so the widget tracks the finger. Without
+        // this a one-finger drag was always classified as a scroll and the
+        // slider only ever reacted to the tap synthesised on finger-up.
+        g_touch.widget_drag = ui_touch_drag_zone_contains(g_touch.start_x, g_touch.start_y);
+        ImGuiIO &io = ImGui::GetIO();
+        io.AddMousePosEvent(g_touch.last_x, g_touch.last_y);
+        if (g_touch.widget_drag)
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
         return;
     }
 
@@ -148,6 +157,15 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
     {
         const float x = px(event.tfinger.x);
         const float y = py(event.tfinger.y);
+        if (g_touch.widget_drag)
+        {
+            // Feed the drag straight to ImGui; no scrolling, no fling.
+            g_touch.last_move_ticks = SDL_GetTicks();
+            g_touch.last_x = x;
+            g_touch.last_y = y;
+            ImGui::GetIO().AddMousePosEvent(x, y);
+            return;
+        }
         const float dx = x - g_touch.start_x;
         const float dy = y - g_touch.start_y;
         if (!g_touch.scrolling && dx * dx + dy * dy > 14.0f * 14.0f)
@@ -182,6 +200,15 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
     {
         const float x = px(event.tfinger.x);
         const float y = py(event.tfinger.y);
+        if (g_touch.widget_drag)
+        {
+            ImGuiIO &io = ImGui::GetIO();
+            io.AddMousePosEvent(x, y);
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+            g_touch.widget_drag = false;
+            g_touch.active = false;
+            return;
+        }
         const bool tap = !g_touch.scrolling && !g_touch.long_fired;
         const Uint32 now_ms = SDL_GetTicks();
         float velocity = g_touch.velocity;
@@ -204,7 +231,7 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
 
 void update_touch_long_press()
 {
-    if (!g_touch.active || g_touch.scrolling || g_touch.long_fired)
+    if (!g_touch.active || g_touch.widget_drag || g_touch.scrolling || g_touch.long_fired)
         return;
     if (SDL_GetTicks() - g_touch.start_ticks < 550)
         return;

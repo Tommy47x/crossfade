@@ -139,6 +139,10 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
 
+    // Republished below if the volume control is visible; a finger landing in
+    // it is treated as a drag instead of a scroll.
+    ui_set_touch_drag_zone(false, 0.0f, 0.0f, 0.0f, 0.0f);
+
     // The separator between the main UI and the bar doubles as the seek
     // indicator: it fills with accent as the track progresses, and the strip
     // can be clicked / dragged to seek. The knob rides a spring (slightly
@@ -914,6 +918,14 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
 
         ui_draw_icon(dl, UiIcon::Volume, ImVec2(vol_x + vol_icon * 0.5f, wp.y + bar_h * 0.5f),
                      vol_icon, ui_text_muted_u32(), 1.5f);
+
+        // Touchscreens: let a finger that lands here drive the slider instead
+        // of scrolling the page. The band is taller than the 24 px track so a
+        // finger can grab it reliably.
+        const float touch_pad = m.space_3;
+        ui_set_touch_drag_zone(true, vol_x - m.space_1, vol_y - touch_pad,
+                               bar_x + vol_bar_w + m.space_1,
+                               vol_y + seek_h + touch_pad);
 
         // Wheel / two-finger scroll over the slider nudges the volume. The
         // readme promises this; without it the wheel only scrolled the page
