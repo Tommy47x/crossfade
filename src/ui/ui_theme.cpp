@@ -63,7 +63,7 @@ static float g_theme_target = 0.0f;   // target
 static bool g_theme_initialized = false;
 
 // Glowing separators: setting mirror, target and eased strength.
-static bool g_glow_separators = true;
+static bool g_glow_separators = false;
 static float g_glow_strength = 0.75f;
 static float g_glow_level = 0.0f;
 

@@ -165,6 +165,11 @@ int ui_tracks_duration(const std::vector<Track> &tracks);
 std::string ui_format_duration(int seconds);
 void ui_reset_search(AppState &state);
 void ui_set_search(AppState &state, const std::string &query);
+// Search field drawn inside the Home panel body. Shares the top bar's buffer
+// and debounce, so the feed never looks dead when it is empty (guest mode,
+// a failed refresh) -- typing here starts a normal search. `width` is the
+// field width in pixels; pass 0 for a sensible default.
+void ui_home_search_field(AppState &state, float width = 0.0f);
 bool ui_open_external_url(const std::string &url);
 void ui_copy_to_clipboard(const std::string &text);
 // Floating search typeahead dropdown. Submitted after every other window so

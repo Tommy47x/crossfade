@@ -2,7 +2,7 @@
 
 # crossfade
 
-**A native YouTube Music client for Linux. No Electron. No browser tab.**
+**A native YouTube Music client for Linux and Windows. No Electron. No browser tab.**
 
 Instant starts. Automatic offline cache. Synced lyrics, your real library, media keys,
 and real crossfade.
@@ -11,7 +11,7 @@ C++17 · SDL2 + OpenGL + Dear ImGui · playback by `mpv` · music data by a Pyth
 
 [Download](../../releases) · [Screenshots](#screens) · [How it works](#how-it-works)
 
-[![Platform](https://img.shields.io/badge/platform-Linux-blue)](#platform-support)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue)](#platform-support)
 [![Build](https://img.shields.io/badge/build-CMake%20%2B%20Make-green)](#install-linux)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue)](https://isocpp.org/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
@@ -46,7 +46,7 @@ the method is below.
 | Idle CPU (all 16 threads) | **~0%** |
 | Playing CPU (all 16 threads) | **~0.23%** |
 | Binary + assets + backend package | **~7.9 MB** |
-| Source | **~38k lines** of C++/headers |
+| Source | **~51k lines** of C++/headers |
 
 All rows above are with **low power mode off**. Low power caps the UI at ~4 FPS,
 disables motion and speculative warming, and skips background downloads/sweeps;
@@ -85,6 +85,28 @@ playback itself is unchanged. Measured separately with `--low-power`:
 
 </details>
 
+### Source size
+
+Line counts (blank lines included) from the current tree:
+
+| Area | Files | Lines |
+|---|---:|---:|
+| `src/ui` — widgets, panels, theming, ImGui layout | 34 | 23,044 |
+| `src/app` — init, main loop, input, playback, workers, diagnostics | 14 | 7,858 |
+| `src/net` — yt-dlp, thumbnails, updater, Discord RPC | 8 | 5,668 |
+| `src/party` — party server, queue, guest page, tunnels | 15 | 4,990 |
+| `src/data` — SQLite library, caches, paths, write-back | 13 | 4,201 |
+| `src/playback` — mpv, crossfade, video surface, session, MPRIS | 12 | 2,175 |
+| `src/core` — shared state, types, tasks, power, JSON | 10 | 1,855 |
+| `win32` — SMTC, WinRT toasts, Windows MPRIS, Discord stub | 7 | 1,688 |
+| `src/main.cpp` | 1 | 7 |
+| **C++ and headers total** | **114** | **51,486** |
+| Python backend (`py/cf_backend`, `p100-backend*.py`) | 5 | 3,864 |
+| Tests (`tests/`) | 19 | 2,565 |
+| Scripts (`scripts/`) | 7 | 1,085 |
+
+`external/` (Dear ImGui, stb) is vendored and excluded.
+
 ## How it compares
 
 | | Electron clients¹ | Native players² | **crossfade** |
@@ -96,7 +118,7 @@ playback itself is unchanged. Measured separately with `--low-power`:
 | Synced lyrics + click-to-seek | ✅ | mixed | ✅ |
 | Native C++ / no bundled Chromium | ❌ | ✅ | ✅ |
 | Media keys / MPRIS | ✅ | ✅ | ✅ |
-| Windows / macOS | ✅ | mixed | Linux (Windows beta) |
+| Windows / macOS | ✅ | mixed | ✅ Windows, ❌ macOS |
 
 ¹ th-ch/youtube-music, ytmdesktop · ² Tauon, Feishin, Nuclear, mpv+yt-dlp
 
@@ -106,7 +128,8 @@ playback itself is unchanged. Measured separately with `--low-power`:
 No. Without `browser.json` crossfade starts in guest mode: public browsing, playback,
 lyrics, radio, podcasts, downloads and local playlists work. Personalized
 recommendations and your YouTube Music playlists/library need a sign-in; the Home tab
-links straight to the sign-in settings while you are a guest.
+keeps a search field on the page itself (so an empty feed is never a dead end) and links
+straight to the sign-in settings while you are a guest.
 
 **Isn't signing in annoying?**
 One-time, about 30 seconds: copy the request headers, run `crossfade-login`, done.
@@ -122,9 +145,13 @@ requests go to YouTube and nowhere else.
 Because the point was to stop a music player from using a gigabyte of RAM. One native
 binary, libmpv, no bundled browser.
 
-**Linux only?**
-Linux is the primary target. Windows works with a one-click installer (beta). macOS is
-not started.
+**Linux or Windows?**
+Both are first-class. The same C++/OpenGL/ImGui app runs on Linux and Windows, with the
+same playback, crossfade, cache, lyrics, party mode and video features, and each has a
+one-click install: AppImage/deb/rpm/AUR and a source build on Linux, an MSYS2 UCRT64 build
+with a one-click PowerShell installer on Windows. Platform integration is native on both
+(MPRIS and libnotify on Linux; SMTC, WinRT toasts and a GUI-subsystem build on Windows).
+macOS is not started.
 
 ---
 
@@ -378,9 +405,10 @@ installer, so the in-app updater is Windows-only for now.
 
 ## Build on Windows
 
-The same source tree builds on Windows with the MSYS2 UCRT64 toolchain (MinGW-w64) —
-the Linux-only desktop integration (MPRIS, libnotify, GLib) is compiled out and
-replaced by no-op stubs.
+The same source tree builds on Windows with the MSYS2 UCRT64 toolchain (MinGW-w64) and
+runs the same unit test suite. The Linux desktop integration (MPRIS, libnotify, GLib) is
+swapped for native Windows equivalents — System Media Transport Controls and WinRT
+toasts — rather than dropped.
 
 ```bash
 # In a UCRT64 MSYS2 shell (C:\msys64\ucrt64.exe)
@@ -552,6 +580,12 @@ session; press **Library** again to return to YouTube search.
 - Press **V** (or the video button in the bottom bar) to show the current track's video
   in the main area. The top bar, sidebar and bottom bar stay exactly where they are;
   **Esc**, **V** or the close button returns to the list.
+- The video replaces the list, not the whole body: with the lyrics panel open, the panel
+  stays docked beside the picture, so you can watch the video and follow the lyrics at
+  the same time. Only theater mode (**F**) takes the full width.
+- Starting a search drops the video page back to the list (audio keeps playing), but you
+  can press **V** again on any search result to watch that song's video while the search
+  stays up.
 - Audio keeps playing on its own player: opening, closing, seeking, or the video
   buffering never interrupts the sound. The page only appears once a real frame is
   decoded and the picture is running.
@@ -991,25 +1025,27 @@ A JSON reply means auth and the API work; `{"error": ..., "kind": "auth"}` means
 
 ### Continuous integration
 
-`.github/workflows/build.yml` builds the Linux binary on every push and pull request and
-also compiles the Windows port under MSYS2. Linux runs the unit test suite and a second
-ASan/UBSan build of the same tests. The CI build is the source of truth for platform
-health.
+`.github/workflows/build.yml` builds both targets on every push and pull request: the
+Linux binary plus unit tests, an ASan/UBSan build of the same tests (and TSan under
+clang), and the Windows binary under MSYS2 UCRT64 with its own unit tests. Tagged
+releases publish Linux packages (AppImage, deb, rpm, tar.gz) and the Windows zip plus
+one-click installer from the same run, so the two platforms ship together. The CI build
+is the source of truth for platform health.
 
 ## Platform support
 
 | Platform | Status |
 |---|---|
-| **Linux** (X11; Wayland via XWayland) | ✅ Supported — the target platform |
-| **Windows** | 🚧 In progress — see [`docs/PORTING-WINDOWS.md`](docs/PORTING-WINDOWS.md) |
+| **Linux** (X11; Wayland via XWayland) | ✅ Supported |
+| **Windows** (10/11 x64, MSYS2 UCRT64; one-click installer) | ✅ Supported — same features and test suite as Linux |
 | **macOS** | ❌ Not started |
 
-What is Linux-only by design: **MPRIS** media control and **libnotify** desktop
-notifications. The Windows port implements equivalents with System Media
-Transport Controls and WinRT toasts, plus warm start over a named pipe and a
-GUI-subsystem build with no console window; Discord RPC is still stubbed.
-Everything else — playback, crossfade, caching, lyrics, library — is portable
-C++/Python.
+Platform integration is native on both sides: **MPRIS** and **libnotify** on Linux,
+**System Media Transport Controls** and **WinRT toasts** on Windows. Windows also gets
+warm start over a named pipe, a GUI-subsystem build with no console window, and the
+one-click updater. The one remaining gap is Discord RPC, which is stubbed on Windows.
+Everything else — playback, crossfade, caching, lyrics, library, party mode, music
+videos — is the same portable C++/Python code running on both.
 
 ## Troubleshooting
 
@@ -1067,7 +1103,7 @@ cat ~/.config/crossfade/audio_cache/<videoId>.meta.json
 
 ## Known limitations
 
-- Linux is the primary target; Windows is beta and macOS is not started.
+- Linux and Windows are both supported; macOS is not started. Discord RPC is stubbed on Windows.
 - Cookie auth needs a periodic refresh; OAuth avoids most of that.
 - Manual skip crossfade only applies when the next track is already cached.
 - Public party links require a locally installed `cloudflared`; Quick Tunnel addresses change each start, and Cloudflare relays the traffic. Same-Wi-Fi mode stays fully local.

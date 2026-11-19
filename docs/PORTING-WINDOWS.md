@@ -1,11 +1,15 @@
-# Windows port status
+# Windows platform notes
 
-The Linux build is the reference. Windows support is **in progress** — the
-platform layer exists (see the `P100_WINDOWS` blocks). CI
-(`.github/workflows/build.yml`) builds the Windows binary on every push, which
-is the source of truth. The desktop-integration layer (media controls,
-notifications) has been exercised end-to-end on Windows 10; the rest of the
-port is still awaiting broader real-machine testing.
+Windows is a first-class target: the same C++/OpenGL/ImGui app, feature set and
+unit tests as Linux, built with MSYS2 UCRT64. CI
+(`.github/workflows/build.yml`) builds and tests the Windows binary on every
+push and ships it with each tagged release, alongside the Linux packages. The
+desktop-integration layer (media controls, notifications) has been exercised
+end-to-end on Windows 10/11. The only remaining gap is Discord RPC, which is a
+silent stub on Windows.
+
+This page records how each Linux facility maps onto Windows; the `P100_WINDOWS`
+blocks in the sources are the implementation.
 
 ## What is done
 

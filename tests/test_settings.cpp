@@ -25,6 +25,7 @@ int main()
     check(s.party.public_reach(), "party defaults to a public link");
     check(s.party.tunnel_path.empty(), "default cloudflared path");
     check(!s.party.allow_controls, "guest controls default off");
+    check(!s.glow_separators, "glowing separators default off");
 
     Settings a, b;
     check(a == b, "defaults compare equal");

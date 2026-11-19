@@ -925,6 +925,75 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
     }
 }
 
+// Home carries its own search field. The feed can legitimately be empty --
+// guest mode, a failed refresh, or no recommendations yet -- and an empty page
+// is the worst place to discover that search still works without an account.
+// It writes the shared buffer and reuses the top bar's debounce, so typing
+// here behaves exactly like typing in the header field.
+void ui_home_search_field(AppState &state, float width)
+{
+    const UiMetrics &m = ui_m();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (width <= 0.0f)
+        width = std::min(avail, 620.0f * m.layout_scale);
+    width = std::max(120.0f, std::min(width, avail));
+    const float field_h = std::max(m.control_h, 46.0f * m.layout_scale);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(40.0f * m.layout_scale,
+                               (field_h - ImGui::GetFontSize()) * 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, m.radius_sm);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ui_c().frame_bg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ui_c().frame_bg_hovered);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ui_c().frame_bg_active);
+    // The border and the icon are drawn manually below so focus can tint them.
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui_c().text);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ui_c().text_muted);
+    ImGui::SetNextItemWidth(width);
+    ImGui::SetNextItemAllowOverlap();
+    if (state.focus_search_requested)
+    {
+        ImGui::SetKeyboardFocusHere();
+        state.focus_search_requested = false;
+    }
+    if (ImGui::InputTextWithHint("##home_search", "Search songs, albums, artists",
+                                 state.search_buffer, sizeof(state.search_buffer)))
+        on_search_edit(state);
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(2);
+
+    const ImVec2 field_pos = ImGui::GetItemRectMin();
+    const ImVec2 field_max = ImGui::GetItemRectMax();
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRect(field_pos, field_max,
+                (active || hovered) ? ui_accent_u32(0.45f) : ui_border_u32(),
+                m.radius_sm, 0, 1.0f);
+    ui_draw_icon(dl, UiIcon::Search,
+                 ImVec2(field_pos.x + 15.0f * m.layout_scale,
+                        (field_pos.y + field_max.y) * 0.5f),
+                 16.0f * m.layout_scale,
+                 (active || hovered) ? ui_accent_text_u32() : ui_text_muted_u32(), 1.5f);
+    if (state.search_buffer[0])
+    {
+        const float cb_size = field_h * 0.82f;
+        ImGui::SetCursorScreenPos(
+            ImVec2(field_max.x - cb_size - 4.0f * m.layout_scale,
+                   field_pos.y + (field_h - cb_size) * 0.5f));
+        if (ui_icon_button("##home_clear_search", UiIcon::Close, cb_size, false, 0, "Clear"))
+        {
+            ui_reset_search(state);
+            std::atomic_store(&state.search_results,
+                              std::make_shared<const std::vector<Track>>());
+            s_pending_search = false;
+            s_last_edit_time = 0.0;
+            state.current_playlist_source = PlaylistSource::HOME;
+        }
+    }
+}
+
 // Called once after every other window has been submitted, so the dropdown
 // floats above the content without a popup's focus behaviour.
 void draw_search_suggestions_overlay(AppState &state)

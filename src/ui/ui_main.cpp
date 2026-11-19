@@ -858,6 +858,15 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
                        : state.search_filter == 3 ? "playlist" : "track";
     meta = searching ? "Searching..." : std::to_string(count) + " " + unit + (count == 1 ? "" : "s");
 
+    // Home carries its own search field. The feed can be legitimately empty
+    // (guest mode, a failed refresh, no recommendations yet), and an empty
+    // page is a bad place to discover that search works without an account.
+    if (home && !home_search)
+    {
+        ui_home_search_field(state);
+        ImGui::Dummy(ImVec2(0.0f, m.space_3));
+    }
+
     // Recent searches sit above the recommendation feed, not between its
     // header and the tracks it describes.
     if (home && !home_search)
@@ -1683,9 +1692,18 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 
-    // While a video is on screen it owns the body area: the list, the hero
-    // bands and the lyrics drawer step aside. The rest of the window (top bar,
-    // sidebar, bottom bar) is untouched.
+    // While a video is on screen it owns the main area, not the whole body: a
+    // docked lyrics panel keeps its place beside the picture, so a music video
+    // and its lyrics can be watched together. Theater mode still takes the
+    // full width, and an undocked lyrics panel (too narrow to dock) keeps its
+    // existing full-body takeover. The rest of the window (top bar, sidebar,
+    // bottom bar) is untouched.
+    const float lyrics_w = layout.lyrics_open ? layout.lyrics_w : 0.0f;
+    const bool lyrics_only = layout.lyrics_open && !layout.lyrics_docked;
+    const float list_w = (layout.lyrics_open && layout.lyrics_docked)
+                             ? std::max(0.0f, layout.body_size.x - lyrics_w - layout.gap)
+                             : layout.body_size.x;
+
     if (state.video_active || state.video_page_alpha > 0.001f)
     {
         if (state.video_theater && state.video_active)
@@ -1710,17 +1728,17 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         }
         else
         {
-            draw_video_page(state, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+            draw_video_page(state, ImGui::GetWindowPos(),
+                            ImVec2(list_w, layout.body_size.y));
+            if (layout.lyrics_open && layout.lyrics_docked)
+            {
+                ImGui::SetCursorPos(ImVec2(layout.body_size.x - lyrics_w, 0.0f));
+                draw_lyrics_panel(state, player, layout.lyrics_w, layout.body_size.y);
+            }
         }
         ImGui::End();
         return;
     }
-
-    const float lyrics_w = layout.lyrics_open ? layout.lyrics_w : 0.0f;
-    const bool lyrics_only = layout.lyrics_open && !layout.lyrics_docked;
-    const float list_w = (layout.lyrics_open && layout.lyrics_docked)
-                             ? std::max(0.0f, layout.body_size.x - lyrics_w - layout.gap)
-                             : layout.body_size.x;
 
     const bool single_panel = state.current_tab == Tab::Settings ||
                               state.current_tab == Tab::Radio ||

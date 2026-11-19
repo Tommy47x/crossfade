@@ -248,7 +248,9 @@ struct Settings
     // Glowing separators: a soft album-coloured light streak under each
     // section header, plus album-tinted structural hairlines. Uses the same
     // dominant-colour tint as the backdrop, but works with the backdrop off.
-    bool glow_separators = true;
+    // Off by default: the plain hairline keeps the list chrome quiet, and the
+    // effect stays one toggle away in Settings -> Appearance.
+    bool glow_separators = false;
     float glow_separator_strength = 0.75f;
     // Slowly rotate the backdrop's light arrangement every so often, so the
     // glow drifts to a different corner instead of sitting still.

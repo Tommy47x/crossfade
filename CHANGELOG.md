@@ -2,6 +2,30 @@
 
 All notable changes to crossfade are documented here.
 
+## Unreleased
+
+### Added
+
+- **Search field on the Home panel.** The feed page now carries its own search
+  box, so guests -- and anyone whose feed is empty right now -- can start a
+  search without hunting for the header field.
+- **Video and lyrics side by side.** The music-video page now replaces only the
+  list: an open lyrics panel stays docked beside the picture. Theater mode
+  still takes the full width.
+- **Videos work from search results.** Starting a search still drops the video
+  page, but pressing **V** on a search result now opens that song's video while
+  the search stays up; before, the page closed itself on the next frame.
+
+### Changed
+
+- **Glowing separators are off by default.** The option is unchanged in
+  Settings -> Appearance; new installs get the plain hairline.
+
+### Documentation
+
+- README: Windows is documented as a first-class platform alongside Linux, and
+  the source-size table now lists line counts per folder.
+
 ## 0.4.0 - 2026-11-18
 
 ### Added

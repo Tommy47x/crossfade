@@ -1644,12 +1644,19 @@ int app_run(int argc, char **argv)
                 g_state.repaint_requested = true;
             }
             // Navigating to another tab or starting a search closes the video
-            // page; audio continues in the background.
+            // page; audio continues in the background. The search part fires
+            // on the transition only: a video opened from a search result has
+            // to stay up while that search is active, otherwise pressing V on
+            // a found song was undone by this rule on the very next frame.
+            static bool s_video_search_was_active = false;
+            const bool video_search_active = g_state.search_buffer[0] != '\0' ||
+                                             g_state.local_search_active;
             if (g_state.video_active &&
                 (g_state.current_tab != g_state.video_tab ||
-                 g_state.search_buffer[0] != '\0' || g_state.local_search_active ||
+                 (video_search_active && !s_video_search_was_active) ||
                  g_state.focus_search_requested))
                 g_state.video_close_requested = true;
+            s_video_search_was_active = video_search_active;
 
             // Right-click Download video: start the background video download.
             if (!g_state.video_download_request_id.empty())
