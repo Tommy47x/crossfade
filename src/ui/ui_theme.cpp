@@ -38,19 +38,22 @@ static const UiColors k_colors_dark = {
 };
 
 static const UiColors k_colors_light = {
-    /*bg*/ ImVec4(0.96f, 0.965f, 0.975f, 1.0f),
+    // A neutral-warm paper base. The old cool blue-grey cast read as a clash
+    // once an album tint warmed the page, and painted blue-looking hairlines
+    // on it. Slightly warm also keeps secondary text comfortable.
+    /*bg*/ ImVec4(0.962f, 0.960f, 0.956f, 1.0f),
     /*surface*/ ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
-    /*surface_hover*/ ImVec4(0.90f, 0.905f, 0.92f, 1.0f),
-    /*surface_active*/ ImVec4(0.86f, 0.865f, 0.89f, 1.0f),
-    /*frame_bg*/ ImVec4(0.92f, 0.925f, 0.945f, 1.0f),
-    /*frame_bg_hovered*/ ImVec4(0.87f, 0.875f, 0.90f, 1.0f),
-    /*frame_bg_active*/ ImVec4(0.92f, 0.925f, 0.945f, 1.0f),
+    /*surface_hover*/ ImVec4(0.925f, 0.922f, 0.917f, 1.0f),
+    /*surface_active*/ ImVec4(0.885f, 0.882f, 0.876f, 1.0f),
+    /*frame_bg*/ ImVec4(0.935f, 0.933f, 0.928f, 1.0f),
+    /*frame_bg_hovered*/ ImVec4(0.895f, 0.892f, 0.887f, 1.0f),
+    /*frame_bg_active*/ ImVec4(0.935f, 0.933f, 0.928f, 1.0f),
     /*overlay*/ ImVec4(0.0f, 0.0f, 0.0f, 1.0f),
-    /*border*/ ImVec4(0.78f, 0.785f, 0.81f, 1.0f),
-    /*border_soft*/ ImVec4(0.86f, 0.865f, 0.885f, 1.0f),
-    /*text*/ ImVec4(0.10f, 0.105f, 0.13f, 1.0f),
-    /*text_dim*/ ImVec4(0.38f, 0.385f, 0.42f, 1.0f),
-    /*text_muted*/ ImVec4(0.52f, 0.525f, 0.56f, 1.0f),
+    /*border*/ ImVec4(0.80f, 0.795f, 0.785f, 1.0f),
+    /*border_soft*/ ImVec4(0.88f, 0.876f, 0.868f, 1.0f),
+    /*text*/ ImVec4(0.105f, 0.104f, 0.10f, 1.0f),
+    /*text_dim*/ ImVec4(0.36f, 0.355f, 0.345f, 1.0f),
+    /*text_muted*/ ImVec4(0.47f, 0.465f, 0.455f, 1.0f),
     /*accent*/ ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
     /*accent_hover*/ ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
     /*accent_active*/ ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
@@ -97,7 +100,7 @@ ImU32 ui_accent_u32(float alpha)
 
 ImU32 ui_accent_text_u32()
 {
-    return ImGui::GetColorU32(g_accent_text);
+    return ImGui::GetColorU32(g_colors.accent_text);
 }
 
 ImU32 ui_text_u32()
@@ -255,7 +258,17 @@ void ui_theme_refresh_accent()
     g_colors.accent = g_accent;
     g_colors.accent_hover = g_accent_hover;
     g_colors.accent_active = g_accent_active;
-    g_colors.accent_text = g_accent_text;
+
+    // g_accent_text is the accent lifted toward white, which is what reads
+    // well on the dark palette. On a light page that same value is far too
+    // pale for text, so day mode pulls it toward the body text colour instead.
+    // Blending on g_theme_t keeps the accent labels legible throughout the
+    // day/night crossfade.
+    const ImVec4 day_text = ImVec4(g_accent_text.x + (g_colors.text.x - g_accent_text.x) * 0.62f,
+                                   g_accent_text.y + (g_colors.text.y - g_accent_text.y) * 0.62f,
+                                   g_accent_text.z + (g_colors.text.z - g_accent_text.z) * 0.62f,
+                                   1.0f);
+    g_colors.accent_text = lerp4(g_accent_text, day_text, g_theme_t);
     g_colors.on_accent = ui_accent_is_light() ? ImVec4(0.02f, 0.02f, 0.025f, 1.0f) : ImVec4(0.98f, 0.98f, 0.99f, 1.0f);
 }
 
@@ -490,7 +503,7 @@ void ui_theme_apply(const Settings &settings, const ImGuiIO &io)
     live.Colors[ImGuiCol_TabSelectedOverline] = g_accent;
     live.Colors[ImGuiCol_TabDimmed] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     live.Colors[ImGuiCol_TabDimmedSelected] = accent_alpha(g_accent, 0.10f);
-    live.Colors[ImGuiCol_TextLink] = g_accent_text;
+    live.Colors[ImGuiCol_TextLink] = g_colors.accent_text;
     live.Colors[ImGuiCol_TextSelectedBg] = accent_alpha(g_accent, 0.30f);
     live.Colors[ImGuiCol_NavCursor] = g_accent_active;
     live.Colors[ImGuiCol_DragDropTarget] = g_accent_active;

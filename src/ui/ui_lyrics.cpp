@@ -43,11 +43,6 @@
 namespace
 {
 // App accent (daily colour, synced with dwm/dmenu).
-static const ImVec4 &kAccent = g_accent_text;
-
-// Height of the top/bottom fade overlays (also the clearance kept clear of
-// them when lyrics have no auto-centre padding).
-const float kEdgeFade = 34.0f;
 
 // Ease rate: higher settles faster. ~0.5 s to visually settle.
 const float kEaseRate = 6.0f;
@@ -523,7 +518,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
 
         if (!lx.ok)
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, g_accent_text);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui_c().accent_text);
             centered_text("Couldn't load lyrics.");
             ImGui::PopStyleColor();
             ImGui::Spacing();
@@ -579,7 +574,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
             const float remaining = ImGui::GetContentRegionAvail().y;
             const float child_h = remaining > ui_px(40.0f) ? remaining : ui_px(40.0f);
             // Clearance so the top edge fade never dims the first line.
-            const float pad = ui_px(kEdgeFade) + ui_px(6.0f);
+            const float pad = ui_px(state.settings.edge_fade_height) + ui_px(6.0f);
 
             // Zero the child's window padding so the lyrics align with the
             // header and the pad measurements stay exact.
@@ -653,7 +648,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                     ImVec4 tgt_col;
                     if (is_active)
                     {
-                        tgt_col = kAccent;
+                        tgt_col = ui_c().accent_text;
                     }
                     else
                     {
@@ -679,10 +674,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                         morphing = true;
 
                     ImVec4 col = ls.col;
-                    const float line_top = ImGui::GetCursorScreenPos().y;
-                    const float line_edge = ui_content_edge_alpha(
-                        line_top, line_top + ImGui::GetTextLineHeightWithSpacing() * 1.8f);
-                    col.w *= alpha * panel_alpha * line_edge;
+                    col.w *= alpha * panel_alpha;
 
                     float top_y = ImGui::GetCursorPosY();
                     // ImGui rounds font sizes to whole pixels, so animating
@@ -730,11 +722,8 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                 // Unsynced lyrics: a plain, evenly dimmed block (no highlight).
                 for (const auto &line : lx.lines)
                 {
-                    const float line_top = ImGui::GetCursorScreenPos().y;
-                    const float line_edge = ui_content_edge_alpha(
-                        line_top, line_top + ImGui::GetTextLineHeightWithSpacing());
                     const ImU32 ucol = ui_with_alpha(
-                        ui_text_dim_u32(), alpha * panel_alpha * 0.85f * line_edge);
+                        ui_text_dim_u32(), alpha * panel_alpha * 0.85f);
                     centered_wrapped_text(line.c_str(), ucol, 0.0f, content_w);
                 }
             }
@@ -830,6 +819,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                 ImGui::SetScrollY(g_anim.scroll_target);
             }
 
+            ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
             ImGui::EndChild();
             ImGui::PopStyleVar(); // WindowPadding
 

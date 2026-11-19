@@ -287,6 +287,7 @@ void draw_playlists_panel(AppState &state)
     ImGui::BeginChild("PlaylistList", ImVec2(left_w, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     ui_section_header("Your Library", nullptr);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(m.space_2, m.space_2));
@@ -403,8 +404,10 @@ void draw_playlists_panel(AppState &state)
                                       ImGuiWindowFlags_NoBackground |
                                           ImGuiWindowFlags_NoScrollWithMouse);
                     smooth_scroll_child();
+                    ui_scroll_top_begin();
                     for (const auto &entry : *library)
                         spotify_library_row(state, entry, list_w - m.space_2);
+                    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
                     ImGui::EndChild();
                 }
                 else
@@ -558,6 +561,7 @@ void draw_playlists_panel(AppState &state)
         ImGui::PopFont();
     }
 
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 
     const ImVec2 line_start = ImGui::GetCursorScreenPos();
@@ -569,6 +573,7 @@ void draw_playlists_panel(AppState &state)
     ImGui::BeginChild("PlaylistTracks", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     if (state.selected_playlist_index < 0 || state.selected_playlist_index >= (int)state.playlists.size())
     {
@@ -637,7 +642,7 @@ void draw_playlists_panel(AppState &state)
                                            (state.local_search_active ? ":search" : "");
             const double reveal_start = ui_anim_track_list_reveal(reveal_key.c_str(), tracks);
             const int count = (int)tracks.size();
-            const float row_pitch = ui_track_row_pitch(44.0f * m.layout_scale);
+            const float row_pitch = ui_track_row_pitch(ui_elem("list_thumb", 44.0f));
             ImGuiListClipper clipper;
             clipper.Begin(count, row_pitch);
             while (clipper.Step())
@@ -646,9 +651,10 @@ void draw_playlists_panel(AppState &state)
                 const Track &track = tracks[i];
                 TrackRowOptions opt;
                 opt.show_duration = true;
-                opt.art_size = 44.0f * m.layout_scale;
+                opt.art_size = ui_elem("list_thumb", 44.0f);
                 opt.reveal_start = reveal_start;
-                opt.reveal_index = i;
+                // Stagger from the first visible row; see ui_reveal_base().
+                opt.reveal_index = std::max(0, i - clipper.DisplayStart);
                 opt.selected = state.selected_track_ids.count(track.id) > 0;
                 opt.draggable = !state.local_search_active;
                 opt.drag_type = "P100_PLAYLIST";
@@ -710,6 +716,7 @@ void draw_playlists_panel(AppState &state)
         }
     }
 
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 
     if (delete_index >= 0)

@@ -97,6 +97,10 @@ void ui_draw_icon(ImDrawList *dl, UiIcon icon, ImVec2 c, float s, ImU32 col, flo
         dl->AddLine(p(c, s, -0.16f, -0.34f), p(c, s, 0.18f, 0.0f), col, t);
         dl->AddLine(p(c, s, 0.18f, 0.0f), p(c, s, -0.16f, 0.34f), col, t);
         break;
+    case UiIcon::ChevronUp:
+        dl->AddLine(p(c, s, -0.34f, 0.16f), p(c, s, 0.0f, -0.18f), col, t);
+        dl->AddLine(p(c, s, 0.0f, -0.18f), p(c, s, 0.34f, 0.16f), col, t);
+        break;
     case UiIcon::Play:
         dl->AddTriangleFilled(p(c, s, -0.26f, -0.40f), p(c, s, -0.26f, 0.40f), p(c, s, 0.40f, 0.0f), col);
         break;

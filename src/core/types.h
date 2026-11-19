@@ -219,6 +219,9 @@ struct Settings
     // tracks. `album_backdrop_strength` scales the glow (0.1 - 1.0).
     bool album_backdrop = false;
     float album_backdrop_strength = 0.65f;
+    // Height (logical px) of the scroll edge fades on track lists and the
+    // lyrics panel. 0 disables them.
+    float edge_fade_height = 26.0f;
     // Hero card background: 0 = off (flat card), 1 = transparent blur (frosted
     // glass), 2 = cover blur (the cover art itself, blurred). The blurred
     // texture is generated once per cover by a shader and then reused.
@@ -325,6 +328,7 @@ struct Settings
                day_mode == o.day_mode && accent_color == o.accent_color &&
                album_backdrop == o.album_backdrop &&
                album_backdrop_strength == o.album_backdrop_strength &&
+               edge_fade_height == o.edge_fade_height &&
                hero_backdrop == o.hero_backdrop &&
                hero_backdrop_strength == o.hero_backdrop_strength &&
                backdrop_shader == o.backdrop_shader &&

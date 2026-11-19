@@ -39,6 +39,10 @@ struct BackdropState
     float spin_duration = 7.0f;
     float spin_wait = 40.0f;
     bool track_pending = false; // waiting for the new cover's colour
+    // True while the tint is the app accent (nothing playing / no cover)
+    // rather than an actual album colour. Day mode uses less of it, because
+    // there is no artwork the wash can meaningfully belong to.
+    bool accent_fallback = false;
     bool use_shader = false;
     bool shader_failed = false;
     std::string last_track_id;
@@ -128,7 +132,6 @@ struct GlowSpot
 // always match what is actually on screen.
 struct BackdropParams
 {
-    bool light = false;
     float intensity = 0.0f;
     float wash = 0.0f;
     ImVec4 tint;
@@ -148,19 +151,31 @@ BackdropParams backdrop_params()
 {
     BackdropParams p;
     const float theme_light = ui_theme_progress(); // 0 = night, 1 = day
-    p.light = theme_light > 0.5f;
 
     // Night mode deliberately runs at a fraction of the day-mode intensity
     // so the pure-black OLED base is preserved. The fade-in itself is done by
     // the panel opacity (ui_backdrop_window_bg), which keeps the colour at
     // full strength and makes the crossfade linear and exact.
-    const float theme_scale = p.light ? 1.0f : 0.58f;
+    //
+    // Day mode is the opposite kind of surface: tint over white can only
+    // darken it, so the same alpha reads as tinted paper rather than as
+    // emitted light. Keep it low enough that the page stays a page, and thin
+    // it further when the tint is just the app accent (no artwork to belong to).
+    // Everything below interpolates on `theme_light` rather than switching at
+    // the midpoint, so the day/night toggle fades instead of popping.
+    const float accent_scale =
+        1.0f - (g_backdrop.accent_fallback ? 0.45f * theme_light : 0.0f);
+    const float theme_scale = (0.58f - 0.16f * theme_light) * accent_scale;
     p.intensity = g_backdrop.strength * theme_scale *
                   (1.0f + 0.38f * g_backdrop.pulse);
 
     p.tint = glow_tint(g_backdrop.color);
+    // Lift most of the way to white in day mode: the wash should read as
+    // daylight falling on the page, not as a pink sheet. The hue survives,
+    // the luminance cost does not.
+    p.tint = mix_white(p.tint, 0.52f * theme_light);
     p.tint = mix_white(p.tint, 0.06f * g_backdrop.pulse);
-    p.tint_soft = mix_white(p.tint, p.light ? 0.16f : 0.08f);
+    p.tint_soft = mix_white(p.tint, 0.08f + 0.22f * theme_light);
     p.wash = 0.22f * p.intensity;
 
     const float spin = g_backdrop.spin;
@@ -198,9 +213,10 @@ BackdropParams backdrop_params()
     place(127.8f, 0.31f, 0.40f, ImVec2(w * 0.44f, h * 0.46f), p.tint, 0.18f * p.intensity);
     place(-51.9f, 0.36f, 0.46f, ImVec2(w * 0.50f, h * 0.56f), p.tint_soft, 0.14f * p.intensity);
     place(-36.9f, 0.08f, 0.06f, ImVec2(w * 0.56f, h * 0.60f), p.tint, 0.07f * p.intensity);
-    if (p.light)
-        place(-115.5f, 0.20f, 0.42f, ImVec2(w * 0.36f, h * 0.32f),
-              mix_white(p.tint, 0.55f), 0.05f * p.intensity);
+    // The extra day-mode bloom is faded with the theme instead of appearing
+    // at the midpoint, which keeps the night->day toggle continuous.
+    place(-115.5f, 0.20f, 0.42f, ImVec2(w * 0.36f, h * 0.32f),
+          mix_white(p.tint, 0.55f), 0.05f * p.intensity * theme_light);
 
     return p;
 }
@@ -235,6 +251,64 @@ void soft_ellipse(ImDrawList *dl, const ImVec2 &center, const ImVec2 &radius,
     }
 }
 
+ImVec4 with_alpha(const ImVec4 &c, float alpha)
+{
+    return ImVec4(c.x, c.y, c.z, clampf(alpha, 0.0f, 1.0f));
+}
+
+// Straight-alpha "source over destination" for an opaque destination.
+ImVec4 blend_over(const ImVec4 &dst, const ImVec4 &src)
+{
+    const float a = clampf(src.w, 0.0f, 1.0f);
+    return ImVec4(src.x * a + dst.x * (1.0f - a),
+                  src.y * a + dst.y * (1.0f - a),
+                  src.z * a + dst.z * (1.0f - a), 1.0f);
+}
+
+// Wash colour at normalised screen coordinates, matching the bilinear corner
+// interpolation of AddRectFilledMultiColor (and the shader's mix chain).
+ImVec4 wash_color_at(const BackdropParams &p, float u, float v)
+{
+    const ImVec4 tl = with_alpha(p.tint, p.wash * p.wash_c[0]);
+    const ImVec4 tr = with_alpha(p.tint_soft, p.wash * p.wash_c[1]);
+    const ImVec4 br = with_alpha(p.tint, p.wash * p.wash_c[2]);
+    const ImVec4 bl = with_alpha(p.tint, p.wash * p.wash_c[3]);
+    const ImVec4 top = lerp4(tl, tr, u);
+    const ImVec4 bottom = lerp4(bl, br, u);
+    return lerp4(top, bottom, v);
+}
+
+// Cumulative alpha contributed by soft_ellipse() at a point. Mirrors the ring
+// construction exactly (same step count, same minimum 1/255 alpha).
+float ellipse_coverage(const ImVec2 &pt, const ImVec2 &center, const ImVec2 &radius,
+                       float peak_alpha)
+{
+    if (peak_alpha <= 0.001f || radius.x <= 0.0f || radius.y <= 0.0f)
+        return 0.0f;
+
+    const float nx = (pt.x - center.x) / radius.x;
+    const float ny = (pt.y - center.y) / radius.y;
+    const float dist = std::sqrt(nx * nx + ny * ny);
+    if (dist >= 1.0f)
+        return 0.0f;
+
+    constexpr int kSteps = 22;
+    const float alpha = std::max(peak_alpha / (float)kSteps, 1.0f / 255.0f);
+    const float t_max = std::pow(std::min(1.0f, (1.0f - dist) / 0.94f), 1.0f / 0.72f);
+    const int layers =
+        std::max(0, std::min(kSteps, (int)std::floor(t_max * (kSteps - 1) + 1.0f)));
+    if (layers <= 0)
+        return 0.0f;
+    return 1.0f - std::pow(1.0f - alpha, (float)layers);
+}
+
+// The shader path is only the active one when it compiled; a requested but
+// failed shader falls back to the stacked-ellipse look.
+bool shader_active()
+{
+    return g_backdrop.use_shader && !g_backdrop.shader_failed;
+}
+
 } // namespace
 
 float ui_backdrop_visibility()
@@ -248,6 +322,79 @@ ImVec4 ui_backdrop_window_bg()
     ImVec4 bg = ui_c().bg;
     bg.w *= 1.0f - ui_backdrop_visibility();
     return bg;
+}
+
+BackdropSampleInputs ui_backdrop_sample_inputs()
+{
+    BackdropSampleInputs in;
+    in.tint = g_backdrop.color;
+    in.visibility = ui_backdrop_visibility();
+    in.strength = g_backdrop.strength;
+    in.pulse = g_backdrop.pulse;
+    in.spin = g_backdrop.spin;
+    in.theme = ui_theme_progress();
+    in.accent_fallback = g_backdrop.accent_fallback;
+    in.shader = shader_active();
+    in.display_w = ImGui::GetIO().DisplaySize.x;
+    in.display_h = ImGui::GetIO().DisplaySize.y;
+    return in;
+}
+
+ImVec4 ui_backdrop_sample(const ImVec2 &screen_pos)
+{
+    ImVec4 base = ui_c().bg;
+    base.w = 1.0f;
+
+    const float visibility = ui_backdrop_visibility();
+    if (visibility <= 0.001f)
+        return base;
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    if (display.x <= 1.0f || display.y <= 1.0f)
+        return base;
+
+    const BackdropParams p = backdrop_params();
+    const float w = display.x;
+    const float h = display.y;
+
+    // Wash (bilinear corner interpolation, same as AddRectFilledMultiColor).
+    const float u = clampf(screen_pos.x / w, 0.0f, 1.0f);
+    const float v = clampf(screen_pos.y / h, 0.0f, 1.0f);
+    ImVec4 color = blend_over(base, wash_color_at(p, u, v));
+
+    // Blooms, in the same order they are drawn. The shader uses a continuous
+    // exponential falloff; the primitive path uses stacked ellipses. Match the
+    // active path so the fades dissolve into what is actually on screen.
+    const bool shader = shader_active();
+    for (int i = 0; i < p.spot_count; ++i)
+    {
+        float a = 0.0f;
+        if (shader)
+        {
+            const float nx = (screen_pos.x - p.spots[i].center.x) /
+                             std::max(1.0f, p.spots[i].radius.x);
+            const float ny = (screen_pos.y - p.spots[i].center.y) /
+                             std::max(1.0f, p.spots[i].radius.y);
+            const float dist = std::sqrt(nx * nx + ny * ny);
+            if (dist < 1.0f)
+            {
+                const float t = std::pow(clampf((1.0f - dist) / 0.94f, 0.0f, 1.0f),
+                                         1.0f / 0.72f);
+                a = 1.0f - std::exp(-p.spots[i].peak * t);
+            }
+        }
+        else
+        {
+            a = ellipse_coverage(screen_pos, p.spots[i].center, p.spots[i].radius,
+                                 p.spots[i].peak);
+        }
+        if (a > 0.0f)
+            color = blend_over(color, with_alpha(p.spots[i].tint, a));
+    }
+
+    // The panels fade their own background in so the backdrop becomes visible;
+    // the perceived colour is therefore the backdrop mixed in at `visibility`.
+    return lerp4(base, color, visibility);
 }
 
 void ui_backdrop_update(const AppState &state)
@@ -295,6 +442,7 @@ void ui_backdrop_update(const AppState &state)
     }
 
     bool have_target = false;
+    bool from_accent = false;
     ImVec4 desired = g_backdrop.target;
 
     // Paused / stopped: rest on the app accent instead of the cover colour,
@@ -304,12 +452,14 @@ void ui_backdrop_update(const AppState &state)
     {
         desired = g_accent;
         have_target = true;
+        from_accent = true;
     }
     else if (state.current_thumbnail_url.empty())
     {
         // Nothing loaded: use the app accent (portal / daily colour).
         desired = g_accent;
         have_target = true;
+        from_accent = true;
     }
     else
     {
@@ -320,6 +470,7 @@ void ui_backdrop_update(const AppState &state)
             // a washed-out grey haze.
             desired = cover.valid ? ImVec4(cover.r, cover.g, cover.b, 1.0f) : g_accent;
             have_target = true;
+            from_accent = !cover.valid;
         }
         // Not decoded yet: keep the previous tint. It will crossfade as soon
         // as the colour is available, which avoids a flash through the accent.
@@ -327,6 +478,7 @@ void ui_backdrop_update(const AppState &state)
 
     if (have_target)
     {
+        g_backdrop.accent_fallback = from_accent;
         if (color_distance(desired, g_backdrop.target) > 0.006f)
         {
             g_backdrop.target = desired;

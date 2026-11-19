@@ -385,6 +385,7 @@ void draw_albums_panel(AppState &state)
     ImGui::BeginChild("SavedAlbumsScroll", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     const float gap = m.card_gap;
     const float available = ImGui::GetContentRegionAvail().x;
@@ -436,6 +437,7 @@ void draw_albums_panel(AppState &state)
     }
 
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 
     if (remove_index >= 0 && remove_index < (int)state.saved_albums.size())
@@ -606,6 +608,7 @@ void draw_album_panel(AppState &state)
     ImGui::BeginChild("AlbumTracks", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     if (state.album_tracks.empty())
     {
@@ -628,13 +631,14 @@ void draw_album_panel(AppState &state)
         }
         else
             ui_empty_state(UiIcon::Album, "No playable tracks", "This album has no tracks available");
+        ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
         ImGui::EndChild();
         return;
     }
 
     const std::string reveal_key = std::string("album:") + state.album_browse_id;
     const double reveal_start = ui_anim_track_list_reveal(reveal_key.c_str(), state.album_tracks);
-    const float row_pitch = ui_track_row_pitch(44.0f * m.layout_scale);
+    const float row_pitch = ui_track_row_pitch(ui_elem("list_thumb", 44.0f));
     ImGuiListClipper clipper;
     clipper.Begin((int)state.album_tracks.size(), row_pitch);
     while (clipper.Step())
@@ -644,9 +648,10 @@ void draw_album_panel(AppState &state)
         opt.show_rank = true;
         opt.rank = state.album_tracks[i].track_number > 0 ? state.album_tracks[i].track_number : i + 1;
         opt.show_duration = true;
-        opt.art_size = 44.0f * m.layout_scale;
+        opt.art_size = ui_elem("list_thumb", 44.0f);
         opt.reveal_start = reveal_start;
-        opt.reveal_index = i;
+        // Stagger from the first visible row; see ui_reveal_base().
+        opt.reveal_index = std::max(0, i - clipper.DisplayStart);
         Track row = state.album_tracks[i];
         // Album tracks from the backend carry no per-track art, so use the
         // album cover for every row (and keep it even if a stale per-track
@@ -656,5 +661,6 @@ void draw_album_panel(AppState &state)
         ui_track_row(state, row, i, opt);
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 }

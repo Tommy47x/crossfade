@@ -18,6 +18,7 @@ enum class UiIcon
     Close,
     ChevronLeft,
     ChevronRight,
+    ChevronUp,
     Play,
     Pause,
     Prev,

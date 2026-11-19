@@ -152,6 +152,7 @@ void draw_youtube_panel(AppState &state)
     ImGui::BeginChild("YTPlaylistList", ImVec2(left_w, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     ui_section_header("Your YouTube Playlists", nullptr);
     for (int i = 0; i < (int)state.youtube_playlists.size(); ++i)
@@ -212,12 +213,14 @@ void draw_youtube_panel(AppState &state)
         }
     }
 
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 
     ImGui::SameLine(0.0f, gap);
     ImGui::BeginChild("YTPlaylistTracks", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     if (selected < 0 || selected >= (int)state.youtube_playlists.size())
     {
@@ -362,7 +365,7 @@ void draw_youtube_panel(AppState &state)
             else
             {
                 const double reveal_start = ui_anim_track_list_reveal("yt_playlist", *tracks);
-                const float row_pitch = ui_track_row_pitch(44.0f * m.layout_scale);
+                const float row_pitch = ui_track_row_pitch(ui_elem("list_thumb", 44.0f));
                 ImGuiListClipper clipper;
                 clipper.Begin(count, row_pitch);
                 while (clipper.Step())
@@ -371,13 +374,14 @@ void draw_youtube_panel(AppState &state)
                     const Track &track = (*tracks)[i];
                     TrackRowOptions opt;
                     opt.show_duration = true;
-                    opt.art_size = 44.0f * m.layout_scale;
+                    opt.art_size = ui_elem("list_thumb", 44.0f);
                     // This view plays on single click; keep row-internal
                     // (double-click / touch-tap) playback off so a touch tap
                     // can't fire ui_play_track twice.
                     opt.auto_play_double_click = false;
                     opt.reveal_start = reveal_start;
-                    opt.reveal_index = i;
+                    // Stagger from the first visible row; see ui_reveal_base().
+                    opt.reveal_index = std::max(0, i - clipper.DisplayStart);
                     TrackRowResult row = ui_track_row(state, track, i, opt);
                     if (row.clicked && !row.ctrl_clicked && !row.shift_clicked)
                     {
@@ -390,5 +394,6 @@ void draw_youtube_panel(AppState &state)
     }
 
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 }

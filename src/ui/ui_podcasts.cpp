@@ -663,18 +663,26 @@ void draw_podcasts_panel(AppState &state)
         const uint64_t token = (uint64_t)std::hash<std::string>{}(show.browse_id);
         double reveal = ui_anim_track_list_reveal(("podcast_show:" + show.browse_id).c_str(),
                                                   state.podcast_tracks, token);
-        const double gate = s_show_start + (double)ui_anim_delay(0.18f);
-        if (gate > reveal)
-            reveal = gate;
+        // Stagger from the first visible row; see ui_reveal_base().
+        const int reveal_base = ui_reveal_base(
+            ImGui::GetCursorScreenPos().y, ui_track_row_pitch(ui_elem("list_thumb", 52.0f)));
+        // Only delay the list behind the show intro while it is below the
+        // fold; a scrolled-back show should show its episodes immediately.
+        if (ImGui::GetScrollY() <= 1.0f)
+        {
+            const double gate = s_show_start + (double)ui_anim_delay(0.18f);
+            if (gate > reveal)
+                reveal = gate;
+        }
         for (int i = 0; i < (int)state.podcast_tracks.size(); ++i)
         {
             TrackRowOptions opt;
             opt.show_duration = true;
             opt.show_download = true;
             opt.secondary = (*episodes)[i].date;
-            opt.art_size = 52.0f * m.layout_scale;
+            opt.art_size = ui_elem("list_thumb", 52.0f);
             opt.reveal_start = reveal;
-            opt.reveal_index = i;
+            opt.reveal_index = std::max(0, i - reveal_base);
             TrackRowResult row = ui_track_row(state, state.podcast_tracks[i], i, opt);
             if (row.download_requested)
             {
@@ -756,17 +764,23 @@ void draw_podcasts_panel(AppState &state)
         auto tracks = tracks_for(none, *later);
         const uint64_t token = (uint64_t)(uintptr_t)later.get();
         double reveal = ui_anim_track_list_reveal("podcast_later", tracks, token);
-        const double gate = s_start + (double)ui_anim_delay(0.30f);
-        if (gate > reveal)
-            reveal = gate;
+        // Stagger from the first visible row; see ui_reveal_base().
+        const int reveal_base = ui_reveal_base(
+            ImGui::GetCursorScreenPos().y, ui_track_row_pitch(ui_elem("list_thumb", 52.0f)));
+        if (ImGui::GetScrollY() <= 1.0f)
+        {
+            const double gate = s_start + (double)ui_anim_delay(0.30f);
+            if (gate > reveal)
+                reveal = gate;
+        }
         for (int i = 0; i < (int)tracks.size(); ++i)
         {
             TrackRowOptions opt;
             opt.show_duration = true;
             opt.secondary = (*later)[i].date;
-            opt.art_size = 52.0f * m.layout_scale;
+            opt.art_size = ui_elem("list_thumb", 52.0f);
             opt.reveal_start = reveal;
-            opt.reveal_index = i;
+            opt.reveal_index = std::max(0, i - reveal_base);
             TrackRowResult row = ui_track_row(state, tracks[i], i, opt);
             if (row.double_clicked)
                 play_list(state, tracks, i);

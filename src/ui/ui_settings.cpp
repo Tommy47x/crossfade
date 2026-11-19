@@ -129,6 +129,8 @@ const std::vector<UiElementDef> &ui_element_defs()
     static const std::vector<UiElementDef> defs = {
         {"list_thumb", "Track thumbnails"},
         {"list_row", "Track row spacing"},
+        {"list_title", "Song title size"},
+        {"list_meta", "Artist & detail size"},
         {"bottom_art", "Bottom album cover"},
         {"bottom_controls", "Bottom transport controls"},
         {"bottom_seekvol", "Seek & volume bars"},
@@ -179,6 +181,7 @@ void save_settings(const Settings &settings)
         << "\"accent_color\":\"" << json_escape(settings.accent_color) << "\","
         << "\"album_backdrop\":" << (settings.album_backdrop ? "true" : "false") << ","
         << "\"album_backdrop_strength\":" << settings.album_backdrop_strength << ","
+        << "\"edge_fade_height\":" << settings.edge_fade_height << ","
         << "\"hero_backdrop\":" << settings.hero_backdrop << ","
         << "\"hero_backdrop_strength\":" << settings.hero_backdrop_strength << ","
         << "\"backdrop_shader\":" << (settings.backdrop_shader ? "true" : "false") << ","
@@ -452,6 +455,8 @@ Settings load_settings()
             if (v > 0.0f)
                 s.album_backdrop_strength = std::max(0.10f, std::min(1.0f, v));
         }
+        if (json.find("\"edge_fade_height\"") != std::string::npos)
+            s.edge_fade_height = std::max(0.0f, std::min(80.0f, get_float("edge_fade_height")));
         if (json.find("\"backdrop_shader\"") != std::string::npos)
             s.backdrop_shader = get_bool("backdrop_shader");
         if (json.find("\"warm_start\"") != std::string::npos)
@@ -1579,6 +1584,10 @@ void draw_settings_panel(AppState &state)
                                         "One full-screen shader pass with subtle dithering. Removes the colour steps OLED panels expose."))
                     save = true;
             }
+            if (settings_slider_row("##edge_fade_height", "List edge fade",
+                                    &state.settings.edge_fade_height, 0.0f, 80.0f, "%.0f",
+                                    "Height of the soft gradient that fades track lists and lyrics into the background at the top and bottom. 0 turns it off."))
+                save = true;
             {
                 const char *hero_modes[] = {"Off", "Transparent blur", "Cover blur"};
                 int hero_mode = std::max(0, std::min(2, state.settings.hero_backdrop));

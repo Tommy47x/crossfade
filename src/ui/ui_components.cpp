@@ -516,12 +516,26 @@ float ui_track_row_pitch(float art_size, bool compact)
 {
     const UiMetrics &m = ui_m();
     const float art = art_size > 0.0f ? art_size : ui_elem("list_thumb", compact ? 40.0f : 48.0f);
-    const float title_line = (compact ? 21.0f : 24.0f) * m.text_scale * 1.22f;
-    const float meta_line = (compact ? 16.5f : 18.0f) * m.text_scale * 1.24f;
+    const float title_base = (compact ? 21.0f : 24.0f) * ui_elem_mult("list_title");
+    const float meta_base = (compact ? 16.5f : 18.0f) * ui_elem_mult("list_meta");
+    const float title_line = title_base * m.text_scale * 1.22f;
+    const float meta_line = meta_base * m.text_scale * 1.24f;
     const float row_scale = ui_elem("list_row", 1.0f);
     const float pad_y = (compact ? m.space_1 : m.row_pad_y) * row_scale;
     const float row_h = std::max(art, title_line + m.space_1 + meta_line) + pad_y * 2.0f;
     return row_h + ImGui::GetStyle().ItemSpacing.y;
+}
+
+int ui_reveal_base(float list_top_screen_y, float row_pitch)
+{
+    if (!(row_pitch > 1.0f))
+        return 0;
+    // The draw list's clip rect is the visible viewport of the scroll child.
+    // Rows whose bottom sits above it are fully scrolled out.
+    const float clip_top = ImGui::GetWindowDrawList()->GetClipRectMin().y;
+    if (clip_top <= list_top_screen_y)
+        return 0;
+    return (int)std::floor((clip_top - list_top_screen_y) / row_pitch);
 }
 
 
@@ -768,8 +782,8 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     }
 
     const float base_art = opt.art_size > 0.0f ? opt.art_size : ui_elem("list_thumb", opt.compact ? 40.0f : 48.0f);
-    const float title_base = opt.compact ? 21.0f : 24.0f;
-    const float meta_base = opt.compact ? 16.5f : 18.0f;
+    const float title_base = (opt.compact ? 21.0f : 24.0f) * ui_elem_mult("list_title");
+    const float meta_base = (opt.compact ? 16.5f : 18.0f) * ui_elem_mult("list_meta");
     const float title_line = title_base * m.text_scale * 1.22f;
     const float meta_line = meta_base * m.text_scale * 1.24f;
     const float row_scale = ui_elem("list_row", 1.0f);
@@ -813,7 +827,7 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
     double reveal_start = opt.reveal_start;
     bool stagger_reveal = true;
     int stagger_index = opt.reveal_index;
-    if (ui_animations_enabled() &&
+    if (ui_animations_enabled() && !ui_scroll_top_animating() &&
         ImGui::IsRectVisible(ImVec2(row_x, row_y), ImVec2(row_x + full_w, row_y + row_h)))
     {
         int scroll_order = 0;
@@ -841,9 +855,9 @@ TrackRowResult ui_track_row(AppState &state, const Track &track, int index, cons
             ui_anim_request();
     }
     const float slide = (1.0f - appear) * ui_anim_offset(ui_px(7.0f));
-    // Fade the row itself at a scroll edge; this leaves the backdrop untouched
-    // instead of painting a sampled background band over it.
-    appear *= ui_content_edge_alpha(row_y, row_y + row_h);
+    // Scroll edges are handled by ui_draw_scroll_edge_fades(), which paints a
+    // backdrop-matched gradient over the viewport; the row itself stays at
+    // full opacity so nothing shows through it.
     const float draw_y = row_y + slide;
 
     ImGui::SetCursorScreenPos(ImVec2(row_x, row_y));
@@ -1078,9 +1092,9 @@ void ui_glow_separator(float width)
             tint.z += (1.0f - tint.z) * 0.16f;
         }
 
-        // Day mode runs a little softer: a saturated bloom over a light
-        // surface reads heavier than the same alpha over black.
-        const float theme_scale = light ? 0.80f : 0.74f;
+        // Day mode runs softer still: a saturated bloom over a light surface
+        // reads heavier than the same alpha over black.
+        const float theme_scale = light ? 0.52f : 0.74f;
         // Cumulative alpha at the core of the bloom, and on the crisp line.
         const float glow_peak = clampf(0.55f * level, 0.0f, 0.90f) * theme_scale;
         const float core_a = clampf(0.90f * level, 0.0f, 0.95f) * theme_scale;
@@ -1401,8 +1415,9 @@ MediaCardResult ui_media_card(const char *id, const std::string &title, const st
     const float caption_h = title_h + (meta.empty() ? 0.0f : m.space_1 + meta_h);
     const float card_h = art_size + m.space_3 + caption_h + m.space_2;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
-    const float edge_alpha = ui_content_edge_alpha(pos.y, pos.y + card_h) *
-                             std::max(0.0f, std::min(1.0f, alpha));
+    // The scroll edge is faded by ui_draw_scroll_edge_fades(); the card keeps
+    // full opacity and only its reveal alpha applies.
+    const float card_alpha = std::max(0.0f, std::min(1.0f, alpha));
 
     ImGui::InvisibleButton(id, ImVec2(width, card_h),
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
@@ -1418,18 +1433,18 @@ MediaCardResult ui_media_card(const char *id, const std::string &title, const st
     if (r.hovered || current)
         dl->AddRectFilled(ImVec2(pos.x - m.space_1, pos.y - m.space_1),
                           ImVec2(pos.x + width + m.space_1, pos.y + card_h + m.space_1),
-                          current ? ui_accent_u32(0.13f * edge_alpha)
-                                  : ui_overlay_u32(0.045f * edge_alpha), m.radius_md);
-    draw_art(dl, thumb_url, amin, amax, m.radius_md, circular, edge_alpha);
+                          current ? ui_accent_u32(0.13f * card_alpha)
+                                  : ui_overlay_u32(0.045f * card_alpha), m.radius_md);
+    draw_art(dl, thumb_url, amin, amax, m.radius_md, circular, card_alpha);
     if (r.hovered)
     {
-        const ImU32 scrim = IM_COL32(0, 0, 0, (int)(110.0f * edge_alpha));
+        const ImU32 scrim = IM_COL32(0, 0, 0, (int)(110.0f * card_alpha));
         if (circular)
             dl->AddCircleFilled(ImVec2((amin.x + amax.x) * 0.5f, (amin.y + amax.y) * 0.5f), art_size * 0.5f, scrim, 48);
         else
             dl->AddRectFilled(amin, amax, scrim, m.radius_md);
         ui_draw_icon(dl, UiIcon::Play, ImVec2((amin.x + amax.x) * 0.5f, (amin.y + amax.y) * 0.5f),
-                     art_size * 0.24f, ui_with_alpha(IM_COL32_WHITE, edge_alpha), 1.5f);
+                     art_size * 0.24f, ui_with_alpha(IM_COL32_WHITE, card_alpha), 1.5f);
     }
 
     const float tx = pos.x;
@@ -1439,11 +1454,11 @@ MediaCardResult ui_media_card(const char *id, const std::string &title, const st
     std::string md = ui_ellipsize(g_ui_fonts.body, meta_base, meta, tw);
     dl->PushClipRect(ImVec2(tx, title_y), ImVec2(tx + tw, title_y + caption_h), true);
     dl->AddText(g_ui_fonts.medium, title_base * m.text_scale, ImVec2(tx, title_y),
-                ui_with_alpha(current ? ui_accent_text_u32() : ui_text_u32(), edge_alpha),
+                ui_with_alpha(current ? ui_accent_text_u32() : ui_text_u32(), card_alpha),
                 td.c_str());
     if (!meta.empty())
         dl->AddText(g_ui_fonts.body, meta_base * m.text_scale, ImVec2(tx, title_y + title_h + m.space_1),
-                    ui_with_alpha(ui_text_dim_u32(), edge_alpha), md.c_str());
+                    ui_with_alpha(ui_text_dim_u32(), card_alpha), md.c_str());
     dl->PopClipRect();
 
     ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + card_h + m.card_gap));

@@ -599,6 +599,7 @@ void draw_artists_panel(AppState &state)
     ImGui::BeginChild("ArtistsScroll", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     const float gap = m.card_gap;
     const float available = ImGui::GetContentRegionAvail().x;
@@ -652,6 +653,7 @@ void draw_artists_panel(AppState &state)
     }
 
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 }
 
@@ -730,6 +732,7 @@ void draw_artist_panel(AppState &state)
     ImGui::BeginChild("ArtistBody", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     if (!state.artist_description.empty())
     {
@@ -772,7 +775,7 @@ void draw_artist_panel(AppState &state)
     {
         const std::string reveal_key = std::string("artist:") + state.artist_browse_id;
         const ArtistSongReveal reveal = artist_song_reveal(reveal_key, state.artist_songs);
-        const float row_pitch = ui_track_row_pitch(44.0f * m.layout_scale);
+        const float row_pitch = ui_track_row_pitch(ui_elem("list_thumb", 44.0f));
         const float list_start_y = ImGui::GetCursorPosY();
         ImGuiListClipper clipper;
         clipper.Begin((int)state.artist_songs.size(), row_pitch);
@@ -783,11 +786,13 @@ void draw_artist_panel(AppState &state)
             opt.show_rank = true;
             opt.rank = i + 1;
             opt.show_duration = true;
-            opt.art_size = 44.0f * m.layout_scale;
+            opt.art_size = ui_elem("list_thumb", 44.0f);
             // Rows that were already on screen keep their finished reveal;
             // only the freshly appended five get a new, staggered start.
             double row_reveal = reveal.start;
-            int row_reveal_index = i;
+            // Stagger from the first visible row; the appended tail keeps its
+            // own per-step start (see above), so its index stays 0.
+            int row_reveal_index = std::max(0, i - clipper.DisplayStart);
             if (reveal.append_start > 0.0 && i >= reveal.append_from)
             {
                 const int step = i - reveal.append_from;
@@ -887,5 +892,6 @@ void draw_artist_panel(AppState &state)
     }
 
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
 }

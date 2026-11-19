@@ -713,6 +713,9 @@ void draw_stats_panel(AppState &state)
                                    std::to_string(state.stats_week_offset);
     const double reveal_start = ui_anim_track_list_reveal(
         reveal_key.c_str(), st.tracks, (uint64_t)(st.anim_start * 1000.0));
+    // Stagger from the first visible row; see ui_reveal_base().
+    const int reveal_base = ui_reveal_base(ImGui::GetCursorScreenPos().y,
+                                           ui_track_row_pitch(ui_elem("list_thumb", 44.0f)));
     for (int i = 0; i < list_size; ++i)
     {
         TrackRowOptions opt;
@@ -720,12 +723,12 @@ void draw_stats_panel(AppState &state)
         opt.rank = i + 1;
         opt.show_duration = false;
         opt.show_plays = false;
-        opt.art_size = 44.0f * m.layout_scale;
+        opt.art_size = ui_elem("list_thumb", 44.0f);
         // This view plays on single click; see the matching note in
         // ui_youtube.cpp -- avoid a second play path for touch taps.
         opt.auto_play_double_click = false;
         opt.reveal_start = reveal_start;
-        opt.reveal_index = i;
+        opt.reveal_index = std::max(0, i - reveal_base);
         opt.right_text = std::to_string(st.plays[i]) + (st.plays[i] == 1 ? " play" : " plays");
         opt.progress = max_plays > 0 ? (float)st.plays[i] / (float)max_plays : 0.0f;
         TrackRowResult row = ui_track_row(state, st.tracks[i], i, opt);

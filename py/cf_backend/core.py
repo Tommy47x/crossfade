@@ -2467,8 +2467,7 @@ def get_video_urls(video_id, fresh=False, max_height=720, fast=False):
         pair = {'video': video}
         if audio:
             pair['audio'] = audio
-        if _url_playable(video, timeout=3.0 if fast else 8.0,
-                         attempts=1 if fast else 2):
+        if _url_playable(video, timeout=3.0 if fast else 4.0, attempts=1):
             _video_stream_cache[cache_key] = (time.time(), pair)
             _save_video_stream_disk()
             return dict(pair)

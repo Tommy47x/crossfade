@@ -505,7 +505,7 @@ static void draw_radio_skeleton(const UiMetrics &m, float avail, double now)
 {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const float art = 46.0f * m.layout_scale;
+    const float art = ui_elem("list_thumb", 46.0f);
     const float title_line = 21.0f * m.text_scale * 1.22f;
     const float meta_line = 16.0f * m.text_scale * 1.24f;
     const float row_h = std::max(art, title_line + m.space_1 + meta_line) + m.row_pad_y * 2.0f;
@@ -981,11 +981,24 @@ void draw_radio_panel(AppState &state)
         const std::string reveal_key = "radio:" + state.radio_seed_id;
         const uint64_t token = (uint64_t)std::hash<std::string>{}(state.radio_seed_id);
         double reveal_start = ui_anim_track_list_reveal(reveal_key.c_str(), *tracks, token);
-        const double seed_gate = s_start + (double)ui_anim_delay(seed_done_base);
-        if (seed_gate > reveal_start)
+
+        // Stagger from the first visible row. With the absolute index, a
+        // scrolled station made every visible row wait out the full stagger
+        // before appearing (see ui_reveal_base()).
+        const int reveal_base = ui_reveal_base(
+            ImGui::GetCursorScreenPos().y, ui_track_row_pitch(ui_elem("list_thumb", 46.0f)));
+
+        // The seed-card intro gate only applies while the station is below the
+        // fold. Returning to a station that is already scrolled down must show
+        // its tracks immediately instead of waiting out the hero animation.
+        if (ImGui::GetScrollY() <= 1.0f)
         {
-            reveal_start = seed_gate;
-            ui_anim_request();
+            const double seed_gate = s_start + (double)ui_anim_delay(seed_done_base);
+            if (seed_gate > reveal_start)
+            {
+                reveal_start = seed_gate;
+                ui_anim_request();
+            }
         }
 
         for (int i = 0; i < (int)tracks->size(); ++i)
@@ -995,9 +1008,9 @@ void draw_radio_panel(AppState &state)
             opt.show_rank = true;
             opt.rank = i + 1;
             opt.show_duration = true;
-            opt.art_size = 46.0f * m.layout_scale;
+            opt.art_size = ui_elem("list_thumb", 46.0f);
             opt.reveal_start = reveal_start;
-            opt.reveal_index = i;
+            opt.reveal_index = std::max(0, i - reveal_base);
             opt.auto_play_double_click = false;
             TrackRowResult row = ui_track_row(state, track, i, opt);
             if (row.clicked && !row.double_clicked && !row.ctrl_clicked && !row.shift_clicked)

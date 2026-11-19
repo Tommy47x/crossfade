@@ -25,6 +25,31 @@ void ui_backdrop_draw();
 // dithered before 8-bit output, removing the bands OLED panels expose.
 void ui_backdrop_render_shader();
 
+// Inputs that fully determine the sampled backdrop colour. The list edge
+// fades compare two of these to skip re-sampling a still backdrop.
+struct BackdropSampleInputs
+{
+    ImVec4 tint = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+    float visibility = 0.0f;
+    float strength = 0.0f;
+    float pulse = 0.0f;
+    float spin = 0.0f;
+    float theme = 0.0f;
+    float display_w = 0.0f;
+    float display_h = 0.0f;
+    bool accent_fallback = false;
+    bool shader = false;
+};
+
+// Snapshot of the animation state that feeds ui_backdrop_sample().
+BackdropSampleInputs ui_backdrop_sample_inputs();
+
+// Visible background colour at a screen position: the wash and blooms
+// composited at the current visibility over the base surface. Mirrors both the
+// primitive and the shader draw paths, so anything painted with it (list edge
+// fades) dissolves into the real backdrop without a seam.
+ImVec4 ui_backdrop_sample(const ImVec2 &screen_pos);
+
 // 0 = fully hidden (panels opaque), 1 = fully visible (panels transparent).
 float ui_backdrop_visibility();
 

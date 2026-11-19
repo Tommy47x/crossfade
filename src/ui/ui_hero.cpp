@@ -8,6 +8,17 @@
 #include <algorithm>
 #include <cmath>
 
+namespace
+{
+ImVec4 mix4(const ImVec4 &a, const ImVec4 &b, float t)
+{
+    return ImVec4(a.x + (b.x - a.x) * t,
+                  a.y + (b.y - a.y) * t,
+                  a.z + (b.z - a.z) * t,
+                  a.w + (b.w - a.w) * t);
+}
+} // namespace
+
 int ui_hero(const std::string &eyebrow, const std::string &title,
             const std::string &subtitle, const std::string &art_url,
             UiIcon fallback, const char *art_scope,
@@ -53,15 +64,25 @@ int ui_hero(const std::string &eyebrow, const std::string &title,
     const ImVec2 card_min = C(origin);
     const ImVec2 card_max = C(ImVec2(origin.x + avail, origin.y + hero_h));
     const float strength = std::max(0.0f, std::min(1.0f, backdrop_strength));
+    const float day = ui_theme_progress(); // 0 = night, 1 = day
 
     if (backdrop_style == 1 && !power::low_power())
     {
         // Frosted glass: no cover image at all. The page's ambient backdrop
-        // shows through a slightly tinted, lightly darkened pane, so this
-        // reads as "blurred background" without any per-frame shader work.
+        // shows through a slightly tinted pane, so this reads as "blurred
+        // background" without any per-frame shader work.
+        //
+        // At night the pane is a dark tint that keeps the white text loud. In
+        // day mode that same pane turns into a grey slab over a light page, so
+        // it becomes a white veil instead and the tint supplies the colour.
         const ImVec4 tint = ui_backdrop_tint();
+        const ImVec4 pane_rgb = mix4(ImVec4(0.071f, 0.071f, 0.086f, 1.0f),
+                                      ui_c().surface, day);
+        const float pane_a = (0.16f + 0.10f * strength) * (1.0f - day) +
+                             (0.52f + 0.18f * strength) * day;
         dl->AddRectFilled(card_min, card_max,
-                          IM_COL32(18, 18, 22, (int)((0.16f + 0.10f * strength) * hero_t * 255.0f)),
+                          ImGui::GetColorU32(ImVec4(pane_rgb.x, pane_rgb.y, pane_rgb.z,
+                                                    pane_a * hero_t)),
                           m.radius_lg);
         dl->AddRectFilled(card_min, card_max,
                           ImGui::GetColorU32(ImVec4(tint.x, tint.y, tint.z,
@@ -81,12 +102,17 @@ int ui_hero(const std::string &eyebrow, const std::string &title,
         const GLuint blur = ui_hero_blur_texture(art_url);
         int bw = 0, bh = 0;
         const bool have_size = blur != 0 && ui_hero_blur_size(art_url, bw, bh);
+        const ImVec4 card_base = mix4(ui_c().surface_hover, ui_c().surface, day);
         if (have_size)
         {
             dl->AddRectFilled(card_min, card_max,
-                              ui_with_alpha(ui_col(ui_c().surface_hover), hero_t), m.radius_lg);
-            const float image_a = 0.85f * strength * hero_t;
-            const float scrim_a = 0.20f * strength * hero_t;
+                              ui_with_alpha(ui_col(card_base), hero_t), m.radius_lg);
+            // Day mode keeps the cover as a pale watercolour: a lower image
+            // alpha plus a white veil, so dark artwork cannot turn the hero
+            // into a black slab with black text on it.
+            const float image_a = (0.85f - 0.43f * day) * strength * hero_t;
+            const float scrim_a = 0.20f * (1.0f - day) * strength * hero_t;
+            const float veil_a = 0.50f * day * strength * hero_t;
             float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
             const TextureInfo info{blur, bw, bh};
             const ImVec2 box(card_max.x - card_min.x, card_max.y - card_min.y);
@@ -102,11 +128,14 @@ int ui_hero(const std::string &eyebrow, const std::string &title,
             if (scrim_a > 0.002f)
                 dl->AddRectFilled(card_min, card_max,
                                   IM_COL32(0, 0, 0, (int)(scrim_a * 255.0f)), m.radius_lg);
+            if (veil_a > 0.002f)
+                dl->AddRectFilled(card_min, card_max,
+                                  IM_COL32(255, 255, 255, (int)(veil_a * 255.0f)), m.radius_lg);
         }
         else
         {
             dl->AddRectFilled(card_min, card_max,
-                              ui_with_alpha(ui_col(ui_c().surface_hover), hero_t), m.radius_lg);
+                              ui_with_alpha(ui_col(card_base), hero_t), m.radius_lg);
         }
     }
     else

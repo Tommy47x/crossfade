@@ -589,6 +589,7 @@ static std::string g_video_retained_id;
 struct VideoResolveResult
 {
     std::string id;
+    std::string stream_id; // id whose stream was resolved (own or matched)
     std::string video;
     std::string audio;
     std::string error;
@@ -600,6 +601,7 @@ struct VideoResolveResult
     // video resolves) and a later hot-swap onto the matched video.
     bool interim = false;
     bool replace = false;
+    bool retry_failed = false;
     double sync_offset = 0.0;
     bool sync_confident = false;
     std::uint64_t gen = 0;
@@ -607,6 +609,18 @@ struct VideoResolveResult
 static std::mutex g_video_result_mutex;
 static std::shared_ptr<const VideoResolveResult> g_video_result;
 static std::uint64_t g_video_request_gen = 0;
+// Fresh-resolve retry state for a stream that fails to load (typically an
+// expired/revoked googlevideo URL).
+static std::string g_video_stream_id;
+static int g_video_height = 720;
+static bool g_video_fresh_tried = false;
+static std::shared_ptr<const VideoResolveResult> g_video_last_result;
+// When the current file started loading; a stream that never reaches
+// FILE_LOADED (silent 403/stall) is treated as a failure after a few seconds.
+static std::chrono::steady_clock::time_point g_video_load_at{};
+// The background fresh-resolve is bounded: the full client walk can otherwise
+// take minutes, leaving the page loading forever.
+static std::chrono::steady_clock::time_point g_video_retry_deadline{};
 // A/V offset computed after the video has already started.
 struct VideoSyncMsg
 {
@@ -623,7 +637,11 @@ static void video_target_event(const std::string &event)
 {
     DLOG("video: event '%s'", event.c_str());
     if (event == "loaded")
+    {
         g_video_file_loaded = true;
+        g_video_load_at = {};
+        g_video_retry_deadline = {};
+    }
     else if (event.rfind("error", 0) == 0 || event == "end" || event == "stop")
         g_video_target_failed = true;
 }
@@ -693,6 +711,9 @@ void begin_video_playback()
     g_video_retained_id.clear();
     g_video_sync_offset = 0.0;
     g_video_ready_at = {};
+    g_video_fresh_tried = false;
+    g_video_stream_id.clear();
+    g_video_last_result.reset();
 
     // Free the idle player: an in-flight audio crossfade uses the helper.
     settle_inflight_crossfade();
@@ -762,6 +783,7 @@ void begin_video_playback()
     else if (g_state.settings.video_quality == 2)
         height = (int)ImGui::GetIO().DisplaySize.y;
     height = std::clamp(height, 360, 1080);
+    g_video_height = height;
     const std::string track_title = g_state.current_title;
     const std::string track_artist = g_state.current_artist;
     MpvPlayer *audible_now = display_player();
@@ -790,6 +812,7 @@ void begin_video_playback()
                                bool is_interim, bool is_replace) {
             auto res = std::make_shared<VideoResolveResult>();
             res->id = id;
+            res->stream_id = stream_id;
             res->gen = gen;
             res->video = urls.video;
             res->audio = urls.audio;
@@ -895,13 +918,21 @@ void video_preload_poll()
     }
     if (result->video.empty())
     {
-        // The interim upload may still be on screen; keep it rather than
-        // tearing down a working video.
-        if (!g_state.video_active)
+        if (result->retry_failed && g_state.video_active)
+        {
+            ui_notify(UiNotifyType::Warning, "Video unavailable",
+                      "Playing the audio only.", 4.0f);
+            end_video_playback();
+        }
+        else if (!g_state.video_active)
+        {
             cancel_video_resolve(true);
+        }
         return;
     }
 
+    g_video_stream_id = result->stream_id;
+    g_video_last_result = result;
     const bool hot = result->replace && g_state.video_active;
     DLOG("video: resolved (%s, sync %s %.2fs%s)",
          result->self_video ? "already a video"
@@ -918,6 +949,7 @@ void video_preload_poll()
                                  : "No music video match - showing this track's own video.";
 
     g_video_target->play_video(result->video);
+    g_video_load_at = std::chrono::steady_clock::now();
     g_video_target->set_paused(!g_state.playing.load());
     if (hot)
     {
@@ -932,6 +964,40 @@ void video_preload_poll()
 }
 
 
+// One retry after a stream-load failure, bypassing all URL caches. URLs are
+// short-lived; a URL that resolved last night can 403 in the morning.
+static bool retry_video_stream()
+{
+    if (g_video_fresh_tried || g_video_stream_id.empty() || !g_video_last_result)
+        return false;
+    g_video_fresh_tried = true;
+    g_video_target_failed = false;
+    g_video_retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    auto base = g_video_last_result;
+    const std::string sid = g_video_stream_id;
+    const int h = g_video_height;
+    const std::uint64_t gen = g_video_request_gen;
+    DLOG("video: fresh re-resolve after a load failure (%s)", sid.c_str());
+    tasks::spawn("video-retry", [base, sid, h, gen]()
+    {
+        VideoStreamUrls urls = fetch_video_stream_urls(sid, true, h, false);
+        auto res = std::make_shared<VideoResolveResult>(*base);
+        res->gen = gen;
+        res->video = std::move(urls.video);
+        res->audio = std::move(urls.audio);
+        res->error = std::move(urls.error);
+        res->replace = true;
+        res->retry_failed = res->video.empty();
+        {
+            std::lock_guard<std::mutex> lock(g_video_result_mutex);
+            if (!g_video_result || g_video_result->gen <= gen)
+                g_video_result = std::move(res);
+        }
+        g_state.repaint_requested = true;
+    });
+    return true;
+}
+
 // Called once per frame while a preload is in flight, after the surface has
 // tried to render a frame. Shows the page once a real, aligned frame exists.
 void video_preload_tick(bool have_frame)
@@ -940,14 +1006,33 @@ void video_preload_tick(bool have_frame)
         return;
     if (g_video_target_failed)
     {
-        cancel_video_resolve(true);
+        if (!retry_video_stream())
+            cancel_video_resolve(true);
         return;
     }
     g_video_target->set_paused(!g_state.playing.load());
     if (!g_video_file_loaded)
     {
-        if (std::chrono::steady_clock::now() - g_video_requested_at >
-            std::chrono::seconds(30))
+        const auto now = std::chrono::steady_clock::now();
+        if (g_video_retry_deadline != std::chrono::steady_clock::time_point{} &&
+            now > g_video_retry_deadline)
+        {
+            g_video_retry_deadline = {};
+            DLOG("video: retry timed out");
+            cancel_video_resolve(true);
+            return;
+        }
+        // A stream that never reports FILE_LOADED (mpv opened it, then the
+        // server refused the bytes) gets one fresh re-resolve; the request
+        // timeout below still covers a resolve that never returned.
+        if (g_video_load_at != std::chrono::steady_clock::time_point{} &&
+            now - g_video_load_at > std::chrono::seconds(8))
+        {
+            if (!retry_video_stream())
+                cancel_video_resolve(true);
+            return;
+        }
+        if (now - g_video_requested_at > std::chrono::seconds(30))
             cancel_video_resolve(true); // resolve never finished
         return;
     }
@@ -966,39 +1051,28 @@ void video_preload_tick(bool have_frame)
         g_video_last_seek = std::chrono::steady_clock::now();
         return;
     }
-    // Wait until the alignment seek has actually completed and playback has
-    // started: seeking still reports the seek target as time-pos, which made
-    // the first frames of the reveal show a frozen pre-seek image.
-    if (!have_frame || g_video_target->is_buffering() || g_video_target->is_seeking() ||
-        g_video_target->is_core_idle())
-        return;
-
-    MpvPlayer *audible = display_player();
-    const double audio_pos = audible ? audible->cached_time_pos() : -1.0;
-    const double tpos = g_video_target->cached_time_pos();
-    if (audio_pos >= 0.0 && tpos >= 0.0 &&
-        std::fabs(tpos - (audio_pos + g_video_sync_offset)) > 0.2)
+    // Show as soon as the stream has a video frame. The previous strict gate
+    // (seek/idle/alignment/readiness hold) could block the reveal forever on
+    // a stream that had loaded fine. One alignment seek is issued here; the
+    // active tick keeps drift and seeks locked once the page is up.
+    if (!g_video_target->has_video())
     {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - g_video_last_seek > std::chrono::milliseconds(350))
-        {
-            g_video_target->seek(std::max(0.0, audio_pos + g_video_sync_offset + 0.1));
-            g_video_last_seek = now;
-        }
+        if (!retry_video_stream())
+            cancel_video_resolve(true);
         return;
     }
-    // Hold the reveal briefly: the seek completing and the clock advancing
-    // does not guarantee the *texture* has moved yet. Two or three rendered
-    // frames here are what make the picture live from the first animation
-    // frame.
-    const auto ready_now = std::chrono::steady_clock::now();
-    if (g_video_ready_at == std::chrono::steady_clock::time_point{})
+    if (!have_frame)
+        return;
+    if (!g_video_seek_done)
     {
-        g_video_ready_at = ready_now;
+        MpvPlayer *audible = display_player();
+        const double pos = audible ? audible->cached_time_pos() : -1.0;
+        if (pos > 0.5)
+            g_video_target->seek(std::max(0.0, pos + g_video_sync_offset));
+        g_video_seek_done = true;
+        g_video_last_seek = std::chrono::steady_clock::now();
         return;
     }
-    if (ready_now - g_video_ready_at < std::chrono::milliseconds(100))
-        return;
     finish_video_start();
 }
 
@@ -1068,6 +1142,11 @@ void video_active_tick()
         return;
     if (g_video_target_failed)
     {
+        if (retry_video_stream())
+        {
+            DLOG("video: retrying the stream after a failure");
+            return;
+        }
         DLOG("video: stream ended while active");
         g_video_target_failed = false;
         end_video_playback();

@@ -11,6 +11,7 @@ void draw_queue_panel(AppState &state)
 {
     const UiMetrics &m = ui_m();
     smooth_scroll_child();
+    ui_scroll_top_begin();
 
     const int count = (int)state.play_queue.size();
     const std::string meta = std::to_string(count) + (count == 1 ? " track" : " tracks");
@@ -37,7 +38,7 @@ void draw_queue_panel(AppState &state)
         return;
     }
 
-    const float art = 44.0f * m.layout_scale;
+    const float art = ui_elem("list_thumb", 44.0f);
     const float title_line = 24.0f * m.text_scale * 1.22f;
     const float meta_line = 18.0f * m.text_scale * 1.24f;
     const float row_h = std::max(art, title_line + m.space_1 + meta_line) + m.row_pad_y * 2.0f;
@@ -62,7 +63,8 @@ void draw_queue_panel(AppState &state)
             opt.draggable = true;
             opt.drag_type = "P100_QUEUE";
             opt.reveal_start = reveal_start;
-            opt.reveal_index = i;
+            // Stagger from the first visible row; see ui_reveal_base().
+            opt.reveal_index = std::max(0, i - clipper.DisplayStart);
             TrackRowResult row = ui_track_row(state, track, i, opt);
             if (row.drop_received)
                 queue_move(state, row.drag_from, row.drop_to);

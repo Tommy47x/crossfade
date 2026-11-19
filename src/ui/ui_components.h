@@ -69,6 +69,15 @@ bool ui_touch_tap_recent();
 // Matching row pitch for ImGuiListClipper users of ui_track_row().
 float ui_track_row_pitch(float art_size, bool compact = false);
 
+// Index of the first row at the top of the current scroll child, for
+// viewport-relative reveal staggers: pass `i - ui_reveal_base(list_top, pitch)`
+// as TrackRowOptions::reveal_index. Without it a list that is scrolled down
+// staggers from the absolute list position, so every visible row waits out the
+// full stagger before appearing. `list_top` is the screen Y of the first row
+// (GetCursorScreenPos() before the loop). Clipper-based loops can use
+// clipper.DisplayStart instead.
+int ui_reveal_base(float list_top_screen_y, float row_pitch);
+
 // Hero pill button (Radio / list-page heroes): outlined or accent-filled
 // rounded button with icon+label, hover ease and click pulse. Returns true
 // when clicked.
