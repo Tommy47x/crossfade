@@ -2651,7 +2651,7 @@ void draw_settings_panel(AppState &state)
     if (ui_primary_button("Sign in", ImVec2(170.0f * m.layout_scale, m.button_h)))
         auth_start(state, {"--signin", "auto"});
     ImGui::SameLine(0.0f, m.space_2);
-    if (ui_ghost_button("Open YouTube Music",
+    if (ui_ghost_button("Open YouTube Music##signin_open",
                         ImVec2(210.0f * m.layout_scale, m.button_h)))
     {
         if (!ui_open_external_url("https://music.youtube.com/"))
@@ -2659,7 +2659,7 @@ void draw_settings_panel(AppState &state)
                       "Copy the link and open it manually.", 6.0f);
     }
     ImGui::SameLine(0.0f, m.space_2);
-    if (ui_ghost_button("Copy link", ImVec2(120.0f * m.layout_scale, m.button_h)))
+    if (ui_ghost_button("Copy link##signin_copy", ImVec2(120.0f * m.layout_scale, m.button_h)))
         ImGui::SetClipboardText("https://music.youtube.com/");
 
     if (ui_ghost_button("Import session from this browser",
@@ -2694,7 +2694,7 @@ void draw_settings_panel(AppState &state)
                       "2. Press F12, open Network, then refresh the page or click a song. "
                       "3. Right-click a POST request to music.youtube.com and choose "
                       "Copy -> Copy request headers. 4. Paste the whole block below.");
-        if (ui_ghost_button("Open YouTube Music",
+        if (ui_ghost_button("Open YouTube Music##paste_open",
                             ImVec2(200.0f * m.layout_scale, m.control_h)))
         {
             if (!ui_open_external_url("https://music.youtube.com/"))
@@ -2703,7 +2703,7 @@ void draw_settings_panel(AppState &state)
                           "request headers.", 7.0f);
         }
         ImGui::SameLine(0.0f, m.space_2);
-        if (ui_ghost_button("Copy link", ImVec2(120.0f * m.layout_scale, m.control_h)))
+        if (ui_ghost_button("Copy link##paste_copy", ImVec2(120.0f * m.layout_scale, m.control_h)))
             ImGui::SetClipboardText("https://music.youtube.com/");
         ImGui::InputTextMultiline(
             "##auth_headers", &s_auth_headers,

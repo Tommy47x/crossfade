@@ -51,21 +51,46 @@ if ($newVer) {
 }
 
 # A running copy locks crossfade.exe and its DLLs, so the in-place upgrade
-# cannot replace them. Close the app (and its backend/mpv children) first.
+# cannot replace them. Close the app and its backend children first.
+#
+# Do NOT use `taskkill /IM crossfade.exe /T /F` here: when Settings -> Update
+# now starts the installer, this script is itself a child of crossfade.exe,
+# and /T kills the whole tree — including the installer — right after the
+# download/unpack step. Stop crossfade by name and its per-user children by
+# executable path instead.
+$venv = "$Root\share\crossfade\venv"
 $running = Get-Process -Name crossfade -ErrorAction SilentlyContinue
 if ($running) {
     Write-Host "[1/4] Closing the running crossfade ..."
-    & taskkill.exe /IM crossfade.exe /T /F 2>$null | Out-Null
-    Start-Sleep -Milliseconds 700
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
 }
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.ExecutablePath -and (
+            $_.ExecutablePath -like "$Root\*" -or
+            $_.ExecutablePath -like "$venv\*"
+        )
+    } |
+    ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+Start-Sleep -Milliseconds 700
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
-try {
-    Copy-Item "$payload\*" $Root -Recurse -Force
-} catch {
-    Write-Host "Could not update the installed files: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Close any running crossfade window and run the installer again."
-    exit 1
+$copied = $false
+for ($attempt = 0; $attempt -lt 3 -and -not $copied; $attempt++) {
+    try {
+        Copy-Item "$payload\*" $Root -Recurse -Force
+        $copied = $true
+    } catch {
+        # Antivirus and a lingering child can hold files for a moment.
+        if ($attempt -eq 2) {
+            Write-Host "Could not update the installed files: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Close any running crossfade window and run the installer again."
+            exit 1
+        }
+        Start-Sleep -Seconds 1
+    }
 }
 
 # ---- 2. Python runtime (per-user, silent) ---------------------------------
