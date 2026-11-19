@@ -70,13 +70,8 @@ def _ensure_config_dir():
     return path
 
 
-def clean_headers(text):
-    """Turn a DevTools/HTTP/2/cURL header paste into a plain header block.
-
-    Handles Chromium's pseudo-header view, request/status lines, cURL -H/-b
-    forms, long Cookie lines wrapped by the console, and Edge's multiple
-    Cookie lines (they are merged instead of dropped).
-    """
+def _clean_colon_block(text):
+    """The familiar `name: value` / cURL forms."""
     lines = []
     for line in text.splitlines():
         line = line.strip().rstrip("\\").strip()
@@ -113,6 +108,63 @@ def clean_headers(text):
         seen.add(name)
         out.append(line)
     return "\n".join(out)
+
+
+def _clean_pair_block(text):
+    """Chromium DevTools "Copy request headers": name line, value line.
+
+    Example:
+        :authority
+        music.youtube.com
+        cookie
+        SID=...; SAPISID=...
+        x-goog-authuser
+        0
+    """
+    lines = text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        name = lines[i].strip()
+        i += 1
+        if not name:
+            continue
+        if name.lower().startswith("decoded") or name.startswith("message "):
+            break
+        if PSEUDO.match(name):
+            # Pseudo-header: drop it and its value line.
+            if i < len(lines):
+                i += 1
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9-]+", name):
+            continue
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i >= len(lines):
+            break
+        value = lines[i].strip()
+        i += 1
+        if not value or name.lower() in DROP:
+            continue
+        out.append(f"{name}: {value}")
+    return "\n".join(out)
+
+
+def clean_headers(text):
+    """Turn a DevTools/HTTP/2/cURL header paste into a plain header block.
+
+    Handles Chromium's pseudo-header view, the two-line "Copy request headers"
+    form (name line followed by value line), request/status lines, cURL
+    -H/-b forms, long Cookie lines wrapped by the console, and Edge's multiple
+    Cookie lines (they are merged instead of dropped).
+    """
+    cleaned = _clean_colon_block(text)
+    if "cookie" in cleaned.lower():
+        return cleaned
+    paired = _clean_pair_block(text)
+    if "cookie" in paired.lower():
+        return paired
+    return cleaned
 
 
 def filter_cookies(cookies):
@@ -355,8 +407,21 @@ def cookies_from_ytdlp_browser(browser, profile=None):
         from yt_dlp.cookies import extract_cookies_from_browser
     except Exception as e:
         raise RuntimeError(f"yt-dlp is not available ({e})")
-    jar = extract_cookies_from_browser(
-        browser, profile=profile, logger=_QuietYtdlpLogger())
+    try:
+        jar = extract_cookies_from_browser(
+            browser, profile=profile, logger=_QuietYtdlpLogger())
+    except Exception as e:
+        message = str(e)
+        lowered = message.lower()
+        if "could not copy" in lowered or "7271" in lowered:
+            # yt-dlp issue #7271: the browser holds the cookie DB open, and
+            # Chrome 127+ App-Bound Encryption can block this even when it is
+            # closed. The paste panel is the reliable route.
+            raise RuntimeError(
+                f"{browser} is locking its cookie database (yt-dlp #7271). "
+                "Quit the browser completely, including background processes, "
+                "and retry — or use Paste request headers in Settings.") from e
+        raise
     cookies = {}
     for cookie in jar:
         domain = (getattr(cookie, "domain", "") or "").lower()

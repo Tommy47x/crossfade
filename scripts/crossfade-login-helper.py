@@ -557,6 +557,36 @@ def run_qt(out_path):
 # Windows WebView2 through optional pywebview
 # ---------------------------------------------------------------------------
 
+def _cookie_map(cookies):
+    """Normalise pywebview's cookie results across versions.
+
+    pywebview's EdgeChromium backend appends http.cookies.SimpleCookie
+    instances (one morsel each), while some versions return objects with
+    .name/.value or plain dicts. Reading `.name` on a SimpleCookie silently
+    produced an empty map, so a successful WebView2 login was never noticed.
+    """
+    mapping = {}
+    if cookies is None:
+        return mapping
+    if hasattr(cookies, "items"):
+        cookies = [cookies]
+    for cookie in cookies:
+        try:
+            if hasattr(cookie, "items"):  # SimpleCookie or a plain dict
+                for name, morsel in cookie.items():
+                    value = getattr(morsel, "value", morsel)
+                    if name and value is not None:
+                        mapping[str(name)] = str(value)
+            else:
+                name = getattr(cookie, "name", None)
+                value = getattr(cookie, "value", None)
+                if name and value is not None:
+                    mapping[str(name)] = str(value)
+        except Exception:
+            continue
+    return mapping
+
+
 def run_webview2(out_path):
     if sys.platform != "win32":
         return EXIT_NO_ENGINE, "WebView2 is only available on Windows"
@@ -568,7 +598,8 @@ def run_webview2(out_path):
     if window_cls is None or not hasattr(window_cls, "get_cookies"):
         return EXIT_NO_ENGINE, "The installed pywebview cannot read cookies"
 
-    state = {"ok": False, "closed": False, "error": ""}
+    state = {"ok": False, "closed": False, "error": "",
+             "read_error": "", "seen": ""}
     window = webview.create_window("Sign in to crossfade", START_URL,
                                    width=580, height=860)
 
@@ -582,19 +613,27 @@ def run_webview2(out_path):
 
     def worker(win):
         deadline = time.time() + 900
+        last_seen = 0.0
         while time.time() < deadline:
             if state["closed"]:
                 break
             try:
                 cookies = win.get_cookies() or []
-            except Exception:
+            except Exception as e:
+                # get_cookies() raises until the first page has loaded; that is
+                # expected while the window is opening.
+                if "before the page has loaded" not in str(e) and not state["read_error"]:
+                    state["read_error"] = str(e)
+                    log(f"WebView2 cookie read failed: {e}")
                 cookies = []
-            mapping = {}
-            for cookie in cookies:
-                try:
-                    mapping[cookie.name] = cookie.value
-                except Exception:
-                    pass
+            mapping = _cookie_map(cookies)
+            if mapping and time.time() - last_seen > 15:
+                # Names only: never log cookie values.
+                names = ", ".join(sorted(mapping)[:20])
+                if names != state["seen"]:
+                    state["seen"] = names
+                    log(f"WebView2 cookies seen: {names}")
+                last_seen = time.time()
             if mapping.get("__Secure-3PAPISID"):
                 try:
                     _write_cookies(out_path, mapping)
@@ -624,6 +663,8 @@ def run_webview2(out_path):
         return EXIT_CANCELLED, "Sign-in window closed"
     if state["error"]:
         return EXIT_REJECTED, state["error"]
+    if state["read_error"]:
+        return EXIT_REJECTED, f"WebView2 cookies could not be read: {state['read_error']}"
     return EXIT_REJECTED, ("No Google sign-in cookie appeared. Google may have "
                            "blocked the embedded browser.")
 

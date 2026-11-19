@@ -2,6 +2,23 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.5.2 - 2026-11-19
+
+### Fixed
+
+- **Windows WebView2 sign-in is now detected.** pywebview returns each cookie
+  as an `http.cookies.SimpleCookie` morsel, not an object with
+  `.name`/`.value`; the helper silently skipped them, so a successful login
+  persisted but the app never saw it and closing the window counted as a
+  cancel. SimpleCookie, dict and attribute forms are all handled, and cookie
+  names (never values) are logged to `login.log`.
+- **Chromium’s two-line request-header paste works.** Chrome often copies
+  header names and values on alternating lines; the cleaner treated the value
+  as a continuation and reported “No Cookie header found”. It now parses both
+  formats.
+- **Chrome/Edge import explains yt-dlp #7271** (“Could not copy cookie
+  database”) and points at quitting the browser or using the paste panel.
+
 ## 0.5.1 - 2026-11-19
 
 ### Added
