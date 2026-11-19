@@ -128,8 +128,8 @@ Line counts (blank lines included) from the current tree:
 No. Without `browser.json` crossfade starts in guest mode: public browsing, playback,
 lyrics, radio, podcasts, downloads and local playlists work. Personalized
 recommendations and your YouTube Music playlists/library need a sign-in; the Home tab
-keeps a search field on the page itself (so an empty feed is never a dead end) and links
-straight to the sign-in settings while you are a guest.
+keeps a centred search field on the page itself (so an empty feed is never a dead end)
+and links straight to the sign-in settings while you are a guest.
 
 **Isn't signing in annoying?**
 One-time, about 30 seconds: copy the request headers, run `crossfade-login`, done.

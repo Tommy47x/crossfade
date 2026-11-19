@@ -6,9 +6,9 @@ All notable changes to crossfade are documented here.
 
 ### Added
 
-- **Search field on the Home panel.** The feed page now carries its own search
-  box, so guests -- and anyone whose feed is empty right now -- can start a
-  search without hunting for the header field.
+- **Search field on the guest Home page.** With no account the feed is empty, so
+  Home now shows a search box centred on the page, with sign-in kept one button
+  away. Signed-in users keep the populated feed and the header field.
 - **Video and lyrics side by side.** The music-video page now replaces only the
   list: an open lyrics panel stays docked beside the picture. Theater mode
   still takes the full width.

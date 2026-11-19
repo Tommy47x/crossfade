@@ -1,12 +1,18 @@
 #include "ui.h"
 #include "imgui_internal.h"
+#include "ui_backdrop.h"
 #include "ui_notify.h"
+#include "ui_theme.h"
+#include "ui_icons.h"
 #include "library.h"
+#include "party.h"
 
 #include <SDL.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -424,6 +430,8 @@ void resolve_current_track_links(AppState &state)
 static float g_scroll_pixel_accum = 0.0f;
 static float g_frame_scroll_pixels = 0.0f;
 static bool g_frame_scroll_consumed = false;
+// Set for the frame while a back-to-top jump is driving the scroll.
+static bool g_scroll_top_animating = false;
 static float g_scroll_clamp_unapplied = 0.0f;
 
 // Absolute sub-pixel scroll accumulator. ImGui rounds every scroll position
@@ -464,6 +472,7 @@ void smooth_scroll_begin_frame()
     g_frame_scroll_pixels = g_scroll_pixel_accum;
     g_scroll_pixel_accum = 0.0f;
     g_frame_scroll_consumed = false;
+    g_scroll_top_animating = false;
 }
 
 void smooth_scroll_child()
@@ -788,24 +797,355 @@ float ui_anim_texture_alpha(const std::string &url)
     return ui_anim_ease_out(t);
 }
 
-float ui_content_edge_alpha(float top_y, float bottom_y)
+// ----------------------------------------------------------------------
+// Scroll edge fades
+//
+// The list dissolves into the ambient backdrop by painting the backdrop's own
+// visible colour over the top and bottom of the scroll viewport with an alpha
+// ramp. The colour is sampled from ui_backdrop_sample(), so it follows the
+// wash, the blooms, the shader/primitive path, the track colour crossfade and
+// the backdrop's visibility exactly; rows keep full opacity and only the
+// overlay fades.
+//
+// Sampling runs on a small lattice whose colours are memoised per window. The
+// backdrop colour is a pure function of screen position and backdrop state, so
+// a still backdrop reuses the lattice across frames (scrolling only changes
+// which rows are covered, not the colour underneath them).
+// ----------------------------------------------------------------------
+namespace
 {
+struct FadeLattice
+{
+    bool valid = false;
+    float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+    int cols = 0, rows = 0;
+    BackdropSampleInputs bg;
+    std::vector<ImVec4> colours;
+};
+
+struct WindowFadeCache
+{
+    FadeLattice top;
+    FadeLattice bottom;
+
+    // Back-to-top button. The hit target is claimed in ui_scroll_top_begin()
+    // (before the rows) and painted here, so a row can never receive the
+    // click as well.
+    float top_alpha = 0.0f;
+    float top_hover = 0.0f;
+    bool top_hovered = false;
+    bool top_submitted = false;
+    ImVec2 top_min;
+    ImVec2 top_max;
+    // Eased scroll-to-top jump.
+    bool top_animating = false;
+    float top_anim_from = 0.0f;
+    double top_anim_start = 0.0;
+    double top_anim_duration = 0.0;
+};
+
+std::unordered_map<ImGuiID, WindowFadeCache> g_fade_cache;
+
+bool same_backdrop(const BackdropSampleInputs &a, const BackdropSampleInputs &b)
+{
+    return a.tint.x == b.tint.x && a.tint.y == b.tint.y && a.tint.z == b.tint.z &&
+           a.visibility == b.visibility && a.strength == b.strength &&
+           a.pulse == b.pulse && a.spin == b.spin && a.theme == b.theme &&
+           a.accent_fallback == b.accent_fallback && a.shader == b.shader &&
+           a.display_w == b.display_w && a.display_h == b.display_h;
+}
+
+void build_lattice(FadeLattice &c)
+{
+    const int stride = c.cols + 1;
+    c.colours.resize((size_t)stride * (size_t)(c.rows + 1));
+    const float sx = (c.x1 - c.x0) / (float)c.cols;
+    const float sy = (c.y1 - c.y0) / (float)c.rows;
+    for (int r = 0; r <= c.rows; ++r)
+    {
+        for (int k = 0; k <= c.cols; ++k)
+        {
+            ImVec4 s = ui_backdrop_sample(ImVec2(c.x0 + sx * (float)k, c.y0 + sy * (float)r));
+            s.w = 1.0f;
+            c.colours[(size_t)r * (size_t)stride + (size_t)k] = s;
+        }
+    }
+}
+
+// Alpha of the overlay at y: 1 at the outer screen edge (content fully
+// replaced by backdrop), 0 at the inner edge. Smoothstep removes the visible
+// crease a linear ramp leaves where the band ends.
+float band_alpha(const FadeLattice &c, bool top, float y)
+{
+    const float h = std::max(0.001f, c.y1 - c.y0);
+    float t = top ? (y - c.y0) / h : (c.y1 - y) / h;
+    t = std::clamp(t, 0.0f, 1.0f);
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+void draw_lattice(ImDrawList *dl, const FadeLattice &c, bool top)
+{
+    if (c.cols <= 0 || c.rows <= 0)
+        return;
+
+    const int stride = c.cols + 1;
+    const float sx = (c.x1 - c.x0) / (float)c.cols;
+    const float sy = (c.y1 - c.y0) / (float)c.rows;
+    for (int r = 0; r < c.rows; ++r)
+    {
+        const float y0 = c.y0 + sy * (float)r;
+        const float y1 = y0 + sy;
+        const float a0 = band_alpha(c, top, y0);
+        const float a1 = band_alpha(c, top, y1);
+        const ImVec4 *row0 = &c.colours[(size_t)r * (size_t)stride];
+        const ImVec4 *row1 = &c.colours[(size_t)(r + 1) * (size_t)stride];
+        for (int k = 0; k < c.cols; ++k)
+        {
+            const float x0 = c.x0 + sx * (float)k;
+            const float x1 = x0 + sx;
+            const ImVec4 &c00 = row0[k];
+            const ImVec4 &c01 = row0[k + 1];
+            const ImVec4 &c11 = row1[k + 1];
+            const ImVec4 &c10 = row1[k];
+            dl->AddRectFilledMultiColor(
+                ImVec2(x0, y0), ImVec2(x1, y1),
+                ImGui::GetColorU32(ImVec4(c00.x, c00.y, c00.z, a0)),
+                ImGui::GetColorU32(ImVec4(c01.x, c01.y, c01.z, a0)),
+                ImGui::GetColorU32(ImVec4(c11.x, c11.y, c11.z, a1)),
+                ImGui::GetColorU32(ImVec4(c10.x, c10.y, c10.z, a1)));
+        }
+    }
+}
+
+void ensure_lattice(FadeLattice &c, const ImVec2 &pos, const ImVec2 &size,
+                    float y0, float y1, int cols, int rows, const BackdropSampleInputs &bg)
+{
+    if (c.valid && c.x0 == pos.x && c.x1 == pos.x + size.x && c.y0 == y0 && c.y1 == y1 &&
+        c.cols == cols && c.rows == rows && same_backdrop(c.bg, bg))
+        return;
+
+    c.x0 = pos.x;
+    c.x1 = pos.x + size.x;
+    c.y0 = y0;
+    c.y1 = y1;
+    c.cols = cols;
+    c.rows = rows;
+    c.bg = bg;
+    build_lattice(c);
+    c.valid = true;
+}
+} // namespace
+
+void ui_scroll_top_begin()
+{
+    if (g_fade_cache.size() > 64)
+        g_fade_cache.clear();
+    WindowFadeCache &cache = g_fade_cache[ImGui::GetCurrentWindow()->ID];
+    cache.top_submitted = false;
+
+    const double now = ImGui::GetTime();
     const float max_scroll = ImGui::GetScrollMaxY();
-    if (max_scroll <= 1.0f)
-        return 1.0f;
-
-    const ImVec2 pos = ImGui::GetWindowPos();
-    const ImVec2 size = ImGui::GetWindowSize();
-    if (size.y <= 1.0f)
-        return 1.0f;
-
     const float scroll = ImGui::GetScrollY();
-    const float fade = std::min(ui_px(26.0f), size.y * 0.18f);
-    float alpha = 1.0f;
-    if (scroll > 1.0f && top_y < pos.y + fade)
-        alpha = std::min(alpha, std::clamp((top_y - pos.y) / fade, 0.0f, 1.0f));
-    if (scroll < max_scroll - 1.0f && bottom_y > pos.y + size.y - fade)
-        alpha = std::min(alpha, std::clamp(((pos.y + size.y) - bottom_y) / fade, 0.0f, 1.0f));
-    return alpha;
+
+    // Eased jump to the top. A wheel/touch gesture cancels it so the user
+    // always wins; the animation steps the scroll target each frame, which
+    // ImGui applies on the next Begin (same path as the smooth scroller).
+    if (cache.top_animating)
+    {
+        if (std::fabs(g_frame_scroll_pixels) > 0.01f)
+        {
+            cache.top_animating = false;
+        }
+        else
+        {
+            const double elapsed = now - cache.top_anim_start;
+            float t = cache.top_anim_duration > 0.0
+                          ? (float)(elapsed / cache.top_anim_duration)
+                          : 1.0f;
+            t = std::clamp(t, 0.0f, 1.0f);
+            ImGui::SetScrollY(cache.top_anim_from * (1.0f - ui_anim_ease_out(t)));
+            if (t < 1.0f)
+                ui_anim_request();
+            else
+                cache.top_animating = false;
+        }
+    }
+    if (cache.top_animating)
+        g_scroll_top_animating = true;
+
+    // Ease in once the list has been scrolled a meaningful amount; ease out
+    // again near the top. Motion is optional (the button snaps without it).
+    const float target = (max_scroll > 1.0f && scroll > ui_px(120.0f)) ? 1.0f : 0.0f;
+    float alpha = cache.top_alpha;
+    if (ui_animations_enabled())
+    {
+        alpha = ui_anim_approach(alpha, target, 16.0f);
+        if (std::fabs(alpha - target) > 0.002f)
+            ui_anim_request();
+    }
+    else
+        alpha = target;
+    cache.top_alpha = alpha;
+    if (alpha <= 0.002f)
+        return;
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 clip_max = dl->GetClipRectMax();
+    const UiMetrics &m = ui_m();
+    const float diameter = ui_px(38.0f);
+    const float margin = m.space_5;
+    // Keep clear of the party chip, which lives in the same corner.
+    const float stack = party_running()
+                            ? std::max(32.0f * m.layout_scale, m.control_h * 0.78f) + m.space_4
+                            : 0.0f;
+    const ImVec2 pmin(clip_max.x - margin - diameter,
+                      clip_max.y - margin - diameter - stack);
+    cache.top_min = pmin;
+    cache.top_max = ImVec2(pmin.x + diameter, pmin.y + diameter);
+
+    // Claim the hit target now, before the rows are submitted: an item that
+    // claimed hover first blocks later overlapping items, so the row beneath
+    // the button cannot also react to the click.
+    const ImVec2 saved = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(pmin);
+    ImGui::InvisibleButton("##scroll_top", ImVec2(diameter, diameter));
+    cache.top_hovered = ImGui::IsItemHovered();
+    const bool clicked = ImGui::IsItemClicked();
+    ImGui::SetCursorScreenPos(saved);
+
+    float hover = cache.top_hover;
+    const float hover_target = cache.top_hovered ? 1.0f : 0.0f;
+    if (ui_animations_enabled())
+    {
+        hover = ui_anim_approach(hover, hover_target, 16.0f);
+        if (std::fabs(hover - hover_target) > 0.002f)
+            ui_anim_request();
+    }
+    else
+        hover = hover_target;
+    cache.top_hover = hover;
+
+    if (cache.top_hovered)
+    {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("Back to top");
+    }
+    if (clicked)
+    {
+        // The external jump must not be swallowed by the wheel's continuity
+        // base (or an in-flight fling).
+        g_scroll_applied_valid = false;
+        reset_wheel_scroll();
+        const float duration = ui_anim_duration(0.45f);
+        if (duration > 0.001f && scroll > 1.0f)
+        {
+            cache.top_animating = true;
+            cache.top_anim_from = scroll;
+            cache.top_anim_start = now;
+            cache.top_anim_duration = (double)duration;
+        }
+        else
+        {
+            ImGui::SetScrollY(0.0f);
+        }
+        cache.top_alpha = 1.0f;
+        ui_anim_request();
+    }
+
+    cache.top_submitted = true;
+}
+
+bool ui_scroll_top_animating()
+{
+    return g_scroll_top_animating;
+}
+
+void ui_scroll_to_top()
+{
+    // An external jump: the next wheel frame must re-base on the real scroll,
+    // and a fling or a back-to-top animation still in flight would otherwise
+    // keep writing its own target over this one.
+    g_scroll_applied_valid = false;
+    reset_wheel_scroll();
+    if (ImGuiWindow *win = ImGui::GetCurrentWindow())
+    {
+        auto it = g_fade_cache.find(win->ID);
+        if (it != g_fade_cache.end())
+            it->second.top_animating = false;
+    }
+    ImGui::SetScrollY(0.0f);
+}
+
+void ui_draw_scroll_edge_fades(float height)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+
+    // ---- Edge bands -------------------------------------------------
+    if (height > 0.0f && ImGui::GetScrollMaxY() > 1.0f)
+    {
+        // Fade exactly the visible content rect: the window's inner rect
+        // already excludes the padding and the scrollbar, so alpha is full at
+        // the first pixel of the first visible row.
+        const ImVec2 pos = dl->GetClipRectMin();
+        const ImVec2 size(dl->GetClipRectMax().x - pos.x, dl->GetClipRectMax().y - pos.y);
+        const float scroll = ImGui::GetScrollY();
+        const float max_scroll = ImGui::GetScrollMaxY();
+        const bool show_top = scroll > 1.0f;
+        const bool show_bottom = scroll < max_scroll - 1.0f;
+        const float fade = std::min(ui_px(height), size.y * 0.18f);
+        if (size.x > 2.0f && size.y > 2.0f && (show_top || show_bottom) && fade > 0.5f)
+        {
+            const BackdropSampleInputs bg = ui_backdrop_sample_inputs();
+
+            // The wash is bilinear and the blooms are broad, so ~64 px by
+            // ~4 px cells keep the interpolation error below one 8-bit step.
+            // With the backdrop off the background is a single flat colour:
+            // one column is exact.
+            const bool flat = bg.visibility <= 0.001f;
+            const float cell_w = std::max(1.0f, ui_px(64.0f));
+            const float cell_h = std::max(1.0f, ui_px(4.0f));
+            const int cols = flat ? 1 : std::clamp((int)std::ceil(size.x / cell_w), 1, 48);
+            const int rows = std::clamp((int)std::ceil(fade / cell_h), 1, 16);
+
+            WindowFadeCache &cache = g_fade_cache[ImGui::GetCurrentWindow()->ID];
+            if (show_top)
+            {
+                ensure_lattice(cache.top, pos, size, pos.y, pos.y + fade, cols, rows, bg);
+                draw_lattice(dl, cache.top, true);
+            }
+            if (show_bottom)
+            {
+                ensure_lattice(cache.bottom, pos, size, pos.y + size.y - fade, pos.y + size.y,
+                               cols, rows, bg);
+                draw_lattice(dl, cache.bottom, false);
+            }
+        }
+    }
+
+    // ---- Back-to-top button ----------------------------------------
+    // Painted last so it stays crisp over the bottom fade. The item itself
+    // was submitted early by ui_scroll_top_begin().
+    auto it = g_fade_cache.find(ImGui::GetCurrentWindow()->ID);
+    if (it != g_fade_cache.end() && it->second.top_submitted)
+    {
+        const WindowFadeCache &cache = it->second;
+        const float a = std::clamp(cache.top_alpha, 0.0f, 1.0f);
+        const float hv = std::clamp(cache.top_hover, 0.0f, 1.0f);
+        const ImVec2 c((cache.top_min.x + cache.top_max.x) * 0.5f,
+                       (cache.top_min.y + cache.top_max.y) * 0.5f);
+        const float r = (cache.top_max.x - cache.top_min.x) * 0.5f;
+
+        // Solid surface base so the icon stays legible over album art, then
+        // an accent wash and border. The accent is present at rest and
+        // deepens on hover.
+        const ImVec4 surf = ui_c().surface;
+        dl->AddCircleFilled(ImVec2(c.x, c.y + ui_px(2.0f)), r,
+                            IM_COL32(0, 0, 0, (int)(55.0f * a)), 40);
+        dl->AddCircleFilled(c, r, ui_col(ImVec4(surf.x, surf.y, surf.z, a)), 40);
+        dl->AddCircleFilled(c, r, ui_accent_u32((0.16f + 0.10f * hv) * a), 40);
+        dl->AddCircle(c, r, ui_accent_u32((0.60f + 0.30f * hv) * a), 40, 1.0f);
+        ui_draw_icon(dl, UiIcon::ChevronUp, c, r * 0.92f,
+                     ui_with_alpha(ui_accent_text_u32(), a), 1.8f);
+    }
 }
 

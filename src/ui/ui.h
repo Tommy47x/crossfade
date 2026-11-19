@@ -20,6 +20,15 @@ inline float ui_elem(const char *name, float base)
     return base * g_ui_layout_scale * m;
 }
 
+// Resolved multiplier for a single UI element (1.0 when unset). Text sizes use
+// this and then apply the global text scale themselves, so a per-element font
+// setting composes with the "Text size" slider instead of replacing it.
+inline float ui_elem_mult(const char *name)
+{
+    auto it = g_ui_elem.find(name);
+    return it == g_ui_elem.end() ? 1.0f : it->second;
+}
+
 
 struct ScopedNoMinSize
 {
@@ -250,6 +259,13 @@ void scroll_clamp_feedback(float unapplied);
 float take_scroll_clamp_feedback();
 void smooth_scroll_begin_frame();
 void smooth_scroll_child();
+// Cancels any in-flight wheel/touch fling (defined in the input layer).
+void reset_wheel_scroll();
+// Jump the current scroll child back to the top immediately. Drops the
+// sub-pixel continuity base and any in-flight fling or back-to-top animation,
+// so an external content change (new search results) neither glides from a
+// stale offset nor gets pulled back by inertia.
+void ui_scroll_to_top();
 
 // Lyrics panel animation signal. The panel sets this while its auto-centre
 // scroll / fade-in is running; the main loop consumes it (like
@@ -346,10 +362,24 @@ double ui_anim_scroll_reveal(int scope, int index, const std::string &id,
 // Fades a thumbnail in the first time it becomes available (per URL).
 float ui_anim_texture_alpha(const std::string &url);
 
-// Alpha multiplier for a piece of scroll content at the top/bottom edge of
-// the current window. Fades the content itself (rows, cards, lyric lines)
-// instead of painting a background-coloured overlay over it.
-float ui_content_edge_alpha(float top_y, float bottom_y);
+// Paints the top/bottom fade over the current scroll child so its content
+// dissolves into the ambient backdrop. Call just before EndChild() on a
+// NoBackground scroll child; no-op when the child cannot scroll. `height` is
+// the band height in logical pixels (0 disables the fade). Content stays at
+// full opacity: the fade is a backdrop-matched overlay, not per-element alpha.
+// Also draws the floating back-to-top button claimed by ui_scroll_top_begin().
+void ui_draw_scroll_edge_fades(float height);
+
+// Claims the floating back-to-top button for the current scroll child. Must be
+// called near the start of the child (right after BeginChild), before any rows
+// are submitted: the button's hit target is claimed first so the row beneath
+// it cannot also react to the click. ui_draw_scroll_edge_fades() paints it.
+void ui_scroll_top_begin();
+
+// True while a back-to-top jump is scrolling the current frame. Rows skip
+// their scroll-entrance stagger then, so the view slides cleanly instead of
+// cascading every row that enters the viewport.
+bool ui_scroll_top_animating();
 
 // ----------------------------------------------------------------------
 // UI drawing functions

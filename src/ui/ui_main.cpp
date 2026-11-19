@@ -727,6 +727,51 @@ static void draw_search_hero(AppState &state, const std::vector<Track> &tracks,
     }
 }
 
+// Guest Home landing. Without an account the recommendation feed stays empty,
+// so the page would otherwise only be a sign-in prompt. The search field is
+// the content here: centred in both axes, with the sign-in path kept as one
+// quiet button underneath.
+static void draw_guest_home_landing(AppState &state)
+{
+    const UiMetrics &m = ui_m();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const float field_w = std::min(std::max(avail.x, 1.0f), 620.0f * m.layout_scale);
+    const float field_h = std::max(m.control_h, 46.0f * m.layout_scale);
+    const char *hint = "Search works without an account.";
+    const ImVec2 hint_ts = ImGui::CalcTextSize(hint);
+    const char *hint2 = "Log in to see YouTube's feed.";
+    const ImVec2 hint2_ts = ImGui::CalcTextSize(hint2);
+    const char *sign_in = "Sign in";
+    const ImVec2 sign_ts = ImGui::CalcTextSize(sign_in);
+    const ImVec2 sign_btn(std::max(sign_ts.x + m.space_6, m.control_h * 2.0f),
+                          m.control_h);
+    const float line_gap = m.space_1 + 2.0f * m.layout_scale;
+    const float block_h = field_h + m.space_4 + hint_ts.y + line_gap + hint2_ts.y +
+                          m.space_3 + sign_btn.y;
+    const float y0 = start.y + std::max(m.space_4, (avail.y - block_h) * 0.5f);
+
+    ImGui::SetCursorScreenPos(ImVec2(start.x + (avail.x - field_w) * 0.5f, y0));
+    ui_home_search_field(state, field_w);
+
+    const float hint_y = y0 + field_h + m.space_4;
+    ImGui::SetCursorScreenPos(ImVec2(start.x + (avail.x - hint_ts.x) * 0.5f, hint_y));
+    ImGui::TextColored(ui_c().text_muted, "%s", hint);
+    ImGui::SetCursorScreenPos(
+        ImVec2(start.x + (avail.x - hint2_ts.x) * 0.5f, hint_y + hint_ts.y + line_gap));
+    ImGui::TextColored(ui_c().text_dim, "%s", hint2);
+
+    ImGui::SetCursorScreenPos(
+        ImVec2(start.x + (avail.x - sign_btn.x) * 0.5f,
+               hint_y + hint_ts.y + line_gap + hint2_ts.y + m.space_3));
+    if (ui_ghost_button(sign_in, sign_btn))
+    {
+        state.settings_focus_auth = true;
+        state.current_tab = Tab::Settings;
+        state.repaint_requested = true;
+    }
+}
+
 static void draw_list_page(AppState &state, const AppLayout &layout, float width)
 {
     const UiMetrics &m = ui_m();
@@ -741,6 +786,25 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
                       ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
     smooth_scroll_child();
+
+    // A new query replaces the rows without changing this child's ID, so
+    // ImGui would keep the previous scroll offset and leave the user looking
+    // at row 40 of a freshly built list. Jump back to the top on any query
+    // change (including clearing it). Tab switches are left alone: each list
+    // page keeps its own scroll state.
+    static Tab s_scroll_query_tab = Tab::Home;
+    static std::string s_scroll_query;
+    {
+        const std::string list_query(state.search_buffer);
+        const bool same_tab = state.current_tab == s_scroll_query_tab;
+        if (same_tab && list_query != s_scroll_query &&
+            (list_query[0] != '\0' || s_scroll_query[0] != '\0'))
+            ui_scroll_to_top();
+        s_scroll_query_tab = state.current_tab;
+        s_scroll_query = list_query;
+    }
+
+    ui_scroll_top_begin();
 
     TrackListPtr tracks = source_for_tab(state);
     std::vector<std::string> pending_deletes;
@@ -806,6 +870,30 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
     std::string meta;
 
     const bool home_search = home && state.search_buffer[0] != '\0';
+
+    // The Home search field belongs to guests: with an account the feed itself
+    // is the page, and the header field is right above it. Guests have no feed
+    // to greet them, so the field becomes the content. It stays mounted while
+    // a search is active -- otherwise the first keystroke would unmount the
+    // focused input and focus would be lost after one letter.
+    if (home && backend_is_guest())
+    {
+        if (home_search)
+        {
+            ui_home_search_field(state);
+            ImGui::Dummy(ImVec2(0.0f, m.space_3));
+        }
+        else if (!tracks || tracks->empty())
+        {
+            draw_guest_home_landing(state);
+            ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopID();
+            return;
+        }
+    }
+
     auto album_results = std::atomic_load(&state.search_album_results);
     auto artist_results = std::atomic_load(&state.search_artist_results);
     int playlist_result_count = 0;
@@ -858,15 +946,6 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
                        : state.search_filter == 3 ? "playlist" : "track";
     meta = searching ? "Searching..." : std::to_string(count) + " " + unit + (count == 1 ? "" : "s");
 
-    // Home carries its own search field. The feed can be legitimately empty
-    // (guest mode, a failed refresh, no recommendations yet), and an empty
-    // page is a bad place to discover that search works without an account.
-    if (home && !home_search)
-    {
-        ui_home_search_field(state);
-        ImGui::Dummy(ImVec2(0.0f, m.space_3));
-    }
-
     // Recent searches sit above the recommendation feed, not between its
     // header and the tracks it describes.
     if (home && !home_search)
@@ -899,6 +978,7 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
         state.playback_history.clear();
         state.history_view = std::make_shared<const std::vector<Track>>();
         save_playback_history(state.playback_history);
+        ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopID();
@@ -946,6 +1026,7 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
             else
                 draw_search_playlist_grid(state);
             ImGui::Dummy(ImVec2(0.0f, m.space_4));
+            ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
             ImGui::EndChild();
             ImGui::PopStyleVar();
             ImGui::PopID();
@@ -1052,6 +1133,7 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
                            "Press / to search, P to start a party, or ? for shortcuts.");
         if (hero_tab)
             ImGui::PopStyleVar();
+        ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopID();
@@ -1485,6 +1567,7 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
 
     ImGui::Dummy(ImVec2(0.0f, m.space_4));
 
+    ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::PopID();
@@ -1814,7 +1897,10 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
                           ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
         if (!scroll_self)
+        {
             smooth_scroll_child();
+            ui_scroll_top_begin();
+        }
 
         if (state.current_tab == Tab::Settings)
             draw_settings_panel(state);
@@ -1843,6 +1929,7 @@ void draw_main_ui(AppState &state, MpvPlayer &player)
         else if (state.current_tab == Tab::Studio)
             draw_studio_panel(state, player);
 
+        ui_draw_scroll_edge_fades(state.settings.edge_fade_height);
         ImGui::EndChild();
         ImGui::PopID();
         ImGui::PopStyleVar();
