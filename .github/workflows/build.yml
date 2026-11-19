@@ -255,11 +255,13 @@ jobs:
       - name: Install linters
         run: python -m pip install --upgrade pip ruff
       - name: Compile backends
-        run: python -m py_compile p100-backend.py p100-backend-oauth.py py/cf_backend/core.py tests/test_backend_protocol.py
+        run: python -m py_compile p100-backend.py p100-backend-oauth.py py/cf_backend/core.py py/cf_backend/login.py scripts/crossfade-login-helper.py tests/test_backend_protocol.py tests/test_login.py
       - name: Lint (syntax/undefined names)
-        run: ruff check --select E9,F63,F7,F82 p100-backend.py p100-backend-oauth.py py/cf_backend tests/test_backend_protocol.py
+        run: ruff check --select E9,F63,F7,F82 p100-backend.py p100-backend-oauth.py py/cf_backend scripts/crossfade-login-helper.py tests/test_backend_protocol.py tests/test_login.py
       - name: Protocol regression test
         run: python tests/test_backend_protocol.py
+      - name: Sign-in regression test
+        run: python tests/test_login.py
 
   windows:
     runs-on: windows-latest

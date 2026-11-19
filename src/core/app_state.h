@@ -475,6 +475,15 @@ struct AppState
     bool podcast_search_loading = false;
     bool podcast_search_dirty = false;
     bool auth_refresh_requested = false;
+    // Sign-in helper state (Settings -> YouTube Music). The helper runs as a
+    // detached child and writes login-result.txt; the UI polls that and
+    // login.log so a webview window can stay open without blocking the loop.
+    std::atomic<bool> auth_login_running{false};
+    int auth_login_exit = 0;
+    std::string auth_login_log;
+    std::atomic<bool> auth_probe_running{false};
+    std::mutex auth_probe_mutex;
+    std::string auth_probe_output;
     std::shared_ptr<const SpotifyImportResult> spotify_import_result;
     std::atomic<bool> spotify_import_running{false};
     std::atomic<bool> spotify_login_running{false};

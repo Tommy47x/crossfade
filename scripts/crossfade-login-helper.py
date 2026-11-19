@@ -1,340 +1,307 @@
 #!/usr/bin/env python3
-"""Optional sign-in helper for crossfade.
+"""Sign-in helper for crossfade.
 
---google: open a WebKitGTK sign-in window and write browser.json. If WebKitGTK
-          is unavailable, fall back to importing cookies from Firefox.
-          On Windows: open YouTube Music in the default browser and a small
-          Tkinter window that turns copied request headers into browser.json.
---import-firefox: import an existing Firefox YouTube Music session.
---spotify: open a WebKitGTK Spotify sign-in and save the sp_dc cookie.
+Modes:
+  --probe                 print JSON describing available webview engines
+  --signin [ENGINE]       open the best available sign-in window
+                          (webkit, qt, webview2) and install the session
+  --headers FILE|-        install a DevTools "Copy request headers" paste
+  --import-cookies NAME   import an existing browser session (explicit only)
+  --import-firefox        alias for --import-cookies firefox
+  --google                alias for --signin auto
+  --spotify               Spotify sp_dc sign-in (WebKitGTK)
+
+Engines run in-process when the current interpreter has them, otherwise the
+helper re-execs itself with a system Python that does. Cookie extraction and
+verification always use this interpreter (the app venv), where ytmusicapi and
+yt-dlp live.
 """
+
 import argparse
-import configparser
-import glob
-import hashlib
+import atexit
+import importlib
+import importlib.util
 import json
 import os
 import shutil
-import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
-import uuid
 
-if sys.platform == "win32":
-    _BASE = os.environ.get("APPDATA") or os.path.expanduser("~")
-    CONFIG = os.environ.get("P100_CONFIG_DIR") or os.path.join(_BASE, "crossfade")
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
-          "Gecko/20100101 Firefox/140.0")
-else:
-    CONFIG = os.environ.get("P100_CONFIG_DIR") or os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "crossfade")
-    UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+EXIT_OK = 0
+EXIT_BAD_HEADERS = 2
+EXIT_NO_ENGINE = 3
+EXIT_CANCELLED = 4
+EXIT_REJECTED = 5
+EXIT_BLOCKED = 6
 
+START_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&continue="
+             "https%3A%2F%2Fmusic.youtube.com%2F")
+HOME_URL = "https://music.youtube.com/"
+SPOTIFY_START = ("https://accounts.spotify.com/en/login?continue="
+                 "https%3A%2F%2Fopen.spotify.com%2F")
+SPOTIFY_HOME = "https://open.spotify.com/"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/140.0.0.0 Safari/537.36")
 
-def _write_private(path, text):
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    try:
-        os.chmod(os.path.dirname(path), 0o700)
-    except OSError:
-        pass
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+WEBKIT_SPECS = (
+    ("WebKit", "6.0", "4.0"),
+    ("WebKit2", "4.1", "3.0"),
+    ("WebKit2", "4.0", "3.0"),
+)
+QT_BINDINGS = ("PyQt6", "PySide6", "PyQt5", "PySide2")
 
 
-def _sapisid_hash(cookies):
-    sapisid = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or ""
-    if not sapisid:
-        raise RuntimeError("Google did not return a SAPISID cookie")
-    ts = int(time.time())
-    h = hashlib.sha1(f"{ts} {sapisid} https://music.youtube.com".encode()).hexdigest()
-    parts = [f"SAPISIDHASH {ts}_{h}"]
-    for name, scheme in (("__Secure-1PAPISID", "SAPISID1PHASH"),
-                         ("__Secure-3PAPISID", "SAPISID3PHASH")):
-        if name in cookies:
-            hh = hashlib.sha1(f"{ts} {cookies[name]} https://music.youtube.com".encode()).hexdigest()
-            parts.append(f"{scheme} {ts}_{hh}")
-    return " ".join(parts)
-
-
-def _write_browser_json(cookie_header, cookies):
-    headers = {
-        "cookie": cookie_header,
-        "authorization": _sapisid_hash(cookies),
-        "x-goog-authuser": "0",
-        "origin": "https://music.youtube.com",
-        "x-origin": "https://music.youtube.com",
-        "referer": "https://music.youtube.com/",
-        "user-agent": UA,
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-    }
-    _write_private(os.path.join(CONFIG, "browser.json"),
-                   json.dumps(headers, indent=2, sort_keys=True))
-    return True
-
-
-def _firefox_cookie_db():
-    home = os.path.expanduser("~")
-    if sys.platform == "win32":
-        root = os.path.join(os.environ.get("APPDATA", home), "Mozilla", "Firefox")
-    else:
-        root = os.path.join(home, ".mozilla", "firefox")
-    ini = os.path.join(root, "profiles.ini")
+def _find_share_dir():
+    env = os.environ.get("P100_SHARE_DIR")
+    here = os.path.dirname(os.path.abspath(__file__))
     candidates = []
-    if os.path.exists(ini):
-        cp = configparser.ConfigParser()
-        cp.read(ini)
-        for section in cp.sections():
-            if cp.get(section, "IsRelative", fallback="1") == "1":
-                path = os.path.join(os.path.dirname(ini), cp.get(section, "Path", fallback=""))
-            else:
-                path = cp.get(section, "Path", fallback="")
-            if os.path.isdir(path):
-                candidates.append(path)
-    candidates += glob.glob(os.path.join(root, "*"))
-    for path in candidates:
-        db = os.path.join(path, "cookies.sqlite")
-        if os.path.exists(db):
-            return db
+    if env:
+        candidates.append(env)
+    candidates += [
+        os.path.dirname(here),                # installed: <share>/scripts/..
+        os.path.dirname(os.path.dirname(here)),  # repo: scripts/..
+        here,
+    ]
+    for share in candidates:
+        if os.path.isdir(os.path.join(share, "py", "cf_backend")):
+            return share
     return ""
 
 
-def import_firefox():
-    db = _firefox_cookie_db()
-    if not db:
-        raise RuntimeError("No Firefox profile with cookies.sqlite was found")
-    tmp = tempfile.mktemp(prefix="crossfade-cookies-", suffix=".sqlite")
-    # Firefox may hold the DB; a copy is enough and avoids locks.
-    shutil.copy2(db, tmp)
+SHARE_DIR = _find_share_dir()
+if SHARE_DIR:
+    sys.path.insert(0, os.path.join(SHARE_DIR, "py"))
+
+from cf_backend import login  # noqa: E402
+
+LOG_PATH = os.path.join(login.config_dir(), "login.log")
+RESULT = {"code": 1}
+RESULT_FILE = None
+
+
+def log(message):
+    line = time.strftime("%H:%M:%S ") + message
+    print(line, flush=True)
+    # On Windows the helper is spawned without a console and without stdout
+    # redirection, so keep its own copy for the Settings panel. On POSIX the
+    # parent redirects stdout/stderr to this same file.
+    if sys.platform == "win32":
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+@atexit.register
+def _write_result():
+    if not RESULT_FILE:
+        return
     try:
-        con = sqlite3.connect(tmp)
-        rows = con.execute(
-            "select name,value,host from moz_cookies "
-            "where host like '%youtube.com' or host like '%google.com'").fetchall()
-        con.close()
-    finally:
+        with open(RESULT_FILE, "w", encoding="utf-8") as f:
+            f.write(str(RESULT["code"]))
+    except OSError:
+        pass
+
+
+def _truncate_log():
+    try:
+        os.makedirs(login.config_dir(), exist_ok=True)
+        with open(LOG_PATH, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+
+
+def _write_cookies(path, cookies, filter_auth=True):
+    if filter_auth:
+        cookies = login.filter_cookies(cookies)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".crossfade-login-", suffix=".json",
+                               dir=os.path.dirname(path) or ".")
+    try:
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    cookies = {}
-    for name, value, host in rows:
-        if name in ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID",
-                    "SID", "HSID", "SSID", "APISID", "__Secure-1PSID",
-                    "__Secure-3PSID", "SIDCC", "__Secure-1PSIDTS", "__Secure-3PSIDTS"):
-            cookies[name] = value
-    if "SAPISID" not in cookies:
-        raise RuntimeError("Firefox has no signed-in YouTube Music session")
-    header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    return _write_browser_json(header, cookies)
+        raise
 
 
-def _find_make_browser_json():
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    share = os.environ.get("P100_SHARE_DIR")
-    if share:
-        candidates.append(os.path.join(share, "make_browser_json.py"))
-    candidates += [
-        os.path.join(here, "..", "make_browser_json.py"),
-        os.path.join(here, "..", "packaging", "windows", "make_browser_json.py"),
-        os.path.join(here, "make_browser_json.py"),
-    ]
-    for path in candidates:
-        path = os.path.abspath(path)
-        if os.path.isfile(path):
-            return path
+def _read_cookies(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Capability probing
+# ---------------------------------------------------------------------------
+
+def _webkit_imports():
+    try:
+        import gi
+    except Exception:
+        return None
+    for ns, ver, gtk_ver in WEBKIT_SPECS:
+        try:
+            gi.require_version(ns, ver)
+            gi.require_version("Gtk", gtk_ver)
+            Gtk = importlib.import_module("gi.repository.Gtk")
+            WebKit = importlib.import_module("gi.repository." + ns)
+            GLib = importlib.import_module("gi.repository.GLib")
+            return ns, ver, gtk_ver, Gtk, WebKit, GLib
+        except Exception:
+            continue
+    return None
+
+
+def _qt_binding():
+    for name in QT_BINDINGS:
+        try:
+            if importlib.util.find_spec(name) is None:
+                continue
+            if importlib.util.find_spec(name + ".QtWebEngineWidgets") is None:
+                continue
+            return name
+        except Exception:
+            continue
     return ""
 
 
-def _clipboard_text():
-    import subprocess
+def _webview2_available():
+    if sys.platform != "win32":
+        return False
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
-            capture_output=True, timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return result.stdout.decode("utf-8", errors="replace")
+        return importlib.util.find_spec("webview") is not None
     except Exception:
-        return ""
+        return False
 
 
-def _finish_windows_login(text, make_json):
-    """Write browser.json from a copied header block. Returns (ok, output)."""
-    import subprocess
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
-    try:
-        tmp.write(text)
-        tmp.close()
-        result = subprocess.run(
-            [sys.executable, make_json, tmp.name],
-            capture_output=True, text=True, timeout=180,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
-    except Exception as e:
-        return False, str(e)
-    finally:
+def _engine_available_here(engine):
+    if engine == "webkit":
+        return _webkit_imports() is not None
+    if engine == "qt":
+        return bool(_qt_binding())
+    if engine == "webview2":
+        return _webview2_available()
+    return False
+
+
+def _system_pythons():
+    candidates = []
+    env = os.environ.get("P100_SYSTEM_PYTHON")
+    if env:
+        candidates.append(env)
+    candidates += ["/usr/bin/python3", "/usr/local/bin/python3", shutil.which("python3")]
+    out = []
+    seen = {os.path.realpath(sys.executable)}
+    for py in candidates:
+        if not py:
+            continue
+        real = os.path.realpath(py)
+        if real in seen or not os.path.exists(real):
+            continue
+        seen.add(real)
+        out.append(py)
+    return out
+
+
+def _probe_engine_here(engine):
+    if _engine_available_here(engine):
+        if engine == "webkit":
+            info = _webkit_imports()
+            return True, f"WebKitGTK {info[1]}"
+        if engine == "qt":
+            return True, _qt_binding()
+        return True, "WebView2 (pywebview)"
+    return False, "not available in this interpreter"
+
+
+def _probe_engine(engine):
+    ok, label = _probe_engine_here(engine)
+    if ok or engine == "webview2" or sys.platform == "win32":
+        return ok, label
+    for py in _system_pythons():
         try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+            proc = subprocess.run(
+                [py, os.path.abspath(__file__), "--probe-engine", engine],
+                capture_output=True, text=True, timeout=20)
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout.strip().splitlines()[-1])
+                if data.get("available"):
+                    return True, data.get("label") or py
+        except Exception:
+            continue
+    return False, label
 
 
-def _windows_login():
-    """Browser + Tkinter clipboard flow for Windows (no WebKitGTK/gi needed).
-
-    The sign-in itself happens in the user's normal browser, which already has
-    their Google session. DevTools' "Copy request headers" gives us the cookie
-    block; make_browser_json.py turns it into browser.json and verifies it.
-    """
-    import webbrowser
-
-    make_json = _find_make_browser_json()
-    if not make_json:
-        raise RuntimeError("make_browser_json.py was not found; reinstall crossfade")
-
-    site = "https://music.youtube.com/"
-    webbrowser.open(site)
-
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-    except Exception:
-        # No Tk (rare): wait for the headers on the clipboard in the console.
-        print("Waiting for request headers on the clipboard ...", file=sys.stderr)
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            text = _clipboard_text()
-            if "cookie" in text.lower():
-                ok, output = _finish_windows_login(text, make_json)
-                print(output)
-                if ok:
-                    return True
-                raise RuntimeError(output.strip()[-500:] or "sign-in failed")
-            time.sleep(1)
-        raise RuntimeError("timed out waiting for the clipboard")
-
-    root = tk.Tk()
-    root.title("Sign in to crossfade")
-    root.geometry("600x400")
-    root.minsize(520, 340)
-    root.attributes("-topmost", True)
-    root.after(1000, lambda: root.attributes("-topmost", False))
-    completed = {"ok": False}
-
-    frame = tk.Frame(root, padx=18, pady=16)
-    frame.pack(fill="both", expand=True)
-
-    tk.Label(frame, text="Sign in to YouTube Music", font=("Segoe UI", 14, "bold"),
-             anchor="w").pack(fill="x")
-    instructions = (
-        "1. Your browser opened YouTube Music. Make sure you are signed in\n"
-        "   (your profile picture is visible in the top-right corner).\n\n"
-        "2. Press F12, open the Network tab, and click any POST request to\n"
-        "   music.youtube.com. Right-click it and choose\n"
-        "   Copy -> Copy request headers.\n\n"
-        "3. Come back to this window and click \"I copied the headers\"."
-    )
-    tk.Label(frame, text=instructions, justify="left", anchor="w",
-             font=("Segoe UI", 10), wraplength=545).pack(fill="x", pady=(10, 8))
-
-    status = tk.StringVar(value="")
-    tk.Label(frame, textvariable=status, fg="#555", anchor="w",
-             font=("Segoe UI", 9)).pack(fill="x")
-
-    buttons = tk.Frame(frame)
-    buttons.pack(side="bottom", fill="x", pady=(12, 0))
-
-    def open_browser():
-        webbrowser.open(site)
-
-    def finish():
-        try:
-            text = root.clipboard_get()
-        except tk.TclError:
-            text = ""
-        if "cookie" not in text.lower():
-            messagebox.showwarning(
-                "No request headers",
-                "The clipboard does not contain request headers.\n\n"
-                "In the browser: F12 -> Network -> click a POST request to "
-                "music.youtube.com -> right-click -> Copy -> Copy request headers.",
-                parent=root,
-            )
-            return
-        status.set("Signing in ...")
-        root.update_idletasks()
-        ok, output = _finish_windows_login(text, make_json)
-        if ok:
-            completed["ok"] = True
-            messagebox.showinfo(
-                "Signed in",
-                "crossfade is signed in to YouTube Music.\n\n"
-                "Restart crossfade if it is already running.",
-                parent=root,
-            )
-            root.destroy()
-            return
-        status.set("")
-        tail = "\n".join(output.strip().splitlines()[-14:])
-        messagebox.showerror("Sign-in failed", tail or "Unknown error", parent=root)
-
-    tk.Button(buttons, text="Open YouTube Music again", command=open_browser,
-              width=24).pack(side="left")
-    tk.Button(buttons, text="I copied the headers", command=finish,
-              width=22, default="active").pack(side="right")
-    tk.Button(buttons, text="Cancel", command=root.destroy,
-              width=10).pack(side="right", padx=(0, 8))
-
-    root.mainloop()
-    return completed["ok"]
+def probe_payload():
+    engines = []
+    for engine in ("webkit", "qt", "webview2"):
+        available, label = _probe_engine(engine)
+        engines.append({"id": engine, "available": bool(available),
+                        "label": label if available else "", "reason": "" if available else label})
+    return {
+        "python": sys.executable,
+        "share": SHARE_DIR,
+        "engines": engines,
+        "browsers": _detect_browsers(),
+        "paste": True,
+    }
 
 
-def _webview(site):
-    """Open a real sign-in window and harvest the session cookies.
+def _browser_candidates():
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        roaming = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        return {
+            "firefox": [os.path.join(roaming, "Mozilla", "Firefox")],
+            "librewolf": [os.path.join(roaming, "librewolf")],
+            "chrome": [os.path.join(local, "Google", "Chrome", "User Data")],
+            "chromium": [os.path.join(local, "Chromium", "User Data")],
+            "edge": [os.path.join(local, "Microsoft", "Edge", "User Data")],
+            "brave": [os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data")],
+        }
+    return {
+        "firefox": [os.path.join(home, ".mozilla", "firefox")],
+        "librewolf": [os.path.join(home, ".librewolf")],
+        "chrome": [os.path.join(home, ".config", "google-chrome"),
+                   os.path.join(home, ".config", "google-chrome-beta")],
+        "chromium": [os.path.join(home, ".config", "chromium")],
+        "edge": [os.path.join(home, ".config", "microsoft-edge")],
+        "brave": [os.path.join(home, ".config", "BraveSoftware", "Brave-Browser")],
+    }
 
-    Works with both WebKitGTK 6.x (GTK4, `WebKit` namespace) and the older
-    WebKit2GTK 4.1 (GTK3, `WebKit2` namespace). The window closes itself as
-    soon as the required cookie appears, so the user never has to find a
-    "done" button after the final Google/Spotify redirect.
-    """
-    import gi
 
-    webkit_version = None
-    try:
-        gi.require_version("WebKit", "6.0")
-        from gi.repository import WebKit
-        webkit_version = "6.0"
-    except Exception:
-        gi.require_version("WebKit2", "4.1")
-        from gi.repository import WebKit2 as WebKit
-        webkit_version = "4.1"
+def _detect_browsers():
+    found = []
+    for name, paths in _browser_candidates().items():
+        if any(os.path.isdir(path) for path in paths):
+            found.append(name)
+    return found
 
-    if webkit_version == "6.0":
-        gi.require_version("Gtk", "4.0")
-        from gi.repository import Gtk
-        gtk4 = True
-    else:
-        gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk
-        gtk4 = False
-    from gi.repository import GLib
 
-    start = ("https://accounts.google.com/ServiceLogin?service=youtube&continue="
-             "https%3A%2F%2Fmusic.youtube.com%2F" if site == "google" else
-             "https://accounts.spotify.com/en/login?continue=https%3A%2F%2Fopen.spotify.com%2F")
-    home = "https://music.youtube.com/" if site == "google" else "https://open.spotify.com/"
-    required = "SAPISID" if site == "google" else "sp_dc"
+# ---------------------------------------------------------------------------
+# WebKitGTK engine (YouTube or Spotify)
+# ---------------------------------------------------------------------------
 
-    state = {"cookies": None, "error": None, "finished": False}
+def run_webkit(out_path, site="google"):
+    imports = _webkit_imports()
+    if not imports:
+        return EXIT_NO_ENGINE, "No usable WebKitGTK (gi) installation was found"
+    _ns, version, _gtk_ver, Gtk, WebKit, GLib = imports
+
+    start = SPOTIFY_START if site == "spotify" else START_URL
+    home = SPOTIFY_HOME if site == "spotify" else HOME_URL
+    required = "sp_dc" if site == "spotify" else "__Secure-3PAPISID"
+    state = {"cookies": {}, "done": False, "closed": False, "error": ""}
 
     def cookie_manager(view):
         try:
@@ -342,134 +309,501 @@ def _webview(site):
         except Exception:
             return view.get_cookie_manager()
 
-    def persist(cookies):
-        if required not in cookies:
+    def persist(cookie_list):
+        mapping = {}
+        for cookie in cookie_list:
+            try:
+                mapping[cookie.get_name()] = cookie.get_value()
+            except Exception:
+                pass
+        state["cookies"] = mapping
+        if not mapping.get(required):
             return False
         if site == "spotify":
-            _write_private(os.path.join(CONFIG, "spotify.json"),
-                           json.dumps({"sp_dc": cookies["sp_dc"]}, indent=2))
+            _write_cookies(os.path.join(login.config_dir(), "spotify.json"),
+                           {"sp_dc": mapping["sp_dc"]}, filter_auth=False)
         else:
-            header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-            _write_browser_json(header, cookies)
+            _write_cookies(out_path, mapping)
+        state["done"] = True
         return True
 
+    gtk4 = _gtk_ver == "4.0"
     if gtk4:
         app = Gtk.Application(application_id="dev.crossfade.login")
 
         def on_activate(application):
             win = Gtk.ApplicationWindow(application=application)
             win.set_title("Sign in to crossfade")
-            win.set_default_size(540, 820)
+            win.set_default_size(560, 840)
             view = WebKit.WebView()
+            try:
+                view.get_settings().set_user_agent(UA)
+            except Exception:
+                pass
             win.set_child(view)
             manager = cookie_manager(view)
-            manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+            try:
+                manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+            except Exception:
+                pass
 
             def on_cookies(mgr, task, *_):
-                if state["finished"]:
+                if state["done"]:
                     return
                 try:
                     cookies = mgr.get_cookies_finish(task)
-                    mapping = {c.get_name(): c.get_value() for c in cookies}
-                    state["cookies"] = mapping
-                    if persist(mapping):
-                        state["finished"] = True
-                        application.quit()
                 except Exception as e:
                     state["error"] = str(e)
+                    return
+                if persist(cookies):
+                    application.quit()
 
             def poll():
-                if state["finished"]:
+                if state["done"]:
                     return False
                 manager.get_cookies(home, None, on_cookies)
                 return True
 
             def on_close(*_):
-                state["finished"] = True
+                state["closed"] = True
                 application.quit()
                 return False
 
-            view.connect("load-changed", lambda v, event: None)
             win.connect("close-request", on_close)
             view.load_uri(start)
             win.present()
             GLib.timeout_add(650, poll)
 
+            def on_timeout():
+                application.quit()
+                return False
+
+            GLib.timeout_add_seconds(900, on_timeout)
+
         app.connect("activate", on_activate)
         app.run([])
     else:
         win = Gtk.Window(title="Sign in to crossfade")
-        win.set_default_size(540, 820)
+        win.set_default_size(560, 840)
         view = WebKit.WebView()
+        try:
+            view.get_settings().set_user_agent(UA)
+        except Exception:
+            pass
         win.add(view)
         manager = cookie_manager(view)
-        manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+        try:
+            manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+        except Exception:
+            pass
         loop = GLib.MainLoop()
 
         def on_cookies(mgr, task, *_):
-            if state["finished"]:
+            if state["done"]:
                 return
             try:
                 cookies = mgr.get_cookies_finish(task)
-                mapping = {c.get_name(): c.get_value() for c in cookies}
-                state["cookies"] = mapping
-                if persist(mapping):
-                    state["finished"] = True
-                    loop.quit()
             except Exception as e:
                 state["error"] = str(e)
+                return
+            if persist(cookies):
+                loop.quit()
 
         def poll():
-            if state["finished"]:
+            if state["done"]:
                 return False
             manager.get_cookies(home, None, on_cookies)
             return True
 
         def on_close(*_):
-            state["finished"] = True
+            state["closed"] = True
             loop.quit()
 
         win.connect("destroy", on_close)
         view.load_uri(start)
         win.show_all()
         GLib.timeout_add(650, poll)
+
+        def on_timeout():
+            loop.quit()
+            return False
+
+        GLib.timeout_add_seconds(900, on_timeout)
         loop.run()
 
-    cookies = state["cookies"] or {}
-    if state["error"] and required not in cookies:
-        raise RuntimeError(state["error"])
-    if required not in cookies:
-        raise RuntimeError("Sign-in was cancelled or no signed-in cookie was found")
-    return True
+    if state["done"]:
+        return EXIT_OK, f"WebKitGTK {version} sign-in completed"
+    if state["closed"]:
+        return EXIT_CANCELLED, "Sign-in window closed"
+    if state["error"]:
+        return EXIT_REJECTED, state["error"]
+    return EXIT_REJECTED, ("No Google sign-in cookie appeared. Google may have "
+                           "blocked the embedded browser.")
+
+
+# ---------------------------------------------------------------------------
+# Qt WebEngine engine
+# ---------------------------------------------------------------------------
+
+def _qt_classes(binding):
+    core = importlib.import_module(binding + ".QtCore")
+    widgets = importlib.import_module(binding + ".QtWidgets")
+    wew = importlib.import_module(binding + ".QtWebEngineWidgets")
+    profile_cls = getattr(wew, "QWebEngineProfile", None)
+    try:
+        wec = importlib.import_module(binding + ".QtWebEngineCore")
+        profile_cls = getattr(wec, "QWebEngineProfile", profile_cls)
+    except Exception:
+        pass
+    return core, widgets, wew, profile_cls
+
+
+def _cookie_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    try:
+        return bytes(value).decode("utf-8", "replace")
+    except Exception:
+        return str(value)
+
+
+def run_qt(out_path):
+    binding = _qt_binding()
+    if not binding:
+        return EXIT_NO_ENGINE, "No Qt WebEngine Python bindings were found"
+    try:
+        core, widgets, wew, profile_cls = _qt_classes(binding)
+        QApplication = widgets.QApplication
+        QWebEngineView = wew.QWebEngineView
+        QUrl = core.QUrl
+        QTimer = core.QTimer
+    except Exception as e:
+        return EXIT_NO_ENGINE, f"Qt WebEngine could not be imported: {e}"
+
+    app = QApplication.instance() or QApplication([])
+    profile = profile_cls(app) if profile_cls else None
+    try:
+        profile.setHttpUserAgent(UA)
+    except Exception:
+        pass
+    store = profile.cookieStore() if profile else None
+    if store is None:
+        return EXIT_NO_ENGINE, "The Qt WebEngine cookie store is unavailable"
+
+    state = {"cookies": {}, "done": False, "closed": False, "error": ""}
+
+    def on_cookie(cookie):
+        try:
+            state["cookies"][cookie.name()] = _cookie_text(cookie.value())
+        except Exception:
+            pass
+
+    try:
+        store.cookieAdded.connect(on_cookie)
+    except Exception as e:
+        return EXIT_NO_ENGINE, f"Qt cookie signals are unavailable: {e}"
+    try:
+        store.loadAllCookies()
+    except Exception:
+        pass
+
+    class View(QWebEngineView):
+        def closeEvent(self, event):
+            state["closed"] = True
+            app.quit()
+            event.accept()
+
+    view = View()
+    view.setWindowTitle("Sign in to crossfade")
+    view.resize(560, 840)
+    view.setUrl(QUrl(START_URL))
+    view.show()
+
+    def poll():
+        if state["done"]:
+            return
+        cookies = dict(state["cookies"])
+        if cookies.get("__Secure-3PAPISID"):
+            try:
+                _write_cookies(out_path, cookies)
+                state["done"] = True
+            except Exception as e:
+                state["error"] = str(e)
+            app.quit()
+
+    timer = QTimer()
+    timer.timeout.connect(poll)
+    timer.start(700)
+    timeout = QTimer()
+    timeout.setSingleShot(True)
+    timeout.timeout.connect(app.quit)
+    timeout.start(900 * 1000)
+    if hasattr(app, "exec"):
+        app.exec()
+    else:
+        app.exec_()
+
+    if state["done"]:
+        return EXIT_OK, f"{binding} sign-in completed"
+    if state["closed"]:
+        return EXIT_CANCELLED, "Sign-in window closed"
+    if state["error"]:
+        return EXIT_REJECTED, state["error"]
+    return EXIT_REJECTED, ("No Google sign-in cookie appeared. Google may have "
+                           "blocked the embedded browser.")
+
+
+# ---------------------------------------------------------------------------
+# Windows WebView2 through optional pywebview
+# ---------------------------------------------------------------------------
+
+def run_webview2(out_path):
+    if sys.platform != "win32":
+        return EXIT_NO_ENGINE, "WebView2 is only available on Windows"
+    try:
+        import webview
+    except Exception as e:
+        return EXIT_NO_ENGINE, f"pywebview is not installed ({e})"
+    window_cls = getattr(webview, "Window", None)
+    if window_cls is None or not hasattr(window_cls, "get_cookies"):
+        return EXIT_NO_ENGINE, "The installed pywebview cannot read cookies"
+
+    state = {"ok": False, "closed": False, "error": ""}
+    window = webview.create_window("Sign in to crossfade", START_URL,
+                                   width=580, height=860)
+
+    def on_closed():
+        state["closed"] = True
+
+    try:
+        window.events.closed += on_closed
+    except Exception:
+        pass
+
+    def worker(win):
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            if state["closed"]:
+                break
+            try:
+                cookies = win.get_cookies() or []
+            except Exception:
+                cookies = []
+            mapping = {}
+            for cookie in cookies:
+                try:
+                    mapping[cookie.name] = cookie.value
+                except Exception:
+                    pass
+            if mapping.get("__Secure-3PAPISID"):
+                try:
+                    _write_cookies(out_path, mapping)
+                    state["ok"] = True
+                except Exception as e:
+                    state["error"] = str(e)
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                return
+            time.sleep(0.8)
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    try:
+        webview.start(worker, window, gui="edgechromium", private_mode=False,
+                      storage_path=os.path.join(login.config_dir(), "login-webview2"))
+    except Exception as e:
+        return EXIT_NO_ENGINE, f"WebView2 could not start: {e}"
+
+    if state["ok"]:
+        return EXIT_OK, "WebView2 sign-in completed"
+    if state["closed"]:
+        return EXIT_CANCELLED, "Sign-in window closed"
+    if state["error"]:
+        return EXIT_REJECTED, state["error"]
+    return EXIT_REJECTED, ("No Google sign-in cookie appeared. Google may have "
+                           "blocked the embedded browser.")
+
+
+# ---------------------------------------------------------------------------
+# Engine cascade
+# ---------------------------------------------------------------------------
+
+def _run_engine(engine, out_path):
+    if engine == "webkit":
+        return run_webkit(out_path)
+    if engine == "qt":
+        return run_qt(out_path)
+    if engine == "webview2":
+        return run_webview2(out_path)
+    return EXIT_NO_ENGINE, f"Unknown engine: {engine}"
+
+
+def _invoke_engine(engine, out_path):
+    if _engine_available_here(engine):
+        return _run_engine(engine, out_path)
+    if engine == "webview2":
+        return EXIT_NO_ENGINE, "pywebview is not installed"
+    for py in _system_pythons():
+        try:
+            rc = subprocess.call(
+                [py, os.path.abspath(__file__), "--engine", engine, "--out", out_path])
+            if rc != EXIT_NO_ENGINE:
+                return rc, f"{engine} (via {py})"
+        except Exception:
+            continue
+    return EXIT_NO_ENGINE, f"{engine} is not available"
+
+
+def cmd_signin(choice):
+    _truncate_log()
+    order = ["webkit", "qt", "webview2"] if choice == "auto" else [choice]
+    if sys.platform != "win32":
+        order = [engine for engine in order if engine != "webview2"]
+    out_path = os.path.join(login.config_dir(), "login-cookies.json")
+    attempted = False
+    for engine in order:
+        log(f"Trying {engine} ...")
+        rc, detail = _invoke_engine(engine, out_path)
+        log(f"{engine}: {detail} (code {rc})")
+        if rc != EXIT_NO_ENGINE:
+            attempted = True
+        if rc == EXIT_OK:
+            try:
+                cookies = _read_cookies(out_path)
+            except Exception as e:
+                log(f"{engine}: could not read cookies ({e})")
+                continue
+            ok, message = login.install_from_cookies(cookies)
+            log(message)
+            if ok:
+                return EXIT_OK
+            attempted = True
+            continue
+        if rc == EXIT_CANCELLED:
+            return EXIT_CANCELLED
+    log("No embedded sign-in engine worked; use the paste panel.")
+    return EXIT_BLOCKED if attempted else EXIT_NO_ENGINE
+
+
+def cmd_import_cookies(choice):
+    _truncate_log()
+    if choice == "auto":
+        names = ["firefox", "librewolf", "chrome", "chromium", "edge", "brave"]
+    else:
+        names = [choice]
+    for name in names:
+        try:
+            if name in ("firefox", "librewolf"):
+                root = None
+                if name == "librewolf":
+                    root = _browser_candidates()["librewolf"][0]
+                cookies = login.cookies_from_firefox(profile_root=root)
+            else:
+                cookies = login.cookies_from_ytdlp_browser(name)
+        except Exception as e:
+            log(f"{name}: {e}")
+            continue
+        ok, message = login.install_from_cookies(cookies)
+        log(f"{name}: {message}")
+        if ok:
+            return EXIT_OK
+    log("No usable signed-in browser session was found.")
+    return EXIT_REJECTED
+
+
+def cmd_headers(path):
+    try:
+        if path == "-":
+            text = sys.stdin.read()
+        else:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+    except Exception as e:
+        return EXIT_BAD_HEADERS, f"Could not read the headers: {e}"
+    finally:
+        # Only remove the app's own temp file, never a path the user chose.
+        try:
+            if (path != "-" and
+                    os.path.dirname(os.path.abspath(path)) ==
+                    os.path.abspath(login.config_dir())):
+                os.unlink(path)
+        except OSError:
+            pass
+    ok, message = login.install_from_headers(text)
+    if ok:
+        return EXIT_OK, message
+    if "No Cookie header" in message or "Could not parse" in message:
+        return EXIT_BAD_HEADERS, message
+    return EXIT_REJECTED, message
+
+
+def _dispatch(args):
+    if args.probe_engine:
+        ok, label = _probe_engine_here(args.probe_engine)
+        print(json.dumps({"available": bool(ok), "label": label},
+                         separators=(",", ":")))
+        return EXIT_OK
+    if args.probe:
+        print(json.dumps(probe_payload(), separators=(",", ":")))
+        return EXIT_OK
+    if args.engine:
+        if not args.out:
+            print("--engine requires --out", file=sys.stderr)
+            return EXIT_NO_ENGINE
+        rc, detail = _run_engine(args.engine, args.out)
+        if detail:
+            log(detail)
+        return rc
+    if args.headers:
+        rc, message = cmd_headers(args.headers)
+        log(message)
+        return rc
+    if args.import_cookies:
+        return cmd_import_cookies(args.import_cookies)
+    if args.import_firefox:
+        return cmd_import_cookies("firefox")
+    if args.spotify:
+        rc, detail = run_webkit(None, site="spotify")
+        log(detail)
+        return rc
+    if args.signin:
+        return cmd_signin(args.signin)
+    if args.google:
+        return cmd_signin("auto")
+    return None
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--probe-engine", choices=["webkit", "qt", "webview2"])
+    ap.add_argument("--engine", choices=["webkit", "qt", "webview2"])
+    ap.add_argument("--out")
+    ap.add_argument("--signin", nargs="?", const="auto",
+                    choices=["auto", "webkit", "qt", "webview2"])
+    ap.add_argument("--import-cookies", nargs="?", const="auto",
+                    choices=["auto", "firefox", "librewolf", "chrome", "chromium",
+                             "edge", "brave"])
+    ap.add_argument("--headers")
     ap.add_argument("--google", action="store_true")
     ap.add_argument("--import-firefox", action="store_true")
     ap.add_argument("--spotify", action="store_true")
+    ap.add_argument("--result-file")
     args = ap.parse_args()
-    if not (args.google or args.import_firefox or args.spotify):
-        ap.error("choose --google, --import-firefox or --spotify")
-    try:
-        if args.import_firefox:
-            import_firefox()
-        elif args.spotify:
-            _webview("spotify")
-        elif sys.platform == "win32":
-            if not _windows_login():
-                raise RuntimeError("sign-in was cancelled or did not finish")
-        else:
-            try:
-                _webview("google")
-            except RuntimeError as e:
-                print(f"Popup unavailable ({e}); importing Firefox cookies...", file=sys.stderr)
-                import_firefox()
-        print("ok")
-        return 0
-    except Exception as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+
+    global RESULT_FILE
+    RESULT_FILE = args.result_file
+    code = _dispatch(args)
+    if code is None:
+        print("choose --signin, --headers, --import-cookies, --probe or --spotify",
+              file=sys.stderr)
+        code = EXIT_BAD_HEADERS
+    RESULT["code"] = code
+    return code
 
 
 if __name__ == "__main__":

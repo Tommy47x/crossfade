@@ -231,6 +231,9 @@ PlaylistSource playlist_source_for_tab(Tab tab);
 void save_settings(const Settings &settings);
 Settings load_settings();
 void draw_settings_panel(AppState &state);
+// Poll the detached sign-in helper's result/log. Main thread, every frame;
+// completes even when the Settings panel is not open.
+void ui_auth_poll(AppState &state);
 
 // Session persistence
 void save_session(const AppState &state, const class MpvPlayer &player,

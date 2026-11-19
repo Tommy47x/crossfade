@@ -1177,7 +1177,8 @@ int app_run(int argc, char **argv)
                                  g_state.video_loading.load() ||
                                  g_state.video_page_alpha > 0.001f;
         if (animating || g_state.loading || recently_active ||
-            g_cf.pending.load() || g_cf.active.load() || video_frame)
+            g_cf.pending.load() || g_cf.active.load() || video_frame ||
+            g_state.auth_login_running.load())
             interval_ms = low_power ? tunable_int("ui.frame_lp_active_ms")
                                     : active_frame_ms(g_state.settings, window);
         else if (g_state.playing)
@@ -2549,6 +2550,7 @@ int app_run(int argc, char **argv)
             // after the other windows): the search typeahead dropdown.
             draw_search_suggestions_overlay(g_state);
             updater::poll();
+            ui_auth_poll(g_state);
             ui_notify_draw();
             // Draw the QR takeover after the toasts so it is a true top-most
             // surface. The modal already blocks clicks to everything behind it.

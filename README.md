@@ -382,9 +382,10 @@ No admin rights, no build tools:
    and double-click it.
 2. Launch **crossfade** from the Start Menu. The installer also asks whether it
    should start hidden when you sign in (warm start).
-3. Sign in once: **Settings → Sign in with browser** inside the app (it opens
-   YouTube Music in your browser and a small window that reads the request
-   headers you copy), or Start Menu → **crossfade-login**. See [Sign in](#sign-in).
+3. Sign in once: **Settings → YouTube Music → Sign in** inside the app. It uses
+   the Windows WebView2 engine when the optional `pywebview` package is
+   installed (the installer tries), and otherwise offers the paste panel. Start
+   Menu → **crossfade-login** still works too. See [Sign in](#sign-in).
 
 The installer sets up everything per-user under `%LOCALAPPDATA%\crossfade`:
 the app with every runtime DLL bundled (SDL2, libmpv + codecs, and Mesa
@@ -462,58 +463,71 @@ in guest mode — search, albums, artists, radio, lyrics, podcasts, downloads an
 playlists all work. Signing in is optional, and unlocks personalized recommendations
 plus your YouTube Music playlists and library.
 
-### The easy way: copy request headers
+### Sign in from the app (recommended)
+
+**Settings → YouTube Music → Sign in** opens a sign-in window using whatever
+webview engine your system has, with no extra runtime bundled:
+
+1. **WebKitGTK** 6.0 (GTK4), 4.1 or 4.0 (GTK3) — the usual Linux path.
+2. **Qt WebEngine** if PyQt6/PySide6/PyQt5/PySide2 are installed.
+3. **Windows WebView2** through the optional `pywebview` package. The installer
+   adds it best-effort; the WebView2 runtime itself ships with Windows.
+
+The panel's **Sign-in methods detected** section shows what was found. If no
+engine is available — or Google refuses the embedded browser — use the paste
+panel below; it always works. Engines are detected at runtime, never required.
+
+### Paste request headers (works with any browser)
 
 1. Open [music.youtube.com](https://music.youtube.com) in your browser and log in.
 2. Open DevTools (**F12**) → **Network** tab.
 3. Make a POST request happen: refresh the page or click any song.
 4. Find a request to `music.youtube.com` (for example `youtubei/v1/browse`), right-click →
    **Copy → Copy request headers**.
-5. In a terminal, run:
+5. In **Settings → YouTube Music → Paste request headers**, paste the whole
+   block and click **Connect**. (Terminal users can still run
+   `crossfade-login` and paste there.)
 
-   ```bash
-   crossfade-login
-   ```
+The helper cleans HTTP/2 pseudo-headers, cURL `-H`/`-b` output, wrapped Cookie
+lines and Edge's multiple Cookie lines. It verifies the session against your
+library *before* replacing `browser.json`, so a bad paste leaves the current
+session untouched. A running crossfade picks up the new session automatically.
 
-   On Windows, use **Settings → Sign in with browser** inside crossfade instead:
-   it opens YouTube Music for you and a small "Sign in to crossfade" window that
-   turns the copied headers into a saved session (no terminal, no `gi`/WebKit
-   dependency).
+### Import an existing browser session
 
-6. Paste the headers when prompted (on Windows: click **I copied the headers**).
-   That writes `browser.json` into `~/.config/crossfade/`
-   (`%APPDATA%\crossfade\` on Windows). A running crossfade picks up the new
-   session automatically.
+**Import session from this browser** reads the browser selected under
+**Cookie browser** (Firefox, LibreWolf, Chrome, Chromium, Edge, Brave). Chrome
+and Edge decryption is delegated to yt-dlp (DPAPI/libsecret/Keychain). This is
+a one-click snapshot and is never used automatically: if the session has
+expired, verification fails and nothing changes, so a fresh window sign-in is
+still the reliable path.
 
 Launch crossfade and everything — home feed, likes, playlists, lyrics — is yours.
 
 > **Cookies expire** (weeks to months, Google's choice). When the home feed or search
-> suddenly comes back empty, run `crossfade-login` again. It takes about 30 seconds.
+> suddenly comes back empty, sign in again. It takes about 30 seconds.
 
-> **Privacy tip:** the copied headers contain your full Google session cookies. Consider a
-> dedicated browser profile for the header copy so your daily profile's cookies never leave
-> it:
+> **Privacy tip:** copied headers contain your full Google session cookies. Consider a
+> dedicated browser profile for the copy so your daily profile's cookies never leave it:
 >
 > ```bash
 > firefox -P "crossfade" -no-remote                       # create once, log in there
 > chromium --user-data-dir=~/.config/crossfade-browser    # Chromium-family equivalent
 > ```
 
-### Alternative: OAuth
+### Alternative: OAuth (experimental, CLI only)
 
-An OAuth token is long-lived and refreshes automatically instead of expiring like cookies.
+An OAuth token is long-lived and refreshes automatically instead of expiring.
+It is currently hidden in the interface because it requires your own Google
+Cloud client and is not a one-click flow.
 
 1. Create an OAuth client in the [Google Cloud Console](https://console.cloud.google.com/)
    → **APIs & Services → Credentials**, type **“TVs and Limited Input devices”**.
-2. Set `P100_OAUTH_CLIENT_ID` and `P100_OAUTH_CLIENT_SECRET` (or edit
-   `CLIENT_ID` / `CLIENT_SECRET` at the top of `p100-backend-oauth.py`). No
-   credentials are bundled with the repo.
-3. Switch **Settings → YouTube Music → Authentication → OAuth** and restart crossfade.
-4. If no token exists yet, crossfade starts in guest mode. Run the login command
-   below (or sign in from **Settings → YouTube Music**) to create `browseroauth.json`;
-   the backend restarts and picks it up without a relaunch.
-
-You can also trigger the login-only flow directly:
+2. Set `P100_OAUTH_CLIENT_ID` and `P100_OAUTH_CLIENT_SECRET` **in the
+   environment crossfade runs in**. No credentials are bundled.
+3. Set `auth_mode` to `"oauth"` in `settings.json` and restart crossfade.
+4. Run the login command below; it prints a device-code URL and waits for you
+   to approve it (you can approve on another device):
 
 ```bash
 ~/.local/share/crossfade/venv/bin/python \
@@ -1010,6 +1024,7 @@ Useful extras:
 
 ```bash
 python3 tests/test_backend_protocol.py   # shared cookie/OAuth command loop
+python3 tests/test_login.py              # sign-in helpers and helper CLI
 ./scripts/party-smoke-test.sh            # headless party HTTP checks
 ./scripts/bench.sh                       # binary/source/test/idle resource table
 ```

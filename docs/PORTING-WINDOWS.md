@@ -68,9 +68,13 @@ python -m venv venv
 venv/Scripts/pip install -U pip
 venv/Scripts/pip install -r requirements.txt
 
-# Auth (the bash login helper is Linux-only; call ytmusicapi directly)
-venv/Scripts/ytmusicapi browser --file "%APPDATA%/crossfade/browser.json"
-# ...paste request headers copied from music.youtube.com DevTools
+# Auth: the in-app sign-in panel uses WebView2 through the optional
+# pywebview package; without it, paste request headers in the panel.
+venv/Scripts/pip install pywebview        # optional WebView2 wrapper
+venv/Scripts/python scripts/crossfade-login-helper.py --probe
+venv/Scripts/python scripts/crossfade-login-helper.py --signin auto
+# Terminal fallback (paste headers, then Ctrl+Z+Enter):
+venv/Scripts/python scripts/crossfade-login-helper.py --headers -
 
 # Build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMPV_INCLUDE_DIR=... -DMPV_LIBRARY=...

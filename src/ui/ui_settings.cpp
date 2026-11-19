@@ -37,6 +37,16 @@
 #include <vector>
 #include <unordered_map>
 #include <functional>
+#include <chrono>
+
+#ifdef P100_WINDOWS
+#include "win_process.h"
+#else
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 
 // ----------------------------------------------------------------------
@@ -694,6 +704,296 @@ static std::string s_xfer_import_path;
 static std::string s_xfer_pick_dir;
 static bool s_xfer_pick_open = false;
 static bool s_xfer_confirm_open = false;
+
+// ----------------------------------------------------------------------
+// Sign-in helper plumbing
+//
+// The helper runs as a detached child so a webview window can stay open for
+// minutes without blocking the settings panel or joining on shutdown. It
+// writes <config>/login.log and <config>/login-result.txt; the UI tails both.
+// ----------------------------------------------------------------------
+static bool s_auth_paste_open = false;
+static std::string s_auth_headers;
+static bool s_auth_probe_started = false;
+static std::chrono::steady_clock::time_point s_auth_started{};
+
+static std::string auth_helper_script()
+{
+    return p100_share_dir() + "/scripts/crossfade-login-helper.py";
+}
+
+static std::string auth_quote(const std::string &value)
+{
+#ifdef P100_WINDOWS
+    std::string out = "\"";
+    for (char c : value)
+        out += (c == '"') ? "\\\"" : std::string(1, c);
+    return out + "\"";
+#else
+    std::string out = "'";
+    for (char c : value)
+    {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    return out + "'";
+#endif
+}
+
+static std::string auth_join(const std::vector<std::string> &args)
+{
+    std::string cmd;
+    for (const auto &arg : args)
+    {
+        if (!cmd.empty())
+            cmd += ' ';
+        cmd += auth_quote(arg);
+    }
+    return cmd;
+}
+
+static std::string auth_read_tail(const std::string &path, size_t max_bytes)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return {};
+    std::string data((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    if (data.size() > max_bytes)
+        data.erase(0, data.size() - max_bytes);
+    return data;
+}
+
+static int auth_capture(const std::vector<std::string> &args, std::string &out)
+{
+    out.clear();
+#ifdef P100_WINDOWS
+    return winproc::system_hidden_capture(auth_join(args), out);
+#else
+    const std::string cmd = auth_join(args) + " 2>&1";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe)
+        return 127;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), pipe)) > 0)
+        out.append(buf, n);
+    const int status = pclose(pipe);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+static bool auth_spawn(const std::vector<std::string> &args, const std::string &log_path)
+{
+#ifdef P100_WINDOWS
+    return winproc::spawn_argv_hidden(args);
+#else
+    const pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0)
+    {
+        setsid();
+        const int fd = open(log_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+        if (fd >= 0)
+        {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+        std::vector<char *> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto &arg : args)
+            argv.push_back(const_cast<char *>(arg.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    return true;
+#endif
+}
+
+static void auth_start(AppState &state, std::vector<std::string> args)
+{
+    if (state.auth_login_running.load())
+        return;
+    const std::string script = auth_helper_script();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(script, ec))
+    {
+        ui_notify(UiNotifyType::Error, "Sign-in helper missing",
+                  "The login helper was not found next to the app files. "
+                  "Reinstall crossfade.", 8.0f);
+        return;
+    }
+
+    const std::string result = p100_config_path("login-result.txt");
+    const std::string log = p100_config_path("login.log");
+    std::filesystem::remove(result, ec);
+    std::filesystem::remove(log, ec);
+
+    std::vector<std::string> full;
+    full.push_back(backend_python_path());
+    full.push_back(script);
+    for (auto &arg : args)
+        full.push_back(std::move(arg));
+    full.push_back("--result-file");
+    full.push_back(result);
+
+    state.auth_login_exit = -1;
+    state.auth_login_log.clear();
+    state.auth_login_running.store(true);
+    s_auth_started = std::chrono::steady_clock::now();
+    state.repaint_requested = true;
+    if (!auth_spawn(full, log))
+    {
+        state.auth_login_running.store(false);
+        std::filesystem::remove(p100_config_path("login-headers.txt"), ec);
+        ui_notify(UiNotifyType::Error, "Could not start sign-in",
+                  "The login helper could not be launched.", 7.0f);
+    }
+}
+
+static std::string auth_probe_snapshot(AppState &state)
+{
+    std::lock_guard<std::mutex> lock(state.auth_probe_mutex);
+    return state.auth_probe_output;
+}
+
+static bool auth_write_headers(const std::string &path, const std::string &text)
+{
+#ifdef P100_WINDOWS
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out << text;
+    return out.good();
+#else
+    const int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (fd < 0)
+        return false;
+    const ssize_t n = write(fd, text.data(), text.size());
+    close(fd);
+    return n == (ssize_t)text.size();
+#endif
+}
+
+static void auth_probe_start(AppState &state)
+{
+    if (state.auth_probe_running.load())
+        return;
+    state.auth_probe_running.store(true);
+    AppState *sp = &state;
+    tasks::spawn("auth-probe", [sp]() {
+        std::string out;
+        const int rc =
+            auth_capture({backend_python_path(), auth_helper_script(), "--probe"}, out);
+        {
+            std::lock_guard<std::mutex> lock(sp->auth_probe_mutex);
+            sp->auth_probe_output =
+                rc == 0 ? out
+                        : (std::string("Sign-in detection failed (helper exit ") +
+                           std::to_string(rc) + ")");
+        }
+        sp->auth_probe_running.store(false);
+        sp->repaint_requested = true;
+    });
+}
+
+static std::string auth_probe_engine(const std::string &json, const char *id,
+                                     const char *name)
+{
+    const std::string needle = std::string("\"id\":\"") + id + "\"";
+    const size_t at = json.find(needle);
+    if (at == std::string::npos)
+        return std::string(name) + ": not reported";
+    const size_t available = json.find("\"available\":", at);
+    const bool on = available != std::string::npos && available + 16 <= json.size() &&
+                    json.compare(available + 12, 4, "true") == 0;
+    if (!on)
+        return std::string(name) + ": unavailable";
+    const size_t label = json.find("\"label\":\"", at);
+    if (label == std::string::npos)
+        return std::string(name) + ": available";
+    const size_t start = label + 9;
+    const size_t end = json.find('"', start);
+    if (end == std::string::npos)
+        return std::string(name) + ": available";
+    return std::string(name) + ": " + json.substr(start, end - start);
+}
+
+void ui_auth_poll(AppState &state)
+{
+    if (!state.auth_login_running.load())
+        return;
+
+    const std::string log = p100_config_path("login.log");
+    state.auth_login_log = auth_read_tail(log, 8000);
+
+    const std::string result = p100_config_path("login-result.txt");
+    std::error_code ec;
+    if (!std::filesystem::exists(result, ec))
+    {
+        // A helper that crashed before installing its atexit handler would
+        // otherwise leave the panel "running" forever.
+        if (s_auth_started.time_since_epoch().count() != 0 &&
+            std::chrono::steady_clock::now() - s_auth_started >
+                std::chrono::minutes(20))
+        {
+            state.auth_login_running.store(false);
+            state.repaint_requested = true;
+            s_auth_paste_open = true;
+            ui_notify(UiNotifyType::Error, "Sign-in timed out",
+                      "The helper did not report a result. Use the paste panel.", 8.0f);
+        }
+        return;
+    }
+
+    int code = -1;
+    {
+        std::ifstream in(result);
+        in >> code;
+    }
+    std::filesystem::remove(result, ec);
+    state.auth_login_exit = code;
+    state.auth_login_running.store(false);
+    state.repaint_requested = true;
+
+    if (code == 0)
+    {
+        state.auth_refresh_requested = true;
+        s_auth_headers.clear();
+        s_auth_paste_open = false;
+        ui_notify(UiNotifyType::Success, "Signed in",
+                  "The YouTube Music session was updated.", 4.0f);
+    }
+    else if (code == 4)
+    {
+        ui_notify(UiNotifyType::Info, "Sign-in canceled",
+                  "No session was changed.", 4.0f);
+    }
+    else if (code == 3)
+    {
+        s_auth_paste_open = true;
+        ui_notify(UiNotifyType::Warning, "No sign-in window available",
+                  "Use the paste panel below: open YouTube Music in any browser "
+                  "and copy its request headers.", 9.0f);
+    }
+    else if (code == 6)
+    {
+        s_auth_paste_open = true;
+        ui_notify(UiNotifyType::Warning, "Google blocked the sign-in window",
+                  "Use the paste panel below with your normal browser.", 9.0f);
+    }
+    else
+    {
+        s_auth_paste_open = true;
+        ui_notify(UiNotifyType::Error, "Sign-in failed",
+                  "See the details in Settings -> YouTube Music.", 8.0f);
+    }
+}
 
 static const char *update_state_label(updater::State state)
 {
@@ -2320,96 +2620,157 @@ void draw_settings_panel(AppState &state)
         save = true;
     }
     settings_gap();
-    const char *auth_modes[] = {"Browser cookies (browser.json)", "OAuth (browseroauth.json)"};
-    int auth_mode = state.settings.auth_mode == "oauth" ? 1 : 0;
-    settings_row_label("Sign-in method",
-                       auth_modes[auth_mode],
-                       "OAuth opens a browser once and saves a token. Browser mode uses the cookies your normal browser already has. Restart crossfade after changing this.");
-    ImGui::SetNextItemWidth(field_w);
-    if (ImGui::Combo("##auth_mode", &auth_mode, auth_modes, 2))
+    settings_row_label("Sign-in method", "Browser cookies",
+                       "crossfade opens its own sign-in window (WebKitGTK, Qt WebEngine or "
+                       "Windows WebView2). If none is available, paste request headers below.");
+    if (state.settings.auth_mode == "oauth")
     {
-        state.settings.auth_mode = auth_mode == 1 ? "oauth" : "browser";
-        set_auth_mode(state.settings.auth_mode);
-        save = true;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1.0f));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_w);
+        ImGui::TextWrapped("OAuth is selected in settings.json but is not exposed in the "
+                           "interface yet. Switch back to browser cookies to use the sign-in "
+                           "panel.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        if (ui_ghost_button("Switch to browser cookies",
+                            ImVec2(230.0f * m.layout_scale, m.control_h)))
+        {
+            state.settings.auth_mode = "browser";
+            set_auth_mode("browser");
+            save = true;
+            state.auth_refresh_requested = true;
+        }
     }
-    ImGui::Dummy(ImVec2(0.0f, m.space_2));
+
     settings_gap();
     settings_help(backend_is_guest()
         ? "Browsing as guest: search, albums, artists, radio and podcasts work. "
           "Sign in to unlock personalized recommendations and your library."
         : "Signed in to YouTube Music.");
-    if (ui_primary_button("Sign in with browser", ImVec2(210.0f * m.layout_scale, m.button_h)))
+
+    if (ui_primary_button("Sign in", ImVec2(170.0f * m.layout_scale, m.button_h)))
+        auth_start(state, {"--signin", "auto"});
+    ImGui::SameLine(0.0f, m.space_2);
+    if (ui_ghost_button("Open YouTube Music",
+                        ImVec2(210.0f * m.layout_scale, m.button_h)))
     {
-        const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
-        AppState *sp = &state;
-        const bool oauth_mode = state.settings.auth_mode == "oauth";
-        tasks::spawn([sp, script, oauth_mode]() {
-#ifdef P100_WINDOWS
-            // The vendored venv has ytmusicapi/yt-dlp and the Windows helper
-            // opens a Tkinter sign-in window (no WebKitGTK/gi dependency).
-            const std::string cmd = "\"" + backend_pythonw_path() + "\" \"" + script + "\" --google";
-#else
-            const std::string cmd = "python3 \"" + script + "\" --google";
-#endif
-            const int rc = std::system(cmd.c_str());
-            if (rc == 0 && oauth_mode)
-            {
-                ui_notify(UiNotifyType::Info, "Browser session saved",
-                          "OAuth is selected; use the OAuth login command below.", 6.0f);
-            }
-            else if (rc == 0)
-            {
-                sp->auth_refresh_requested = true;
-                ui_notify(UiNotifyType::Success, "Signed in",
-                          "The YouTube Music session was updated.", 4.0f);
-            }
-            else
-            {
-                ui_notify(UiNotifyType::Error, "Sign-in failed",
-                          "The browser login did not complete. See the terminal for details.", 7.0f);
-            }
-            sp->repaint_requested = true;
-        });
+        if (!ui_open_external_url("https://music.youtube.com/"))
+            ui_notify(UiNotifyType::Warning, "Could not open a browser",
+                      "Copy the link and open it manually.", 6.0f);
     }
     ImGui::SameLine(0.0f, m.space_2);
-    if (ui_ghost_button("Import Firefox cookies", ImVec2(210.0f * m.layout_scale, m.button_h)))
+    if (ui_ghost_button("Copy link", ImVec2(120.0f * m.layout_scale, m.button_h)))
+        ImGui::SetClipboardText("https://music.youtube.com/");
+
+    if (ui_ghost_button("Import session from this browser",
+                        ImVec2(290.0f * m.layout_scale, m.control_h)))
+        auth_start(state, {"--import-cookies", state.settings.ytdl_browser});
+    settings_help("Import is a one-click snapshot and is verified before replacing the "
+                  "current session; if it has expired, nothing changes.");
+
+    if (state.auth_login_running.load())
     {
-        const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
-        AppState *sp = &state;
-        const bool oauth_mode = state.settings.auth_mode == "oauth";
-        tasks::spawn([sp, script, oauth_mode]() {
-#ifdef P100_WINDOWS
-            const std::string cmd = "\"" + backend_pythonw_path() + "\" \"" + script + "\" --import-firefox";
-#else
-            const std::string cmd = "python3 \"" + script + "\" --import-firefox";
-#endif
-            const int rc = std::system(cmd.c_str());
-            if (rc == 0 && oauth_mode)
-            {
-                ui_notify(UiNotifyType::Info, "Browser session imported",
-                          "OAuth is selected; use the OAuth login command below.", 6.0f);
-            }
-            else if (rc == 0)
-            {
-                sp->auth_refresh_requested = true;
-                ui_notify(UiNotifyType::Success, "Firefox session imported",
-                          "The YouTube Music session was updated.", 4.0f);
-            }
-            else
-            {
-                ui_notify(UiNotifyType::Error, "Import failed",
-                          "No signed-in Firefox YouTube Music session was found.", 7.0f);
-            }
-            sp->repaint_requested = true;
-        });
+        ImGui::Dummy(ImVec2(0.0f, m.space_1));
+        ImGui::TextColored(ui_c().accent_text,
+                           "Signing in... close the sign-in window to cancel.");
     }
-#ifdef P100_WINDOWS
-    settings_help("Opens YouTube Music in your browser, then a small window turns the request headers you copy from DevTools into a saved session. No WebKitGTK or OAuth client keys involved.");
-#else
-    settings_help("Sign in without copying request headers. The popup needs WebKitGTK; without it the helper falls back to your Firefox session. No OAuth client keys are involved.");
-#endif
-    if (state.settings.auth_mode == "oauth" && !std::filesystem::exists(backend_auth_file_path()))
-        ImGui::TextColored(ui_c().accent_text, "No OAuth token yet - use the login command below.");
+    if (!state.auth_login_log.empty())
+    {
+        ImGui::BeginChild("##auth_log", ImVec2(-1.0f, 104.0f * m.layout_scale), true);
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted(state.auth_login_log.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+    }
+
+    if (ui_ghost_button(s_auth_paste_open ? "Hide paste panel" : "Paste request headers",
+                        ImVec2(220.0f * m.layout_scale, m.control_h)))
+        s_auth_paste_open = !s_auth_paste_open;
+
+    if (s_auth_paste_open)
+    {
+        settings_gap();
+        settings_help("1. Open music.youtube.com in any browser and sign in. "
+                      "2. Press F12, open Network, then refresh the page or click a song. "
+                      "3. Right-click a POST request to music.youtube.com and choose "
+                      "Copy -> Copy request headers. 4. Paste the whole block below.");
+        if (ui_ghost_button("Open YouTube Music",
+                            ImVec2(200.0f * m.layout_scale, m.control_h)))
+        {
+            if (!ui_open_external_url("https://music.youtube.com/"))
+                ui_notify(UiNotifyType::Warning, "Could not open a browser",
+                          "Open https://music.youtube.com/ manually, then copy its "
+                          "request headers.", 7.0f);
+        }
+        ImGui::SameLine(0.0f, m.space_2);
+        if (ui_ghost_button("Copy link", ImVec2(120.0f * m.layout_scale, m.control_h)))
+            ImGui::SetClipboardText("https://music.youtube.com/");
+        ImGui::InputTextMultiline(
+            "##auth_headers", &s_auth_headers,
+            ImVec2(ImGui::GetContentRegionAvail().x, 120.0f * m.layout_scale));
+        if (ui_ghost_button("Paste from clipboard",
+                            ImVec2(190.0f * m.layout_scale, m.control_h)))
+        {
+            const char *clip = ImGui::GetClipboardText();
+            if (clip && *clip)
+                s_auth_headers = clip;
+        }
+        ImGui::SameLine(0.0f, m.space_2);
+        if (ui_ghost_button("Clear", ImVec2(90.0f * m.layout_scale, m.control_h)))
+            s_auth_headers.clear();
+        ImGui::SameLine(0.0f, m.space_2);
+        if (!state.auth_login_running.load() && !s_auth_headers.empty())
+        {
+            if (ui_primary_button("Connect", ImVec2(130.0f * m.layout_scale, m.control_h)))
+            {
+                const std::string path = p100_config_path("login-headers.txt");
+                if (!auth_write_headers(path, s_auth_headers))
+                    ui_notify(UiNotifyType::Error, "Could not save the headers",
+                              "Check that the config directory is writable.", 7.0f);
+                else
+                    auth_start(state, {"--headers", path});
+            }
+        }
+    }
+
+    if (!s_auth_probe_started)
+    {
+        s_auth_probe_started = true;
+        auth_probe_start(state);
+    }
+    if (ImGui::TreeNode("Sign-in methods detected"))
+    {
+        const std::string probe = auth_probe_snapshot(state);
+        if (state.auth_probe_running.load())
+            ImGui::TextUnformatted("Checking available engines...");
+        else if (probe.empty())
+            ImGui::TextUnformatted("Not checked yet.");
+        else if (probe.rfind("Sign-in detection failed", 0) == 0)
+            ImGui::TextUnformatted(probe.c_str());
+        else
+        {
+            ImGui::TextUnformatted(auth_probe_engine(probe, "webkit", "WebKitGTK").c_str());
+            ImGui::TextUnformatted(auth_probe_engine(probe, "qt", "Qt WebEngine").c_str());
+            ImGui::TextUnformatted(auth_probe_engine(probe, "webview2", "WebView2").c_str());
+            const size_t b = probe.find("\"browsers\":[");
+            if (b != std::string::npos)
+            {
+                const size_t s = b + 12;
+                const size_t e = probe.find(']', s);
+                std::string list = probe.substr(
+                    s, e == std::string::npos ? std::string::npos : e - s);
+                for (char &c : list)
+                    if (c == '"' || c == ',')
+                        c = ' ';
+                ImGui::TextWrapped("Cookie import: %s",
+                                   list.empty() ? "none detected" : list.c_str());
+            }
+        }
+        if (!state.auth_probe_running.load() &&
+            ui_ghost_button("Check again", ImVec2(140.0f * m.layout_scale, m.control_h)))
+            auth_probe_start(state);
+        ImGui::TreePop();
+    }
 
     settings_gap();
     if (settings_toggle_row("##warm_resolver", "Fast stream resolve (experimental)",
@@ -2462,16 +2823,22 @@ void draw_settings_panel(AppState &state)
         ImGui::SetClipboardText(
             std::filesystem::path(state.backend_auth_file).parent_path().string().c_str());
 
-    ImGui::Dummy(ImVec2(0.0f, m.space_2));
-    ImGui::TextColored(ui_c().text_muted, "Re-authenticate");
-    const std::string reauth = backend_reauth_command();
-    char reauth_buf[1024];
-    std::snprintf(reauth_buf, sizeof(reauth_buf), "%s", reauth.c_str());
-    ImGui::SetNextItemWidth(content_w);
-    ImGui::InputText("##reauth_cmd", reauth_buf, sizeof(reauth_buf), ImGuiInputTextFlags_ReadOnly);
-    if (ui_ghost_button("Copy re-auth command", ImVec2(200.0f * m.layout_scale, m.control_h)))
-        ImGui::SetClipboardText(reauth.c_str());
-    settings_help("Paste this into a terminal, complete the browser login, then restart crossfade.");
+    if (state.settings.auth_mode != "oauth")
+    {
+        ImGui::Dummy(ImVec2(0.0f, m.space_2));
+        ImGui::TextColored(ui_c().text_muted, "Re-authenticate");
+        const std::string reauth = backend_reauth_command();
+        char reauth_buf[1024];
+        std::snprintf(reauth_buf, sizeof(reauth_buf), "%s", reauth.c_str());
+        ImGui::SetNextItemWidth(content_w);
+        ImGui::InputText("##reauth_cmd", reauth_buf, sizeof(reauth_buf),
+                         ImGuiInputTextFlags_ReadOnly);
+        if (ui_ghost_button("Copy re-auth command",
+                            ImVec2(200.0f * m.layout_scale, m.control_h)))
+            ImGui::SetClipboardText(reauth.c_str());
+        settings_help("Paste this into a terminal, complete the browser login, then "
+                      "restart crossfade.");
+    }
     if (ImGui::TreeNode("Backend details"))
     {
         ImGui::TextWrapped("Python: %s", backend_python_path().c_str());

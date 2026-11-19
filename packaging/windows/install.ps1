@@ -101,6 +101,14 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# Optional WebView2 sign-in window (Settings -> YouTube Music). WebView2 itself
+# ships with Windows; pywebview is just the Python wrapper. Failure here must
+# not break the install: the in-app paste panel still signs in.
+& "$venv\Scripts\python.exe" -m pip install --quiet --upgrade pywebview
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Optional WebView2 sign-in engine was not installed; the paste panel still works." -ForegroundColor Yellow
+}
+
 # yt-dlp needs Deno plus the yt-dlp-ejs solver to pass YouTube's JavaScript
 # challenges for audio downloads. Keep deno.exe next to yt-dlp.exe so it works
 # without touching the system PATH.
