@@ -2,10 +2,17 @@
 
 All notable changes to crossfade are documented here.
 
-## Unreleased
+## 0.5.0 - 2026-11-19
 
 ### Added
 
+- **Display refresh rate setting.** Settings -> Appearance now offers 60, 120,
+  144, 240 and Auto. Auto follows the monitor's current refresh rate (capped at
+  240 Hz). The setting only raises the frame budget while the interface is
+  animating, scrolling, handling input or showing video; playback and idle
+  cadences are unchanged, so high-refresh rendering costs nothing while parked.
+  The default stays 60, so existing setups keep their current power use. This
+  replaces the old `ui.frame_active_ms` tunable.
 - **Update checks on Linux.** The existing GitHub release check now runs on
   every platform (at most once a day), and **Settings -> Updates** shows the
   installed and latest versions, the last check, a manual **Check now**, and a
