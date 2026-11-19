@@ -488,6 +488,36 @@ static std::string app_context_summary()
     return out.str();
 }
 
+// Fast frame budget (ms) while animating, handling input or showing video.
+// The user's max_refresh_hz setting caps it; 0 follows the current display's
+// refresh rate. Playback and idle budgets are separate and unaffected.
+static int display_refresh_hz(const Settings &settings, SDL_Window *window)
+{
+    if (settings.max_refresh_hz != 0)
+        return settings.max_refresh_hz;
+
+    static int cached_hz = 0;
+    static std::chrono::steady_clock::time_point cached_at{};
+    const auto now = std::chrono::steady_clock::now();
+    if (cached_hz == 0 || now - cached_at > std::chrono::seconds(2))
+    {
+        cached_hz = 60;
+        SDL_DisplayMode mode{};
+        const int index = SDL_GetWindowDisplayIndex(window);
+        if (index >= 0 && SDL_GetCurrentDisplayMode(index, &mode) == 0 &&
+            mode.refresh_rate > 1.0f)
+            cached_hz = (int)(mode.refresh_rate + 0.5f);
+        cached_at = now;
+    }
+    return cached_hz;
+}
+
+static long long active_frame_ms(const Settings &settings, SDL_Window *window)
+{
+    const int hz = std::max(30, std::min(240, display_refresh_hz(settings, window)));
+    return std::max<long long>(4, 1000 / hz);
+}
+
 // ----------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------
@@ -1149,7 +1179,7 @@ int app_run(int argc, char **argv)
         if (animating || g_state.loading || recently_active ||
             g_cf.pending.load() || g_cf.active.load() || video_frame)
             interval_ms = low_power ? tunable_int("ui.frame_lp_active_ms")
-                                    : tunable_int("ui.frame_active_ms");
+                                    : active_frame_ms(g_state.settings, window);
         else if (g_state.playing)
             interval_ms = low_power ? tunable_int("ui.frame_lp_playback_ms")
                                     : tunable_int("ui.frame_playback_ms");

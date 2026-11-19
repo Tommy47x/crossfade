@@ -123,8 +123,6 @@ const std::vector<TunableDef> &build_defs()
              "Playback-rate change smaller than this is ignored.", 0.004f, 0.0001f, 0.1f),
 
         // ---- Interface ------------------------------------------------
-        TUNE_I("ui.frame_active_ms", "Interface", "Frame: interacting",
-               "Frame budget while animating or handling input, ms.", 16, 4, 100),
         TUNE_I("ui.frame_playback_ms", "Interface", "Frame: playing",
                "Frame budget during steady playback, ms.", 100, 16, 1000),
         TUNE_I("ui.frame_idle_ms", "Interface", "Frame: idle",

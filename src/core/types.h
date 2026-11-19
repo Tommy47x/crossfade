@@ -208,6 +208,12 @@ struct Settings
     float ui_layout_scale = 1.0f; // section heights, album art, buttons, gaps
     // Animation intensity: 0 = off, 1 = subtle, 2 = standard, 3 = playful.
     int animations = 2;
+    // Maximum refresh rate the UI renders at while animating, handling input
+    // or showing video. 0 follows the display's refresh rate (up to 240 Hz);
+    // a fixed value caps the fast frame budget at that many Hz. Playback and
+    // idle budgets are unaffected, so higher rates only cost CPU while the
+    // interface is actually moving.
+    int max_refresh_hz = 60;
     // Day mode: true = light theme, false = dark theme. Persisted in settings.json.
     bool day_mode = false;
     // Custom accent colour as "#rrggbb". Empty means automatic: follow the
@@ -329,6 +335,7 @@ struct Settings
                ui_text_scale == o.ui_text_scale &&
                ui_widget_scale == o.ui_widget_scale &&
                ui_layout_scale == o.ui_layout_scale && animations == o.animations &&
+               max_refresh_hz == o.max_refresh_hz &&
                day_mode == o.day_mode && accent_color == o.accent_color &&
                album_backdrop == o.album_backdrop &&
                album_backdrop_strength == o.album_backdrop_strength &&

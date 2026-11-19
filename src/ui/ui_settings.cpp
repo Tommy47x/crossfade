@@ -179,6 +179,7 @@ void save_settings(const Settings &settings)
         << "\"ui_widget_scale\":" << settings.ui_widget_scale << ","
         << "\"ui_layout_scale\":" << settings.ui_layout_scale << ","
         << "\"animations\":" << std::max(0, std::min(3, settings.animations)) << ","
+        << "\"max_refresh_hz\":" << settings.max_refresh_hz << ","
         << "\"shuffle_enabled\":" << (settings.shuffle_enabled ? "true" : "false") << ","
         << "\"repeat_mode\":" << std::max(0, std::min(2, settings.repeat_mode)) << ","
         << "\"day_mode\":" << (settings.day_mode ? "true" : "false") << ","
@@ -431,6 +432,11 @@ Settings load_settings()
         {
             int level = (int)std::lround(get_float("animations"));
             s.animations = std::max(0, std::min(3, level));
+            // Default 60; 0 means "follow the display". Absent keys keep 60.
+            if (json.find("\"max_refresh_hz\"") != std::string::npos)
+                s.max_refresh_hz = (int)std::lround(get_float("max_refresh_hz"));
+            if (s.max_refresh_hz != 0)
+                s.max_refresh_hz = std::max(30, std::min(240, s.max_refresh_hz));
         }
         if (json.find("\"shuffle_enabled\"") != std::string::npos)
             s.shuffle_enabled = get_bool("shuffle_enabled");
@@ -1740,6 +1746,58 @@ void draw_settings_panel(AppState &state)
                     dl->AddText(g_ui_fonts.medium, 15.5f * m.text_scale,
                                 ImVec2(c0.x + (bw - ts.x) * 0.5f, c0.y + (bh - ts.y) * 0.5f),
                                 on ? ui_text_u32() : ui_text_dim_u32(), animations[i]);
+                    ImGui::PopID();
+                }
+                ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + bh + m.space_2));
+            }
+
+            // Display refresh: caps the fast frame budget while the UI moves.
+            static const int refresh_hz[] = {60, 120, 144, 240, 0};
+            static const char *refresh_names[] = {"60", "120", "144", "240", "Auto"};
+            const int cur_hz = state.settings.max_refresh_hz;
+            const char *refresh_value = nullptr;
+            for (int i = 0; i < 5; ++i)
+            {
+                if (refresh_hz[i] == cur_hz)
+                    refresh_value = refresh_names[i];
+            }
+            settings_row_label("Refresh rate",
+                               refresh_value ? refresh_value : "Auto",
+                               "How smoothly the interface moves on your screen. Higher "
+                               "rates are smoother on 120/144/240 Hz monitors but use more "
+                               "CPU while animating; playback and idle stay frugal. Auto "
+                               "follows the monitor.");
+            {
+                const ImVec2 pos = ImGui::GetCursorScreenPos();
+                const float gap = m.space_2;
+                const float bh = 34.0f * m.layout_scale;
+                const float bw = (ImGui::GetContentRegionAvail().x - gap * 4.0f) / 5.0f;
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                for (int i = 0; i < 5; ++i)
+                {
+                    ImGui::SetCursorScreenPos(ImVec2(pos.x + i * (bw + gap), pos.y));
+                    ImGui::PushID(i);
+                    ImGui::InvisibleButton("##refresh", ImVec2(bw, bh));
+                    const bool hov = ImGui::IsItemHovered();
+                    if (ImGui::IsItemClicked())
+                    {
+                        state.settings.max_refresh_hz = refresh_hz[i];
+                        save = true;
+                    }
+                    const bool on = refresh_hz[i] == state.settings.max_refresh_hz;
+                    const ImVec2 c0(pos.x + i * (bw + gap), pos.y);
+                    const ImVec2 c1(c0.x + bw, c0.y + bh);
+                    dl->AddRectFilled(c0, c1, on ? ui_accent_u32(0.20f)
+                                                 : ui_overlay_u32(hov ? 0.075f : 0.035f),
+                                      m.radius_md);
+                    dl->AddRect(c0, c1, on ? ui_accent_u32(0.45f)
+                                           : ui_with_alpha(ui_border_u32(), 0.6f),
+                                m.radius_md, 0, 1.0f);
+                    const ImVec2 ts = g_ui_fonts.medium->CalcTextSizeA(15.5f * m.text_scale,
+                                                                       FLT_MAX, 0, refresh_names[i]);
+                    dl->AddText(g_ui_fonts.medium, 15.5f * m.text_scale,
+                                ImVec2(c0.x + (bw - ts.x) * 0.5f, c0.y + (bh - ts.y) * 0.5f),
+                                on ? ui_text_u32() : ui_text_dim_u32(), refresh_names[i]);
                     ImGui::PopID();
                 }
                 ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + bh + m.space_2));

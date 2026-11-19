@@ -13,6 +13,7 @@ int main()
     check(!s.shuffle_enabled, "default shuffle off");
     check(s.ui_scale == 1.0f && s.ui_text_scale == 1.0f, "default ui scale");
     check(s.animations == 2, "default animations");
+    check(s.max_refresh_hz == 60, "default refresh cap 60");
     check(!s.safe_mode, "default safe mode");
     check(s.check_for_updates, "default update checks on");
     check(!s.low_power, "default low power off");
@@ -35,6 +36,9 @@ int main()
     b = a;
     b.safe_mode = true;
     check(!(a == b), "safe mode change compares unequal");
+    b = a;
+    b.max_refresh_hz = 144;
+    check(!(a == b), "refresh cap change compares unequal");
     b = a;
     b.low_power = true;
     check(!(a == b), "low power change compares unequal");
