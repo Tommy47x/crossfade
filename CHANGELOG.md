@@ -2,24 +2,37 @@
 
 All notable changes to crossfade are documented here.
 
-## Unreleased
+## 0.4.1 - 2026-11-19
 
 ### Added
 
 - **Search field on the guest Home page.** With no account the feed is empty, so
-  Home now shows a search box centred on the page, with sign-in kept one button
-  away. Signed-in users keep the populated feed and the header field.
+  Home now shows a search box centred on the page, with a "Log in to see
+  YouTube's feed" hint and sign-in kept one button away. Signed-in users keep
+  the populated feed and the header field.
 - **Video and lyrics side by side.** The music-video page now replaces only the
   list: an open lyrics panel stays docked beside the picture. Theater mode
   still takes the full width.
 - **Videos work from search results.** Starting a search still drops the video
   page, but pressing **V** on a search result now opens that song's video while
   the search stays up; before, the page closed itself on the next frame.
+- **Scroll edge fades** on list pages and the lyrics panel (configurable height,
+  0 disables them) with a floating **back to top** button.
+- **Touch drags on the bottom bar.** The seek strip, the seek slider and the
+  volume slider now follow a finger; the seek commits once, on release, so a
+  drag does not hammer mpv.
+- **Video stream recovery.** A video whose cached URL 403s, or a stream that
+  never finishes loading, is re-resolved once in the background and falls back
+  to audio-only with a notice when it still cannot play.
 
 ### Changed
 
 - **Glowing separators are off by default.** The option is unchanged in
   Settings -> Appearance; new installs get the plain hairline.
+- The ambient backdrop gets deeper glow spots and slow drift, and UI elements
+  can be scaled individually.
+- A new search query jumps the list back to the top instead of keeping the
+  previous scroll offset.
 
 ### Documentation
 
