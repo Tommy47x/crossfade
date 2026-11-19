@@ -1,4 +1,5 @@
 #include "video_surface.h"
+#include "tunables.h"
 
 #include "mpvplayer.h"
 
@@ -153,7 +154,7 @@ struct VideoSurface::Impl
         if (!mpv)
             return;
         const auto now = std::chrono::steady_clock::now();
-        if (now - aspect_checked < std::chrono::milliseconds(500))
+        if (now - aspect_checked < std::chrono::milliseconds(tunable_int("video.aspect_recheck_ms")))
             return;
         aspect_checked = now;
         double a = 0.0;

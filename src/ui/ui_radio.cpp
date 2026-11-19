@@ -1,4 +1,5 @@
 #include "tasks.h"
+#include "tunables.h"
 #include "ui.h"
 #include "ui_hero.h"
 #include "texture.h"
@@ -28,8 +29,6 @@
 namespace
 {
 
-constexpr int kMaxSeeds = 8;
-constexpr size_t kPrefetchCount = 10;
 
 struct RadioSeed
 {
@@ -96,9 +95,7 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
     // half-life inside a 30-day window). Ranking falls back to all-time totals
     // when the log has no usable timestamps or no recent plays.
     const int64_t now = (int64_t)std::time(nullptr);
-    constexpr int64_t kRecencyWindowSec = 30 * 86400;
-    constexpr double kHalfLifeDays = 7.0;
-
+        
     for (const auto &ev : state.play_log)
     {
         if (ev.id.empty())
@@ -116,11 +113,11 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
             if (ev.ts > last)
                 last = ev.ts;
             const int64_t age = now - ev.ts;
-            if (age >= 0 && age <= kRecencyWindowSec)
+            if (age >= 0 && age <= ((int64_t)tunable_int("radio.recency_days") * 86400))
             {
                 ++recent_plays[ev.id];
                 const double days = (double)age / 86400.0;
-                recent_score[ev.id] += std::pow(0.5, days / kHalfLifeDays);
+                recent_score[ev.id] += std::pow(0.5, days / ((double)tunable("radio.half_life_days")));
             }
         }
     }
@@ -226,7 +223,7 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
 
     // De-duplicate while keeping the sorted order.
     std::vector<RadioSeed> unique;
-    unique.reserve(std::min(out.size(), (size_t)kMaxSeeds));
+    unique.reserve(std::min(out.size(), (size_t)tunable_int("radio.max_seeds")));
     std::unordered_map<std::string, bool> seen;
     for (auto &s : out)
     {
@@ -234,7 +231,7 @@ static std::vector<RadioSeed> collect_radio_seeds(const AppState &state)
             continue;
         seen[s.track.id] = true;
         unique.push_back(std::move(s));
-        if ((int)unique.size() >= kMaxSeeds)
+        if ((int)unique.size() >= tunable_int("radio.max_seeds"))
             break;
     }
     // In recency mode the tiles (and the hero's "N plays") show recent play
@@ -486,7 +483,7 @@ static void begin_station(AppState &state, const Track &seed, int plays, bool sw
                 if (t.url.empty() && !t.id.empty())
                     t.url = "https://www.youtube.com/watch?v=" + t.id;
             }
-            prefetch_urls_for_serial(results, kPrefetchCount, &state.radio_request, token);
+            prefetch_urls_for_serial(results, (size_t)tunable_int("radio.prefetch_count"), &state.radio_request, token);
             save_radio_cache(seed_copy, plays, results);
         }
 
@@ -569,7 +566,7 @@ void ui_radio_init(AppState &state)
     {
         auto snapshot = std::atomic_load(&state.radio_results);
         if (snapshot)
-            prefetch_urls_for_serial(*snapshot, kPrefetchCount, &state.radio_request,
+            prefetch_urls_for_serial(*snapshot, (size_t)tunable_int("radio.prefetch_count"), &state.radio_request,
                                      state.radio_request.load());
         return;
     }

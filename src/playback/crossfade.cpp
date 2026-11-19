@@ -1,4 +1,5 @@
 #include "crossfade.h"
+#include "tunables.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,7 +34,8 @@ bool should_start_natural(const NaturalInputs &in)
     if (in.track_duration <= 0.0)
         return false;
 
-    const double cf = std::min(in.crossfade_duration, in.track_duration * 0.5);
+    const double cf = std::min(in.crossfade_duration,
+                               in.track_duration * tunable("playback.crossfade_cap_fraction"));
     if (cf <= 0.0)
         return false;
     if (in.position <= 0.0 || in.track_duration - in.position > cf)
@@ -60,7 +62,14 @@ std::string audio_filter(const Settings &s)
 {
     std::string af;
     if (s.volume_normalization)
-        af = "loudnorm=I=-16:TP=-1.5:LRA=11";
+    {
+        char norm[96];
+        std::snprintf(norm, sizeof(norm), "loudnorm=I=%g:TP=%g:LRA=%g",
+                      (double)tunable("playback.normalize_i"),
+                      (double)tunable("playback.normalize_tp"),
+                      (double)tunable("playback.normalize_lra"));
+        af = norm;
+    }
     if (s.eq_enabled)
     {
         for (const EqBand &b : s.eq_bands)

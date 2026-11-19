@@ -1,4 +1,5 @@
 #include "ui_layout.h"
+#include "tunables.h"
 #include "ui.h"
 #include "ui_theme.h"
 
@@ -51,7 +52,7 @@ AppLayout ui_compute_layout(const AppState &state, const ImGuiIO &io)
     const bool lyrics_allowed = true;
     if (lyrics_allowed)
     {
-        const float list_min = 260.0f * m.layout_scale;
+        const float list_min = tunable("layout.list_min") * m.layout_scale;
         const float want = std::max(0.0f, state.settings.lyrics_panel_width * m.layout_scale);
         l.lyrics_min_w = m.lyrics_min;
         l.lyrics_max_w = std::min(m.lyrics_max,

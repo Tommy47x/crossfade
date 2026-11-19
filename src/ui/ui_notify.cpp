@@ -1,4 +1,5 @@
 #include "ui_notify.h"
+#include "tunables.h"
 #include "ui_icons.h"
 #include "ui_components.h"
 #include "ui_theme.h"
@@ -43,14 +44,9 @@ static std::vector<Toast> g_toasts;
 static uint32_t g_next_toast_id = 1;
 static void (*g_open_settings)() = nullptr;
 
-static const int kMaxToasts = 4;
-static const float kSlideIn = 0.28f;
-static const float kFadeOut = 0.22f;
 
 // Swipe-to-dismiss tuning: how far the toast must be dragged and how long
 // the fingers must rest before the idle swipe resolves (fling or spring).
-static const float kSwipeDismissPx = 130.0f;
-static const double kSwipeIdleSec = 0.22;
 
 // Last drawn geometry of each open toast (for hit-testing swipe input that
 // arrives between frames, before NewFrame recomputes the layout).
@@ -102,7 +98,7 @@ void ui_notify(UiNotifyType type, const std::string &title, const std::string &m
     t.duration = duration;
     g_toasts.push_back(std::move(t));
     // Drop the oldest if the stack overflows.
-    while ((int)g_toasts.size() > kMaxToasts)
+    while ((int)g_toasts.size() > tunable_int("ui.toast_max"))
         g_toasts.erase(g_toasts.begin());
 }
 
@@ -181,7 +177,7 @@ bool ui_notify_swipe_feed(float dx_pixels)
                 // the fling without a dead stop at the fingers' end). The
                 // fling starts from the current offset, picking up exactly
                 // where the fingers left off.
-                if (std::fabs(t.swipe_x) >= kSwipeDismissPx)
+                if (std::fabs(t.swipe_x) >= tunable("ui.toast_swipe_px"))
                 {
                     t.flung = true;
                     t.fling_dir = t.swipe_x > 0.0f ? 1.0f : -1.0f;
@@ -206,12 +202,12 @@ bool ui_notify_needs_frame()
     {
         if (t.closing)
         {
-            if (now - t.close_start < kFadeOut)
+            if (now - t.close_start < tunable("ui.toast_fade_sec"))
                 return true; // fade-out still running
         }
         else
         {
-            if (now - t.spawn < (double)kSlideIn)
+            if (now - t.spawn < (double)tunable("ui.toast_slide_sec"))
                 return true; // slide-in still running
             if (t.duration > 0.0f && now - t.spawn >= t.duration)
                 return true; // expired: next frame starts the fade-out
@@ -328,9 +324,9 @@ void ui_notify_draw()
     {
         if (t.closing || t.swipe_x == 0.0f)
             continue;
-        if (now - t.last_swipe < kSwipeIdleSec)
+        if (now - t.last_swipe < tunable("ui.toast_swipe_idle_sec"))
             continue;
-        if (std::fabs(t.swipe_x) >= kSwipeDismissPx)
+        if (std::fabs(t.swipe_x) >= tunable("ui.toast_swipe_px"))
         {
             t.flung = true;
             t.fling_dir = t.swipe_x > 0.0f ? 1.0f : -1.0f;
@@ -365,7 +361,7 @@ void ui_notify_draw()
         float swipe_offset = t.swipe_x;
         if (t.closing)
         {
-            const float ct = (float)(now - t.close_start) / kFadeOut;
+            const float ct = (float)(now - t.close_start) / tunable("ui.toast_fade_sec");
             if (ct >= 1.0f)
             {
                 // Erase once the fade-out finished.
@@ -386,7 +382,7 @@ void ui_notify_draw()
         }
         else
         {
-            slide_t = ease_out_cubic(age / kSlideIn);
+            slide_t = ease_out_cubic(age / tunable("ui.toast_slide_sec"));
             alpha = std::clamp(age / 0.18f, 0.0f, 1.0f);
         }
 
@@ -523,7 +519,7 @@ bool ui_notify_animating()
     {
         if (t.closing)
         {
-            if (now - t.close_start < kFadeOut)
+            if (now - t.close_start < tunable("ui.toast_fade_sec"))
                 return true;
         }
         else
@@ -536,7 +532,7 @@ bool ui_notify_animating()
             // the periodic ticks / activity in the main loop, so a duration
             // toast at rest reports false here and gets picked up again when
             // some other frame runs.
-            if (now - t.spawn < (double)kSlideIn)
+            if (now - t.spawn < (double)tunable("ui.toast_slide_sec"))
                 return true;
         }
     }

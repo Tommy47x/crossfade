@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "tunables.h"
 #include "ui_backdrop.h"
 #include "mpvplayer.h"
 #include "texture.h"
@@ -45,18 +46,14 @@ namespace
 // App accent (daily colour, synced with dwm/dmenu).
 
 // Ease rate: higher settles faster. ~0.5 s to visually settle.
-const float kEaseRate = 6.0f;
 
 // Line morph rate: how fast a line slides to its new size/colour when the
 // active line moves on. ~0.5 s to settle.
-const float kMorphRate = 7.0f;
 
 // How long the auto-centre keeps owning the scroll target after the morph
 // has finished, before handing control back to manual wheel scrolling.
-const float kHoldSec = 0.75f;
 
 // Font scale of the active line (1.0 = ordinary lines).
-const float kActiveScale = 1.32f;
 
 // Draw a single-line string horizontally centred in the available width,
 // using the currently-pushed font/colour. Advances the cursor like Text().
@@ -272,7 +269,7 @@ void centered_wrapped_text(const char *text, ImU32 col, float wrap_size = 0.0f,
 // what makes the transition read as a single continuous movement.
 struct LineState
 {
-    float scale = 1.0f;     // font scale (1.0 .. kActiveScale)
+    float scale = 1.0f;     // font scale (1.0 .. tunable("lyrics.active_scale"))
     float glow = 0.0f;      // eased active-ness 0..1 (weights the scroll centre)
     ImVec4 col = ImVec4(0.0f, 0.0f, 0.0f, 0.0f); // colour before the global fade
 };
@@ -629,21 +626,21 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                     snap_lines = true;
                 }
                 const bool animate_lines = ui_animations_enabled() && !snap_lines;
-                const float ease = animate_lines ? 1.0f - std::exp(-kMorphRate * dt) : 1.0f;
+                const float ease = animate_lines ? 1.0f - std::exp(-tunable("lyrics.morph_rate") * dt) : 1.0f;
                 if (!animate_lines)
                     snap_lines = true;
                 // Constant break size in final screen pixels (the widest the
                 // line is ever drawn), so the morph can never re-wrap a line
                 // mid-transition. The actual draw size follows ls.scale and is
                 // never above this.
-                const float wrap_size = draw_size * kActiveScale;
+                const float wrap_size = draw_size * tunable("lyrics.active_scale");
 
                 for (int i = 0; i < (int)lx.lines.size(); ++i)
                 {
                     LineState &ls = g_anim.lines[i];
                     const bool is_active = (i == active);
 
-                    const float tgt_scale = is_active ? kActiveScale : 1.0f;
+                    const float tgt_scale = is_active ? tunable("lyrics.active_scale") : 1.0f;
                     const float tgt_glow = is_active ? 1.0f : 0.0f;
                     ImVec4 tgt_col;
                     if (is_active)
@@ -767,7 +764,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                     // inactive state must not keep owning the target (the
                     // hold is only ever decremented below, while active >= 0).
                     g_anim.auto_scroll = (active >= 0);
-                    g_anim.hold = g_anim.auto_scroll ? kHoldSec : 0.0f;
+                    g_anim.hold = g_anim.auto_scroll ? tunable("lyrics.hold_sec") : 0.0f;
                     // Before the first timestamp the lyrics should sit at the
                     // top of the panel, not wherever the previous song left
                     // the scroll position.
@@ -796,7 +793,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
                         g_anim.scroll_target = tgt;
                     }
                     if (morphing)
-                        g_anim.hold = kHoldSec; // the hold only starts once settled
+                        g_anim.hold = tunable("lyrics.hold_sec"); // the hold only starts once settled
                     else if ((g_anim.hold -= dt) <= 0.0f)
                         g_anim.auto_scroll = false; // hand the target back
                 }
@@ -811,7 +808,7 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
             }
             else if (scroll_anim)
             {
-                float e = 1.0f - std::exp(-kEaseRate * dt);
+                float e = 1.0f - std::exp(-tunable("lyrics.ease_rate") * dt);
                 ImGui::SetScrollY(real + diff * e);
             }
             else

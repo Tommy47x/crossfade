@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "tunables.h"
 
 #include "library.h"
 #include "paths.h"
@@ -53,7 +54,6 @@ namespace
 {
 std::mutex g_mu;
 std::deque<std::string> g_lines;
-constexpr size_t kMaxLines = 2000;
 std::atomic<bool> g_history_enabled{true};
 
 std::mutex g_boot_mu;
@@ -111,7 +111,7 @@ void append_line(const std::string &line)
 {
     std::lock_guard<std::mutex> lock(g_mu);
     g_lines.push_back(line);
-    while (g_lines.size() > kMaxLines)
+    while (g_lines.size() > (size_t)tunable_int("diag.log_lines"))
         g_lines.pop_front();
 }
 
@@ -424,7 +424,7 @@ void start_watchdog()
     g_last_heartbeat_ms.store(now_ms());
     g_watchdog_stop.store(false);
     std::thread([]() {
-        constexpr int64_t kHangMs = 60000;
+        const int64_t kHangMs = tunable_int("diag.hang_ms");
         while (!g_watchdog_stop.load(std::memory_order_relaxed))
         {
             std::this_thread::sleep_for(std::chrono::seconds(2));

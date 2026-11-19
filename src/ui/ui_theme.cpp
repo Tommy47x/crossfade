@@ -1,4 +1,5 @@
 #include "ui_theme.h"
+#include "tunables.h"
 #include "ui.h"
 #include "ui_backdrop.h"
 
@@ -385,14 +386,18 @@ void ui_theme_apply(const Settings &settings, const ImGuiIO &io)
     // the glow/transition animation still update on every call below.
     static float cached_master = -1.0f, cached_text = -1.0f;
     static float cached_widget = -1.0f, cached_layout = -1.0f;
+    static unsigned cached_tune = 0;
+    const unsigned tune = tunables_version();
     const bool style_dirty = master != cached_master || text != cached_text ||
-                             widget != cached_widget || layout != cached_layout;
+                             widget != cached_widget || layout != cached_layout ||
+                             tune != cached_tune;
     if (style_dirty)
     {
         cached_master = master;
         cached_text = text;
         cached_widget = widget;
         cached_layout = layout;
+        cached_tune = tune;
         init_base_style();
 
         g_ui_layout_scale = layout;
@@ -401,32 +406,32 @@ void ui_theme_apply(const Settings &settings, const ImGuiIO &io)
         g_metrics.widget_scale = widget;
         g_metrics.layout_scale = layout;
 
-        g_metrics.space_1 = 4.0f * layout;
-        g_metrics.space_2 = 8.0f * layout;
-        g_metrics.space_3 = 12.0f * layout;
-        g_metrics.space_4 = 16.0f * layout;
-        g_metrics.space_5 = 24.0f * layout;
-        g_metrics.space_6 = 32.0f * layout;
+        g_metrics.space_1 = tunable("layout.space_1") * layout;
+        g_metrics.space_2 = tunable("layout.space_2") * layout;
+        g_metrics.space_3 = tunable("layout.space_3") * layout;
+        g_metrics.space_4 = tunable("layout.space_4") * layout;
+        g_metrics.space_5 = tunable("layout.space_5") * layout;
+        g_metrics.space_6 = tunable("layout.space_6") * layout;
 
-        g_metrics.radius_xs = 4.0f * layout;
-        g_metrics.radius_sm = 7.0f * layout;
-        g_metrics.radius_md = 10.0f * layout;
-        g_metrics.radius_lg = 14.0f * layout;
+        g_metrics.radius_xs = tunable("layout.radius_xs") * layout;
+        g_metrics.radius_sm = tunable("layout.radius_sm") * layout;
+        g_metrics.radius_md = tunable("layout.radius_md") * layout;
+        g_metrics.radius_lg = tunable("layout.radius_lg") * layout;
 
         g_metrics.control_h = 38.0f * layout;
         g_metrics.button_h = 40.0f * layout;
-        g_metrics.row_art = 48.0f * layout;
+        g_metrics.row_art = tunable("layout.row_art") * layout;
         g_metrics.row_pad_x = 12.0f * layout;
         g_metrics.row_pad_y = 9.0f * layout;
         g_metrics.row_gap = 4.0f * layout;
         g_metrics.card_gap = 18.0f * layout;
         g_metrics.sidebar_w = 232.0f * layout;
         g_metrics.sidebar_rail_w = 68.0f * layout;
-        g_metrics.header_h = 68.0f * layout;
-        g_metrics.bottom_h = 92.0f * layout;
-        g_metrics.content_pad = 24.0f * layout;
-        g_metrics.lyrics_min = 300.0f * layout;
-        g_metrics.lyrics_max = 520.0f * layout;
+        g_metrics.header_h = tunable("layout.header_h") * layout;
+        g_metrics.bottom_h = tunable("layout.bottom_h") * layout;
+        g_metrics.content_pad = tunable("layout.content_pad") * layout;
+        g_metrics.lyrics_min = tunable("layout.lyrics_min") * layout;
+        g_metrics.lyrics_max = tunable("layout.lyrics_max") * layout;
 
         ImGuiStyle style = g_base_style;
         style.ScaleAllSizes(widget);

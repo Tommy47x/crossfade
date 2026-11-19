@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "tunables.h"
 #include "ui_backdrop.h"
 #include "ui_icons.h"
 #include "ui_components.h"
@@ -952,7 +953,7 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
         if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(wheel_min, wheel_max) &&
             io.MouseWheel != 0.0f)
         {
-            s_vol_wheel_accum += io.MouseWheel * 5.0f;
+            s_vol_wheel_accum += io.MouseWheel * tunable("playback.volume_wheel_step");
             const int step = (int)s_vol_wheel_accum;
             if (step != 0)
             {

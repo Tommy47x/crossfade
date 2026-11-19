@@ -1,4 +1,5 @@
 #include "party_tunnel.h"
+#include "tunables.h"
 
 #include <algorithm>
 #include <atomic>
@@ -37,7 +38,7 @@ namespace
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int kStartTimeoutSeconds = 30;
+static int start_timeout_seconds() { return tunable_int("party.tunnel_timeout_sec"); }
 
 struct Impl
 {
@@ -99,7 +100,7 @@ void remember_line(const std::string &line)
         return;
     g_impl.log_tail += line;
     g_impl.log_tail += '\n';
-    constexpr size_t kKeep = 3000;
+    const size_t kKeep = (size_t)tunable_int("party.tunnel_log_keep");
     if (g_impl.log_tail.size() > kKeep)
         g_impl.log_tail.erase(0, g_impl.log_tail.size() - kKeep);
 }
@@ -189,7 +190,7 @@ void finish_reader(bool user_stopped)
 void reader_main()
 {
     const Clock::time_point deadline =
-        Clock::now() + std::chrono::seconds(kStartTimeoutSeconds);
+        Clock::now() + std::chrono::seconds(start_timeout_seconds());
     std::string pending;
     char buf[1024];
 
@@ -284,7 +285,7 @@ void reader_main()
 void reader_main()
 {
     const Clock::time_point deadline =
-        Clock::now() + std::chrono::seconds(kStartTimeoutSeconds);
+        Clock::now() + std::chrono::seconds(start_timeout_seconds());
     std::string pending;
 
     while (!g_impl.stopping.load(std::memory_order_relaxed))

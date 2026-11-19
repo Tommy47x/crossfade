@@ -1,4 +1,5 @@
 #include "tasks.h"
+#include "tunables.h"
 #include "party.h"
 
 #include "party_link.h"
@@ -36,8 +37,6 @@ namespace
 
 // Hard upper bounds so a misbehaving client cannot grow memory without limit.
 // Active guests are still evicted after 30 minutes of inactivity in party_tick.
-constexpr size_t kMaxGuests = 64;
-constexpr size_t kMaxInbox = 64;
 
 using Clock = std::chrono::steady_clock;
 double now_sec()
@@ -54,11 +53,11 @@ struct Guest
     std::string id;
     std::string name;
     double last_seen = 0.0;
-    party_util::TokenBucket add_bucket{0.2, 1.0, 0.0};
-    party_util::TokenBucket search_bucket{1.0, 3.0, 0.0};
+    party_util::TokenBucket add_bucket{tunable("party.rate_add"), tunable("party.rate_add_burst"), 0.0};
+    party_util::TokenBucket search_bucket{tunable("party.rate_search"), tunable("party.rate_search_burst"), 0.0};
     // "Play next" taps and media buttons are cheap but can still be spammed.
-    party_util::TokenBucket bump_bucket{0.5, 1.0, 0.0};
-    party_util::TokenBucket control_bucket{1.0, 2.0, 0.0};
+    party_util::TokenBucket bump_bucket{tunable("party.rate_bump"), tunable("party.rate_bump_burst"), 0.0};
+    party_util::TokenBucket control_bucket{tunable("party.rate_control"), tunable("party.rate_control_burst"), 0.0};
 };
 
 struct PendingRequest
@@ -245,7 +244,7 @@ void sync_queue_art(const std::vector<Track> &queue)
     downloads.reserve(8);
     // Match the guest snapshot cap: phones only render the next 40 rows, so
     // never spawn artwork workers for an entire 500-track playlist.
-    constexpr int kQueueArtMax = 40;
+    const int kQueueArtMax = tunable_int("party.queue_art_max");
     int seen = 0;
     for (const Track &t : queue)
     {
@@ -361,7 +360,7 @@ std::string build_state_json(AppState &state, const std::vector<Track> &queue,
     // The global queue can hold an entire playlist. Phones only need the
     // immediate run of songs; cap the snapshot so a long host playlist does
     // not bloat every poll or thumbnail fetch.
-    constexpr int kGuestQueueMax = 40;
+    const int kGuestQueueMax = tunable_int("party.guest_queue_max");
     int shown = 0;
     int hidden = 0;
     for (const Track &t : queue)
@@ -1436,7 +1435,7 @@ void party_tick(AppState &state, double position_sec, double duration_sec, bool 
         const double t = now_sec();
         for (auto it = g_guests.begin(); it != g_guests.end();)
         {
-            if (t - it->second.last_seen > 1800.0)
+            if (t - it->second.last_seen > (double)tunable_int("party.idle_evict_sec"))
                 it = g_guests.erase(it);
             else
                 ++it;
@@ -1524,18 +1523,18 @@ bool join(const std::string &token, std::string &guest_id, bool &is_new)
         return false;
 
     const double t = now_sec();
-    if (g_guests.size() >= kMaxGuests)
+    if (g_guests.size() >= (size_t)tunable_int("party.max_guests"))
     {
         // Make room for a real guest by first dropping sessions that have
         // already gone quiet well past the normal 30-minute idle window.
         for (auto it = g_guests.begin(); it != g_guests.end();)
         {
-            if (t - it->second.last_seen > 1800.0)
+            if (t - it->second.last_seen > (double)tunable_int("party.idle_evict_sec"))
                 it = g_guests.erase(it);
             else
                 ++it;
         }
-        if (g_guests.size() >= kMaxGuests)
+        if (g_guests.size() >= (size_t)tunable_int("party.max_guests"))
             return false;
     }
 
@@ -1698,7 +1697,7 @@ AddResult add(const std::string &guest_id, const std::string &input)
         auto git = g_guests.find(guest_id);
         if (git == g_guests.end())
             return error_result(401, "no_session", "Scan the QR code again.");
-        if (g_add_inbox.size() >= kMaxInbox)
+        if (g_add_inbox.size() >= (size_t)tunable_int("party.max_inbox"))
             return error_result(503, "busy", "The app is busy right now. Try again.", 2);
         InboxAdd item;
         item.waiter = waiter;
@@ -1729,7 +1728,7 @@ AddResult undo(const std::string &guest_id, const std::string &video_id)
             return error_result(403, "party_closed", "This party has ended.");
         if (g_guests.find(guest_id) == g_guests.end())
             return error_result(401, "no_session", "Scan the QR code again.");
-        if (g_undo_inbox.size() >= kMaxInbox)
+        if (g_undo_inbox.size() >= (size_t)tunable_int("party.max_inbox"))
             return error_result(503, "busy", "The app is busy right now. Try again.", 2);
         InboxUndo item;
         item.waiter = waiter;
@@ -1775,7 +1774,7 @@ AddResult bump(const std::string &guest_id, const std::string &video_id)
             return error_result(403, "party_closed", "This party has ended.");
         if (g_guests.find(guest_id) == g_guests.end())
             return error_result(401, "no_session", "Scan the QR code again.");
-        if (g_bump_inbox.size() >= kMaxInbox)
+        if (g_bump_inbox.size() >= (size_t)tunable_int("party.max_inbox"))
             return error_result(503, "busy", "The app is busy right now. Try again.", 2);
         InboxBump item;
         item.waiter = waiter;
@@ -1790,7 +1789,7 @@ AddResult bump(const std::string &guest_id, const std::string &video_id)
     wake_loop();
 
     std::unique_lock<std::mutex> lock(waiter->m);
-    if (!waiter->cv.wait_for(lock, std::chrono::seconds(6), [&] { return waiter->done; }))
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(tunable_int("party.waiter_timeout_sec")), [&] { return waiter->done; }))
         return error_result(503, "busy", "The app is busy right now. Try again.");
     return waiter->result;
 }
@@ -1830,7 +1829,7 @@ AddResult control(const std::string &guest_id, const std::string &action)
                                 "The host turned off guest playback controls.");
         if (g_guests.find(guest_id) == g_guests.end())
             return error_result(401, "no_session", "Scan the QR code again.");
-        if (g_control_inbox.size() >= kMaxInbox)
+        if (g_control_inbox.size() >= (size_t)tunable_int("party.max_inbox"))
             return error_result(503, "busy", "The app is busy right now. Try again.", 2);
         InboxControl item;
         item.waiter = waiter;
@@ -1844,7 +1843,7 @@ AddResult control(const std::string &guest_id, const std::string &action)
     wake_loop();
 
     std::unique_lock<std::mutex> lock(waiter->m);
-    if (!waiter->cv.wait_for(lock, std::chrono::seconds(3), [&] { return waiter->done; }))
+    if (!waiter->cv.wait_for(lock, std::chrono::seconds(tunable_int("party.control_timeout_sec")), [&] { return waiter->done; }))
         return error_result(503, "busy", "The app is busy right now. Try again.");
     return waiter->result;
 }

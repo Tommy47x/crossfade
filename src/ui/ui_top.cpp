@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "tunables.h"
 #include "imgui_internal.h"
 #include "ui_backdrop.h"
 #include "ui_components.h"
@@ -505,7 +506,7 @@ static void on_search_edit(AppState &state)
 // should follow the typing, while the search itself waits for a real pause.
 static void dispatch_suggestions(AppState &state)
 {
-    if (!s_suggest_pending || ImGui::GetTime() - s_suggest_edit_time < 0.22)
+    if (!s_suggest_pending || ImGui::GetTime() - s_suggest_edit_time < tunable("search.suggest_debounce_sec"))
         return;
     s_suggest_pending = false;
     if (state.current_tab != Tab::Home || state.search_buffer[0] == '\0')
@@ -518,7 +519,7 @@ static void dispatch_suggestions(AppState &state)
 
 static void dispatch_search(AppState &state)
 {
-    if (!s_pending_search || (ImGui::GetTime() - s_last_edit_time) < 0.35)
+    if (!s_pending_search || (ImGui::GetTime() - s_last_edit_time) < tunable("search.debounce_sec"))
         return;
     s_pending_search = false;
     const int current_id = state.search_id;
@@ -549,8 +550,8 @@ static void dispatch_search(AppState &state)
             if (it != state.search_recent.end())
                 state.search_recent.erase(it);
             state.search_recent.insert(state.search_recent.begin(), query);
-            if (state.search_recent.size() > 10)
-                state.search_recent.resize(10);
+            if (state.search_recent.size() > (size_t)tunable_int("search.recent_max"))
+                state.search_recent.resize((size_t)tunable_int("search.recent_max"));
             save_search_recent(state.search_recent);
 
             // Keep the previous results and top card on screen until the new
@@ -837,7 +838,7 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
     {
         for (const std::string &recent : state.search_recent)
         {
-            if (s_suggest_entries.size() >= 6)
+            if (s_suggest_entries.size() >= (size_t)tunable_int("search.suggest_songs"))
                 break;
             s_suggest_entries.push_back({0, recent, {}});
         }
@@ -846,7 +847,7 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
     {
         for (const std::string &recent : state.search_recent)
         {
-            if (s_suggest_entries.size() >= 3)
+            if (s_suggest_entries.size() >= (size_t)tunable_int("search.suggest_artists"))
                 break;
             const std::string rl = suggest_lower(recent);
             if (rl == ql || rl.find(ql) == std::string::npos || !seen.insert(rl).second)
@@ -858,7 +859,7 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
         {
             for (const SearchSuggestionQuery &q : sugg->queries)
             {
-                if (s_suggest_entries.size() >= 8)
+                if (s_suggest_entries.size() >= (size_t)tunable_int("search.suggest_more"))
                     break;
                 const std::string t = suggest_lower(q.text);
                 if (t.empty() || !seen.insert(t).second)
@@ -867,7 +868,7 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
             }
             for (const SearchSuggestionItem &it : sugg->items)
             {
-                if (s_suggest_entries.size() >= 13)
+                if (s_suggest_entries.size() >= (size_t)tunable_int("search.suggest_total"))
                     break;
                 s_suggest_entries.push_back({2, {}, it});
             }
@@ -895,7 +896,7 @@ static void prepare_search_suggestions(AppState &state, ImVec2 field_min, ImVec2
         content_h += m.space_1 + 1.0f;
     if (state.search_suggest_loading.load() && s_suggest_entries.empty())
         content_h = query_h;
-    s_suggest_view_h = std::min(content_h, 400.0f * m.layout_scale);
+    s_suggest_view_h = std::min(content_h, (float)tunable_int("search.suggest_height") * m.layout_scale);
     const float width = std::max(300.0f * m.layout_scale, field_max.x - field_min.x);
     s_suggest_pos = ImVec2(field_min.x, field_max.y + 6.0f * m.layout_scale);
     s_suggest_size = ImVec2(width, s_suggest_view_h + pad * 2.0f);

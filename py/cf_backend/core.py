@@ -27,14 +27,54 @@ YTDLP = os.environ.get('P100_YTDLP') or 'yt-dlp'
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 # video_id -> (resolved_at, url); avoids re-running yt-dlp for repeat plays.
-_STREAM_TTL = 7200  # googlevideo URLs are valid ~6h; probed before caching
+
+# Developer tunables (Settings -> Tunables). The app writes <config>/tunables.json;
+# values marked "restart" in that panel are read once, here, at startup.
+def _tunable_dirs():
+    dirs = []
+    env = os.environ.get('P100_CONFIG_DIR')
+    if env:
+        dirs.append(env)
+    xdg = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
+    dirs.append(os.path.join(xdg, 'crossfade'))
+    dirs.append(os.path.join(xdg, 'p100'))
+    return dirs
+
+
+def _load_tunables():
+    for d in _tunable_dirs():
+        try:
+            with open(os.path.join(d, 'tunables.json'), encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return {}
+
+
+_TUNE = _load_tunables()
+
+
+def _tune(key, default):
+    try:
+        return float(_TUNE.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _tunei(key, default):
+    return int(round(_tune(key, default)))
+
+
+_STREAM_TTL = _tunei('backend.stream_ttl_sec', 7200)  # googlevideo URLs are valid ~6h; probed before caching
 _stream_cache = {}
 _stream_lock = threading.Lock()
 
 # Resolved URLs are shared with the other backend processes (play, prefetch)
 # through a small on-disk cache: a URL warmed by one channel is usable by
 # another, and repeat plays across restarts skip extraction entirely.
-_STREAM_DISK_MAX = 400
+_STREAM_DISK_MAX = _tunei('backend.stream_disk_max', 400)
 _stream_disk_loaded = False
 _stream_save_lock = threading.Lock()
 
@@ -1546,7 +1586,9 @@ _YTM_MOBILE_UA = ('com.google.android.apps.youtube.music/7.21.50 '
                   '(Linux; U; Android 14) gzip')
 
 
-def _http_json(url, headers=None, data=None, timeout=10):
+def _http_json(url, headers=None, data=None, timeout=None):
+    if timeout is None:
+        timeout = _tune('backend.http_timeout_sec', 10)
     req_headers = {'User-Agent': _BROWSER_UA}
     if headers:
         req_headers.update(headers)
@@ -1843,7 +1885,11 @@ _PLAYER_CLIENT_FALLBACKS = (
 )
 
 
-def _url_playable(url, timeout=8.0, attempts=2):
+def _url_playable(url, timeout=None, attempts=None):
+    if timeout is None:
+        timeout = _tune('backend.playable_timeout_sec', 8.0)
+    if attempts is None:
+        attempts = _tunei('backend.playable_attempts', 2)
     """Mimic mpv's initial open (open-ended Range) to see if the URL really
     serves audio. One quick retry: googlevideo occasionally 403s a perfectly
     good URL for a moment (rate limiting), which must not discard it."""
@@ -2066,7 +2112,7 @@ def get_stream_url(video_id, fresh=False):
 # ---------------------------------------------------------------------------
 _video_map_lock = threading.Lock()
 _video_map = None
-_VIDEO_MAP_TTL = 30 * 86400
+_VIDEO_MAP_TTL = _tunei('backend.video_map_ttl_days', 30) * 86400
 
 
 def _video_map_path():
@@ -2356,8 +2402,8 @@ def _extract_video_urls(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
 
 
 _video_stream_cache = {}
-_VIDEO_STREAM_TTL = 3600
-_VIDEO_DISK_MAX = 64
+_VIDEO_STREAM_TTL = _tunei('backend.video_stream_ttl_sec', 3600)
+_VIDEO_DISK_MAX = _tunei('backend.video_disk_max', 64)
 _video_stream_disk_loaded = False
 _video_stream_disk_lock = threading.Lock()
 
@@ -2491,11 +2537,11 @@ def get_video_urls(video_id, fresh=False, max_height=720, fast=False):
 # (video_time - song_time) is cached for good, so playback only ever applies a
 # seek offset. Analysis runs in the background channel and never in low power.
 # ---------------------------------------------------------------------------
-_SYNC_SR = 8000
-_SYNC_HOP = 0.05
-_SYNC_WINDOW = 20.0
-_SYNC_SEARCH = 90.0
-_SYNC_TTL = 120 * 86400
+_SYNC_SR = _tunei('backend.sync_sr', 8000)
+_SYNC_HOP = _tune('backend.sync_hop_sec', 0.05)
+_SYNC_WINDOW = _tune('backend.sync_window_sec', 20.0)
+_SYNC_SEARCH = _tune('backend.sync_search_sec', 90.0)
+_SYNC_TTL = _tunei('backend.sync_ttl_days', 120) * 86400
 _sync_map = None
 _sync_lock = threading.Lock()
 
@@ -2763,8 +2809,8 @@ def prefetch_stream_urls(video_ids):
 
 # Repeat/back-navigation searches hit YTM every time; a small TTL cache makes
 # them instant. Errors are never cached (a transient failure must retry).
-_SEARCH_TTL = 900  # seconds
-_SEARCH_CACHE_MAX = 100
+_SEARCH_TTL = _tunei('backend.search_ttl_sec', 900)  # seconds
+_SEARCH_CACHE_MAX = _tunei('backend.search_cache_max', 100)
 _search_cache = {}
 
 

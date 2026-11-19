@@ -15,6 +15,7 @@
 #include "writeback.h"
 #include "library.h"
 #include "diagnostics.h"
+#include "tunables.h"
 #include "data_transfer.h"
 #include "power.h"
 #include "misc/cpp/imgui_stdlib.h"
@@ -664,6 +665,7 @@ enum SettingsCategory
     SC_WARMSTART,
     SC_DATA,
     SC_DIAGNOSTICS,
+    SC_TUNABLES,
     SC_NOTES,
     SC_DANGER,
     SC_COUNT
@@ -715,6 +717,7 @@ static const SettingsNavEntry kSettingsNav[] = {
     {SC_WARMSTART, UiIcon::Repeat, "Warm start", nullptr},
     {SC_DATA, UiIcon::Download, "Data transfer", nullptr},
     {SC_DIAGNOSTICS, UiIcon::Stats, "Diagnostics", nullptr},
+    {SC_TUNABLES, UiIcon::Settings, "Tunables", "DEVELOPER"},
     {SC_NOTES, UiIcon::Settings, "Notes", nullptr},
     {SC_DANGER, UiIcon::Close, "Danger Zone", nullptr},
 };
@@ -1347,6 +1350,123 @@ static void eq_add_band(Settings &st)
     st.eq_bands.push_back({freq, gain, q});
     std::sort(st.eq_bands.begin(), st.eq_bands.end(),
               [](const EqBand &a, const EqBand &b) { return a.freq < b.freq; });
+}
+
+static std::string tune_lower(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return text;
+}
+
+// ----------------------------------------------------------------------
+// Settings -> Tunables
+// Every hardcoded developer value, searchable. Overrides are stored in
+// <config>/tunables.json; the Python backend reads the same file at startup.
+// ----------------------------------------------------------------------
+static void draw_tunables_panel()
+{
+    const UiMetrics &m = ui_m();
+    static char s_search[128] = "";
+    bool changed = false;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(m.space_3, m.space_2));
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputTextWithHint("##tune_search",
+                                 "Search tunables by name, key, group or description...",
+                                 s_search, sizeof(s_search)))
+        changed = true;
+    ImGui::PopStyleVar();
+
+    std::string query = tune_lower(std::string(s_search));
+    const int overridden = tunables_changed_count();
+    const int total = (int)tunable_defs().size();
+    ImGui::TextColored(ui_c().text_muted, "%d of %d values overridden", overridden, total);
+    if (overridden > 0)
+    {
+        ImGui::SameLine(0.0f, m.space_4);
+        if (ui_ghost_button("Reset all", ImVec2(130.0f * m.layout_scale, m.control_h)))
+        {
+            tunables_reset_all();
+            changed = true;
+        }
+    }
+    ImGui::Dummy(ImVec2(0.0f, m.space_2));
+
+    const char *group = nullptr;
+    for (const TunableDef &d : tunable_defs())
+    {
+        if (!query.empty())
+        {
+            std::string hay = std::string(d.key) + " " + d.label + " " + d.group + " " + d.desc;
+            hay = tune_lower(std::move(hay));
+            if (hay.find(query) == std::string::npos)
+                continue;
+        }
+        if (!group || std::strcmp(group, d.group) != 0)
+        {
+            group = d.group;
+            settings_group_label(group);
+        }
+
+        ImGui::PushID(d.key);
+        ImGui::TextUnformatted(d.label);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n\n%s\n\nDefault: %g%s", d.key, d.desc, (double)d.def,
+                              d.restart ? "\nTakes effect after a restart." : "");
+
+        ImGui::Indent(m.space_3);
+        const float editor_w = 260.0f * m.layout_scale;
+        ImGui::SetNextItemWidth(editor_w);
+        if (d.kind == TunableKind::Bool)
+        {
+            bool v = tunable_bool(d.key);
+            if (ImGui::Checkbox("##tune_value", &v))
+            {
+                tunables_set(d.key, v ? 1.0f : 0.0f);
+                changed = true;
+            }
+        }
+        else if (d.kind == TunableKind::Int)
+        {
+            int v = tunable_int(d.key);
+            if (ImGui::SliderInt("##tune_value", &v, (int)d.min, (int)d.max))
+            {
+                tunables_set(d.key, (float)v);
+                changed = true;
+            }
+        }
+        else
+        {
+            float v = tunable(d.key);
+            if (ImGui::SliderFloat("##tune_value", &v, d.min, d.max, "%.3g"))
+            {
+                tunables_set(d.key, v);
+                changed = true;
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", d.key);
+        if (d.restart)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("restart");
+        }
+        if (tunables_is_set(d.key))
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset"))
+            {
+                tunables_reset(d.key);
+                changed = true;
+            }
+        }
+        ImGui::Unindent(m.space_3);
+        ImGui::PopID();
+    }
+
+    if (changed)
+        tunables_save_if_dirty();
 }
 
 void draw_settings_panel(AppState &state)
@@ -2800,6 +2920,9 @@ void draw_settings_panel(AppState &state)
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_5));
     }
+
+    if (s_settings_category == SC_TUNABLES)
+        draw_tunables_panel();
 
     ImGui::EndChild();
 

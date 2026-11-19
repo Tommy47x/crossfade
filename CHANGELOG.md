@@ -2,6 +2,30 @@
 
 All notable changes to crossfade are documented here.
 
+## Unreleased
+
+### Added
+
+- **Settings -> Tunables.** A searchable panel with every value that used to be
+  hardcoded: playback retries and fades, search/typeahead debounce and limits,
+  prefetch counts, video sync thresholds, frame budgets, scroll physics, toast
+  timing, layout spacing and radii, thumbnail decode limits, party rate limits,
+  diagnostics watchdogs, and the backend's cache/timeout/alignment constants.
+  Overrides are stored in `<config>/tunables.json`, each row has a reset button,
+  and there is a **Reset all**. Backend values are marked `restart` because the
+  Python process reads them at startup.
+- The backend now reads `tunables.json` at startup, so tunables marked
+  `restart` reach both C++ and Python without a rebuild.
+
+### Fixed
+
+- **Repeated touch drags on the bottom bar.** One drag could leave the tracked
+  finger latched (a missed or rewritten FINGERUP), after which ImGui filtered
+  every new press as a duplicate and the volume/seek sliders stopped responding
+  to touch. A new touch now clears a stale gesture, a release from the same
+  touch device ends it even if the finger id changed, and the input layer
+  reconciles with ImGui's button state each frame.
+
 ## 0.4.1 - 2026-11-19
 
 ### Added

@@ -1,4 +1,5 @@
 #include "mpvplayer.h"
+#include "tunables.h"
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -434,7 +435,7 @@ double probe_audio_file_duration(const std::string &path)
         return -1.0;
     }
     double dur = -1.0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(tunable_int("playback.mpv_ready_ms"));
     while (dur < 0.0 && std::chrono::steady_clock::now() < deadline)
     {
         mpv_event *ev = mpv_wait_event(h, 0.1);
@@ -473,7 +474,7 @@ bool probe_local_audio_metadata(const std::string &path, LocalAudioMeta &out)
     }
 
     double dur = -1.0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(tunable_int("playback.mpv_seek_ms"));
     while (dur < 0.0 && std::chrono::steady_clock::now() < deadline)
     {
         mpv_event *ev = mpv_wait_event(h, 0.05);

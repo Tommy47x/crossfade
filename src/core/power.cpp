@@ -1,4 +1,5 @@
 #include "power.h"
+#include "tunables.h"
 
 #include <atomic>
 #include <cctype>
@@ -66,7 +67,7 @@ bool read_on_battery()
 void refresh()
 {
     const auto now = std::chrono::steady_clock::now();
-    if (g_battery_checked && now - g_last_battery_check < std::chrono::seconds(30))
+    if (g_battery_checked && now - g_last_battery_check < std::chrono::seconds(tunable_int("power.battery_poll_sec")))
         return;
     g_battery_checked = true;
     g_last_battery_check = now;

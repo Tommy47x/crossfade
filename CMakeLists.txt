@@ -62,6 +62,7 @@ set(SOURCES
     src/app/data_transfer.cpp
     src/core/power.cpp
     src/core/tasks.cpp
+    src/core/tunables.cpp
     src/data/accent.cpp
     src/data/paths.cpp
     src/net/ytdlp.cpp
@@ -255,6 +256,9 @@ if(CROSSFADE_BUILD_TESTS)
     foreach(party_test party_link party_queue party_util party_tunnel)
         add_executable(test_${party_test} tests/test_${party_test}.cpp
             src/party/${party_test}.cpp)
+        if(party_test STREQUAL "party_tunnel")
+            target_sources(test_party_tunnel PRIVATE src/core/tunables.cpp src/data/paths.cpp)
+        endif()
         p100_test(test_${party_test})
         add_test(NAME ${party_test} COMMAND test_${party_test})
     endforeach()
@@ -263,7 +267,7 @@ if(CROSSFADE_BUILD_TESTS)
     endif()
 
     add_executable(test_crossfade tests/test_crossfade.cpp
-        src/playback/crossfade.cpp)
+        src/playback/crossfade.cpp src/core/tunables.cpp src/data/paths.cpp)
     p100_test(test_crossfade)
     add_test(NAME crossfade COMMAND test_crossfade)
 
@@ -278,32 +282,33 @@ if(CROSSFADE_BUILD_TESTS)
 
     add_executable(test_library tests/test_library.cpp
         src/data/library.cpp src/net/ytdlp.cpp src/data/paths.cpp
-        external/sqlite/sqlite3.c)
+        src/core/tunables.cpp external/sqlite/sqlite3.c)
     p100_test(test_library)
     add_test(NAME library COMMAND test_library)
 
     add_executable(test_cache tests/test_cache.cpp
         src/net/ytdlp.cpp src/data/paths.cpp src/data/library.cpp
-        external/sqlite/sqlite3.c)
+        src/core/tunables.cpp external/sqlite/sqlite3.c)
     p100_test(test_cache)
     add_test(NAME cache COMMAND test_cache)
 
     add_executable(test_json tests/test_json.cpp
         src/net/ytdlp.cpp src/data/paths.cpp src/data/library.cpp
-        external/sqlite/sqlite3.c)
+        src/core/tunables.cpp external/sqlite/sqlite3.c)
     p100_test(test_json)
     add_test(NAME json COMMAND test_json)
 
     add_executable(test_session tests/test_session.cpp
         src/playback/session.cpp src/data/cache.cpp src/ui/playlists_io.cpp
         src/core/tasks.cpp src/net/ytdlp.cpp src/data/paths.cpp
-        src/data/library.cpp external/sqlite/sqlite3.c)
+        src/data/library.cpp src/core/tunables.cpp external/sqlite/sqlite3.c)
     p100_test(test_session)
     add_test(NAME session COMMAND test_session)
 
     add_executable(test_playlists tests/test_playlists.cpp
         src/ui/playlists_io.cpp src/core/tasks.cpp src/net/ytdlp.cpp
-        src/data/paths.cpp src/data/library.cpp external/sqlite/sqlite3.c)
+        src/data/paths.cpp src/data/library.cpp src/core/tunables.cpp
+        external/sqlite/sqlite3.c)
     p100_test(test_playlists)
     add_test(NAME playlists COMMAND test_playlists)
 

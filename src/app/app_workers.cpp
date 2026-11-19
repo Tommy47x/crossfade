@@ -1,4 +1,5 @@
 #include "app_internal.h"
+#include "tunables.h"
 
 #include "ytdlp.h"
 #include "search_top.h"
@@ -69,7 +70,7 @@ void background_download(const std::string &video_id)
         std::lock_guard<std::mutex> lock(g_download_mutex);
         if (!g_downloading.insert(video_id).second)
             return; // already running
-        if (g_bg_download_count.load() >= kMaxBgDownloads)
+        if (g_bg_download_count.load() >= tunable_int("playback.bg_downloads"))
         {
             g_downloading.erase(video_id);
             return; // retried by the next predownload pass
@@ -160,7 +161,7 @@ void load_recommendations(bool force, bool quiet)
         // few URLs in the background.
         g_state.home_refreshing = false;
         g_state.repaint_requested = true;
-        prefetch_urls_for(*snapshot, 3);
+        prefetch_urls_for(*snapshot, (size_t)tunable_int("home.prefetch_count"));
     }
     else if (err)
     {
@@ -317,7 +318,7 @@ void search_all_and_update(const std::string &query, int expect_id)
         // Warm the URLs of the visible results so clicking one starts fast.
         // Depth matches the rows a search page shows; warming runs on the
         // main backend channel and aborts as soon as search_id changes.
-        prefetch_urls_for(results.songs, 10, expect_id);
+        prefetch_urls_for(results.songs, (size_t)tunable_int("search.prefetch_count"), expect_id);
         std::atomic_store(&g_state.search_results,
                           std::make_shared<const std::vector<Track>>(std::move(results.songs)));
         std::atomic_store(&g_state.search_album_results,

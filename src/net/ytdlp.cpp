@@ -1,4 +1,5 @@
 #include "ytdlp.h"
+#include "tunables.h"
 #include "json_util.h"
 #include "paths.h"
 #include <chrono>
@@ -119,7 +120,6 @@ static std::atomic<bool> g_backend_deferred{false};
 static std::mutex g_backend_log_mutex;
 static std::deque<BackendLogEntry> g_backend_log;
 static uint64_t g_backend_log_seq = 0;
-static constexpr size_t kBackendLogCap = 400;
 
 static const char *backend_channel_name(const BackendChannel &ch)
 {
@@ -142,14 +142,14 @@ static void record_backend_log(const BackendChannel &ch, const std::string &cmd,
                   std::chrono::steady_clock::now().time_since_epoch())
                   .count();
     e.channel = backend_channel_name(ch);
-    constexpr size_t kCmdClip = 180;
+    const size_t kCmdClip = (size_t)tunable_int("diag.command_clip");
     e.command = cmd.size() > kCmdClip ? cmd.substr(0, kCmdClip) + "…" : cmd;
     e.ms = ms;
     e.error = error || response.empty() ||
               response.find("\"error\"") != std::string::npos;
     e.bytes = response.size();
     g_backend_log.push_back(std::move(e));
-    while (g_backend_log.size() > kBackendLogCap)
+    while (g_backend_log.size() > (size_t)tunable_int("diag.backend_log_lines"))
         g_backend_log.pop_front();
 }
 
@@ -249,8 +249,8 @@ static void record_backend_error(const std::string &response)
 
 // Backend commands must never hang the UI thread forever: a wedged Python
 // process (or a pipe that lost its reader) previously blocked fgets for good.
-// Everything up to kReadTimeoutSeconds, then a synthesized error response.
-static constexpr int kReadTimeoutSeconds = 45;
+// Everything up to read_timeout_seconds(), then a synthesized error response.
+static int read_timeout_seconds() { return tunable_int("backend.read_timeout_sec"); }
 // One backend reply is a single JSON line; anything larger is a bug (or a
 // wedged process) and must not grow a buffer without bound on either OS.
 static constexpr size_t kMaxBackendLine = 10 * 1024 * 1024;
@@ -504,7 +504,7 @@ static std::string backend_read_line(BackendChannel &ch)
 {
     // Same 45 s deadline and error payloads as the POSIX poll() loop below.
     std::unique_lock<std::mutex> lock(ch.q_mutex);
-    time_t deadline = time(nullptr) + kReadTimeoutSeconds;
+    time_t deadline = time(nullptr) + read_timeout_seconds();
     while (ch.lines.empty())
     {
         if (ch.dead.load())
@@ -514,7 +514,7 @@ static std::string backend_read_line(BackendChannel &ch)
         int remaining = (int)(deadline - time(nullptr));
         if (remaining <= 0)
         {
-            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", kReadTimeoutSeconds);
+            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", read_timeout_seconds());
             return "{\"error\":\"Backend did not respond in time\",\"kind\":\"backend\"}";
         }
         ch.q_cv.wait_for(lock, std::chrono::seconds(1));
@@ -577,7 +577,7 @@ static std::string backend_read_line(BackendChannel &ch)
     std::string line;
     char buf[8192];
     size_t total_read = 0;
-    time_t deadline = time(nullptr) + kReadTimeoutSeconds;
+    time_t deadline = time(nullptr) + read_timeout_seconds();
 
     while (line.find('\n') == std::string::npos)
     {
@@ -589,7 +589,7 @@ static std::string backend_read_line(BackendChannel &ch)
         int remaining = (int)(deadline - time(nullptr));
         if (remaining <= 0)
         {
-            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", kReadTimeoutSeconds);
+            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", read_timeout_seconds());
             return "{\"error\":\"Backend did not respond in time\",\"kind\":\"backend\"}";
         }
 
@@ -998,8 +998,6 @@ static int json_get_int(const std::string &json, const std::string &key)
     return jsonutil::get_int(json, key);
 }
 
-static constexpr int kJsonMaxDepth = 256;
-static constexpr size_t kJsonMaxInput = 16u * 1024u * 1024u;
 
 static std::string json_find_object(const std::string &json, size_t key_pos)
 {
@@ -1025,7 +1023,7 @@ static std::string json_find_object(const std::string &json, size_t key_pos)
             in_str = true;
         else if (c == '{')
         {
-            if (++depth > kJsonMaxDepth)
+            if (++depth > tunable_int("backend.json_max_depth"))
                 return "";
         }
         else if (c == '}')
@@ -1128,7 +1126,7 @@ static void parse_track_object(const std::string &obj, Track &t)
 
 std::vector<Track> parse_track_array(const std::string &json)
 {
-    if (json.size() > kJsonMaxInput)
+    if (json.size() > (size_t)tunable_int("backend.json_max_input_kb") * 1024u)
         return {};
     std::vector<Track> tracks;
     size_t pos = 0;
@@ -1206,7 +1204,7 @@ static size_t json_object_end(const std::string &json, size_t obj_start)
             in_str = true;
         else if (c == '{')
         {
-            if (++depth > kJsonMaxDepth)
+            if (++depth > tunable_int("backend.json_max_depth"))
                 return std::string::npos;
         }
         else if (c == '}')
@@ -1308,7 +1306,7 @@ static void normalize_lyric_text(std::string &s)
 
 bool parse_lyrics_json(const std::string &json, Lyrics &out)
 {
-    if (json.size() > kJsonMaxInput)
+    if (json.size() > (size_t)tunable_int("backend.json_max_input_kb") * 1024u)
         return false;
     if (json.empty() || json.find("\"error\"") != std::string::npos)
         return false;
@@ -1504,7 +1502,7 @@ static int run_capture(const std::string &cmd, std::string &out)
     // thumbnails). The old 64 KB cap silently cut off the tail, which is where
     // `artist` and `thumbnail` live, so sidecars were written with a title
     // only. Keep a generous safety cap instead.
-    constexpr size_t kCaptureCap = 8u * 1024u * 1024u;
+    const size_t kCaptureCap = (size_t)tunable_int("backend.capture_max_kb") * 1024u;
     char buffer[1024];
     size_t n = 0;
     while ((n = fread(buffer, 1, sizeof(buffer), pipe)) > 0)
@@ -2082,7 +2080,7 @@ std::vector<std::pair<std::string, std::string>> parse_playlist_item_pairs(
         {
             if (depth == 0)
                 obj_start = i;
-            if (++depth > kJsonMaxDepth)
+            if (++depth > tunable_int("backend.json_max_depth"))
                 return out;
         }
         else if (c == '}')

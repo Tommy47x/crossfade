@@ -1,4 +1,5 @@
 #include "texture.h"
+#include "tunables.h"
 #include "paths.h"
 #include <algorithm>
 #include <cmath>
@@ -98,7 +99,6 @@ static std::mutex loading_mutex;
 // -----------------------------------------------------------------------
 static std::unordered_map<std::string, std::chrono::steady_clock::time_point> failed_urls;
 static std::mutex failed_mutex;
-static constexpr std::chrono::seconds kRetryBackoff{60};
 
 static void mark_failed(const std::string &url)
 {
@@ -120,7 +120,7 @@ static bool is_in_failure_backoff(const std::string &url)
     auto it = failed_urls.find(url);
     if (it == failed_urls.end())
         return false;
-    return (std::chrono::steady_clock::now() - it->second) < kRetryBackoff;
+    return (std::chrono::steady_clock::now() - it->second) < std::chrono::seconds(tunable_int("thumbs.retry_backoff_sec"));
 }
 
 // -----------------------------------------------------------------------
@@ -335,7 +335,7 @@ static TextureColor compute_dominant_color(const unsigned char *pixels, int widt
 static void downscale_rgba(const unsigned char *src, int sw, int sh,
                            std::vector<unsigned char> &out, int &ow, int &oh)
 {
-    constexpr int kMaxDim = 512;
+    const int kMaxDim = tunable_int("thumbs.max_dim");
     if (sw <= kMaxDim && sh <= kMaxDim)
     {
         out.assign(src, src + (size_t)sw * (size_t)sh * 4);
@@ -469,8 +469,7 @@ static std::deque<std::string> g_jobs;
 static std::mutex g_jobs_mutex;
 static std::condition_variable g_jobs_cv;
 static bool g_pool_shutdown = false;
-static constexpr int kPoolSize = 3;
-static constexpr size_t kMaxQueuedJobs = 64;
+
 
 static void pool_worker()
 {
@@ -495,12 +494,12 @@ static bool enqueue_texture_load(const std::string &url)
 {
     static std::once_flag once;
     std::call_once(once, [] {
-        for (int i = 0; i < kPoolSize; ++i)
+        for (int i = 0; i < tunable_int("thumbs.pool"); ++i)
             g_pool.emplace_back(pool_worker);
     });
     {
         std::lock_guard<std::mutex> lock(g_jobs_mutex);
-        if (g_jobs.size() >= kMaxQueuedJobs)
+        if (g_jobs.size() >= (size_t)tunable_int("thumbs.queue"))
             return false;
         g_jobs.push_back(url);
     }

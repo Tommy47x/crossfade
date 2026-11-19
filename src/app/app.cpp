@@ -1,4 +1,5 @@
 #include "tasks.h"
+#include "tunables.h"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl3.h"
@@ -184,7 +185,7 @@ std::atomic<bool> g_counts_dirty{false};
 // events; if neither ever fires (worker died, backend wedged) this caps how
 // long the 60 FPS spinner cadence can be pinned.
 std::chrono::steady_clock::time_point g_loading_since;
-static constexpr double kLoadingWatchdogSec = 30.0;
+
 
 // ---- Discord Rich Presence ----
 // Env var wins over the Settings field so a headless/production install can
@@ -276,13 +277,13 @@ void show_notification(const std::string &title, const std::string &body, const 
     {
         n = notify_notification_new(title.c_str(), body.c_str(),
                                     icon_path.empty() ? nullptr : icon_path.c_str());
-        notify_notification_set_timeout(n, 5000);
+        notify_notification_set_timeout(n, (int)(tunable("ui.notification_timeout_sec") * 1000.0f));
     }
     else
     {
         notify_notification_update(n, title.c_str(), body.c_str(),
                                    icon_path.empty() ? nullptr : icon_path.c_str());
-        notify_notification_set_timeout(n, 5000);
+        notify_notification_set_timeout(n, (int)(tunable("ui.notification_timeout_sec") * 1000.0f));
     }
 
     GError *error = nullptr;
@@ -1125,9 +1126,9 @@ int app_run(int argc, char **argv)
         if (animating)
             last_activity_time = now; // keep the fast cadence until motion settles
         bool recently_active =
-            (now - last_activity_time) < std::chrono::milliseconds(1000);
+            (now - last_activity_time) < std::chrono::milliseconds(tunable_int("ui.activity_grace_ms"));
 
-        long long interval_ms = 1000;
+        long long interval_ms = tunable_int("ui.frame_idle_ms");
         // Video needs a frame every vblank (mpv's update callback also wakes
         // the loop, but this keeps the cadence honest while the surface shows
         // moving pictures).
@@ -1140,12 +1141,16 @@ int app_run(int argc, char **argv)
                                  g_state.video_page_alpha > 0.001f;
         if (animating || g_state.loading || recently_active ||
             g_cf.pending.load() || g_cf.active.load() || video_frame)
-            interval_ms = low_power ? 33 : 16;
+            interval_ms = low_power ? tunable_int("ui.frame_lp_active_ms")
+                                    : tunable_int("ui.frame_active_ms");
         else if (g_state.playing)
-            interval_ms = low_power ? 250 : 100;
+            interval_ms = low_power ? tunable_int("ui.frame_lp_playback_ms")
+                                    : tunable_int("ui.frame_playback_ms");
         else if (low_power)
-            interval_ms = 2000;
+            interval_ms = tunable_int("ui.frame_lp_idle_ms");
 
+        interval_ms = std::min<long long>(interval_ms,
+                                          tunable_int("ui.frame_safety_ms"));
         // Wake at the earlier of the scheduled frame and one current
         // interval from now, so a state change (play started while idle,
         // animated scroll finished) never sleeps past the next deadline.
@@ -1469,7 +1474,7 @@ int app_run(int argc, char **argv)
 
             if (g_state.loading &&
                 std::chrono::duration<double>(now - g_loading_since).count() >
-                    kLoadingWatchdogSec)
+                    tunable("startup.loading_watchdog_sec"))
             {
                 // A stale flag on a healthy stream should clear silently; only
                 // warn when nothing is actually audible.
@@ -1944,11 +1949,11 @@ int app_run(int argc, char **argv)
                 else if (!s_home_retry_armed)
                 {
                     s_home_retry_armed = true;
-                    s_home_retry_at = retry_now + std::chrono::seconds(10);
+                    s_home_retry_at = retry_now + std::chrono::seconds(tunable_int("home.retry_first_sec"));
                 }
                 else if (retry_now >= s_home_retry_at)
                 {
-                    s_home_retry_at = retry_now + std::chrono::seconds(30);
+                    s_home_retry_at = retry_now + std::chrono::seconds(tunable_int("home.retry_next_sec"));
                     {
                         std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                         g_state.home_failed = false;
@@ -2235,7 +2240,7 @@ int app_run(int argc, char **argv)
                     ui_notify(UiNotifyType::Info, "Sleep timer",
                               "Paused — good night.");
                 }
-                else if (remain <= 5 && g_state.playing)
+                else if (remain <= (double)tunable("playback.sleep_fade_sec") && g_state.playing)
                 {
                     if (!g_state.sleep_fade_started)
                     {
@@ -2244,7 +2249,7 @@ int app_run(int argc, char **argv)
                         g_state.sleep_fade_started = true;
                     }
                     float base = (float)g_state.sleep_volume_restore;
-                    g_player->set_volume((int)(base * (float)remain / 5.0f));
+                    g_player->set_volume((int)(base * (float)remain / tunable("playback.sleep_fade_sec")));
                     g_state.repaint_requested = true;
                 }
             }
@@ -2380,7 +2385,7 @@ int app_run(int argc, char **argv)
                  recently_active || g_cf.pending.load() ||
                  g_cf.active.load() || (g_state.playing) || g_state.video_active ||
                  g_state.video_loading.load() || g_state.video_page_alpha > 0.001f ||
-                 (now - last_render_time) > std::chrono::seconds(5)) &&
+                 (now - last_render_time) > std::chrono::seconds(tunable_int("ui.render_safety_sec"))) &&
                 !g_window_hidden;
             if (want_render)
             {

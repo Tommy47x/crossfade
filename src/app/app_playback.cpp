@@ -1,4 +1,5 @@
 #include "app_internal.h"
+#include "tunables.h"
 
 #include "ytdlp.h"
 #include "mpvplayer.h"
@@ -260,7 +261,7 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
         // Resolve in backend-parallel batches. One command per batch keeps the
         // pipe from serializing four extractions behind each other; between
         // batches we can still abandon a superseded search.
-        static constexpr size_t kBatch = 12;
+        const size_t kBatch = (size_t)tunable_int("playback.prefetch_batch");
         for (size_t start = 0; start < ids.size(); start += kBatch)
         {
             if (cancel_search_id != 0 && g_state.search_id != cancel_search_id)
@@ -371,7 +372,7 @@ void prefetch_urls_for_serial(const std::vector<Track> &tracks, size_t count,
 
             if (cancel_token && cancel_token->load() != token)
                 return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            std::this_thread::sleep_for(std::chrono::milliseconds(tunable_int("playback.prefetch_serial_gap_ms")));
         }
     });
 }
@@ -700,7 +701,7 @@ void begin_video_playback()
         const double base = std::max(0.25, (double)g_state.settings.playback_speed);
         g_video_target->set_speed(base);
         g_video_applied_speed = base;
-        g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
+        g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(tunable_int("video.sync_hold_ms"));
         g_video_target->set_paused(!g_state.playing.load());
         g_video_target->set_volume(0);
         g_state.repaint_requested = true;
@@ -972,7 +973,7 @@ static bool retry_video_stream()
         return false;
     g_video_fresh_tried = true;
     g_video_target_failed = false;
-    g_video_retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    g_video_retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(tunable_int("video.retry_deadline_sec"));
     auto base = g_video_last_result;
     const std::string sid = g_video_stream_id;
     const int h = g_video_height;
@@ -1026,13 +1027,13 @@ void video_preload_tick(bool have_frame)
         // server refused the bytes) gets one fresh re-resolve; the request
         // timeout below still covers a resolve that never returned.
         if (g_video_load_at != std::chrono::steady_clock::time_point{} &&
-            now - g_video_load_at > std::chrono::seconds(8))
+            now - g_video_load_at > std::chrono::seconds(tunable_int("video.load_fail_sec")))
         {
             if (!retry_video_stream())
                 cancel_video_resolve(true);
             return;
         }
-        if (now - g_video_requested_at > std::chrono::seconds(30))
+        if (now - g_video_requested_at > std::chrono::seconds(tunable_int("video.resolve_timeout_sec")))
             cancel_video_resolve(true); // resolve never finished
         return;
     }
@@ -1125,7 +1126,7 @@ void finish_video_start()
     g_video_applied_speed = base;
     g_video_target->set_paused(!g_state.playing.load());
     g_video_target->set_volume(0);
-    g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
+    g_video_hold_sync_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(tunable_int("video.sync_hold_ms"));
     g_state.repaint_requested = true;
     DLOG("video: showing (audio=%.2f video=%.2f)",
          audible ? audible->cached_time_pos() : -1.0,
@@ -1179,7 +1180,7 @@ void video_active_tick()
     }
     if (g_video_audio_seek_at != std::chrono::steady_clock::time_point{})
     {
-        if (now - g_video_audio_seek_at < std::chrono::milliseconds(180))
+        if (now - g_video_audio_seek_at < std::chrono::milliseconds(tunable_int("video.seek_follow_ms")))
             return;
         g_video_audio_seek_at = {};
         g_video_target->seek(std::max(0.0, audible->cached_time_pos() + g_video_sync_offset + 0.1));
@@ -1214,8 +1215,8 @@ void video_active_tick()
     const double audio_pos = audible->cached_time_pos();
     const double tpos = g_video_target->cached_time_pos();
     const double want_pos = audio_pos + g_video_sync_offset;
-    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > 2.0 &&
-        now - g_video_last_seek > std::chrono::seconds(2))
+    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > tunable("video.drift_threshold_sec") &&
+        now - g_video_last_seek > std::chrono::seconds(tunable_int("video.drift_seek_interval_sec")))
     {
         DLOG("video: resync (audio=%.2f video=%.2f offset=%.2f)", audio_pos, tpos,
              g_video_sync_offset);
@@ -1230,9 +1231,11 @@ void video_active_tick()
     // the gap within a couple of seconds.
     const double base = std::max(0.25, (double)g_state.settings.playback_speed);
     double desired = base;
-    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > 0.08)
-        desired = base + std::clamp((want_pos - tpos) * 0.25, -0.12, 0.12);
-    if (std::fabs(desired - g_video_applied_speed) > 0.004)
+    if (audio_pos >= 0.0 && tpos >= 0.0 && std::fabs(tpos - want_pos) > tunable("video.speed_deadband"))
+        desired = base + std::clamp((want_pos - tpos) * (double)tunable("video.speed_nudge"),
+                                                   -(double)tunable("video.speed_clamp"),
+                                                   (double)tunable("video.speed_clamp"));
+    if (std::fabs(desired - g_video_applied_speed) > tunable("video.speed_apply_threshold"))
     {
         g_video_target->set_speed(desired);
         g_video_applied_speed = desired;
@@ -1461,7 +1464,7 @@ void consume_endless_results()
     if (g_endless_waiting && !appended && !g_state.endless_loading.load())
     {
         // Keep waiting: schedule the next attempt. 4 s, then 8/16/32 s.
-        s_retry_backoff = std::min(s_retry_backoff + 1, 4);
+        s_retry_backoff = std::min(s_retry_backoff + 1, tunable_int("playback.retry_max_doublings"));
         s_retry_at = now + std::chrono::seconds(2 << s_retry_backoff);
         g_state.status_text = "Endless radio unavailable; retrying...";
     }
@@ -1827,7 +1830,7 @@ void maybe_start_crossfade()
     {
         static std::chrono::steady_clock::time_point s_last_ramp;
         const auto ramp_now = std::chrono::steady_clock::now();
-        if (ramp_now - s_last_ramp < std::chrono::milliseconds(50))
+        if (ramp_now - s_last_ramp < std::chrono::milliseconds(tunable_int("playback.resume_ramp_ms")))
             return;
         s_last_ramp = ramp_now;
         const double cf = std::max(g_cf.seconds, 0.1);

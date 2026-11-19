@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "tunables.h"
 #include "imgui_internal.h"
 #include "ui_backdrop.h"
 #include "ui_notify.h"
@@ -622,8 +623,8 @@ static float anim_factor()
 {
     switch (g_ui_animation_level)
     {
-    case 1: return 0.70f;
-    case 3: return 1.55f;
+    case 1: return tunable("ui.anim_subtle");
+    case 3: return tunable("ui.anim_playful");
     default: return 1.0f;
     }
 }

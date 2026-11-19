@@ -1,6 +1,7 @@
 #include "app_internal.h"
 
 #include "ui.h"
+#include "tunables.h"
 #include "ui_notify.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@ struct TouchGesture
 {
     bool active = false;
     SDL_FingerID id = 0;
+    SDL_TouchID touch_id = 0;
     float start_x = 0.0f, start_y = 0.0f;
     float last_x = 0.0f, last_y = 0.0f;
     Uint32 start_ticks = 0;
@@ -43,20 +45,22 @@ static Uint32 g_wheel_last_event_ms = 0;
 static Uint32 g_wheel_last_frame_ms = 0;
 static int g_wheel_event_count = 0;
 
-static constexpr float kWheelPixelsPerDelta = 70.0f;
-static constexpr float kWheelChaseTau = 0.05f; // input→display settle, s
-static constexpr float kWheelFlingDecay = 3.0f;
-static constexpr float kWheelFlingMin = 5.0f;
-static constexpr float kWheelFlingMax = 5000.0f;
-static constexpr Uint32 kWheelReleaseMs = 80;
-static constexpr Uint32 kWheelGestureGapMs = 120;
+// All of these live in Settings -> Tunables ("Scrolling"); defaults are the
+// values this code shipped with.
+static float wheel_pixels_per_delta() { return tunable("scroll.pixels_per_delta"); }
+static float wheel_chase_tau() { return std::max(0.005f, tunable("scroll.chase_tau")); }
+static float wheel_fling_decay() { return tunable("scroll.fling_decay"); }
+static float wheel_fling_min() { return tunable("scroll.fling_min"); }
+static float wheel_fling_max() { return tunable("scroll.fling_max"); }
+static Uint32 wheel_release_ms() { return (Uint32)tunable_int("scroll.release_ms"); }
+static Uint32 wheel_gesture_gap_ms() { return (Uint32)tunable_int("scroll.gesture_gap_ms"); }
 
 // Horizontal two-finger swipe (back/forward navigation). See the
 // SDL_MOUSEWHEEL handler for the threshold semantics.
 static float g_hwheel_accum = 0.0f;
 static Uint32 g_hwheel_last_ms = 0;
-static constexpr float kHWheelTrigger = 2.0f; // wheel deltas per navigation step
-static constexpr Uint32 kHWheelGapMs = 150;
+static float hwheel_trigger() { return tunable("scroll.hwheel_trigger"); } // deltas per step
+static Uint32 hwheel_gap_ms() { return (Uint32)tunable_int("scroll.hwheel_gap_ms"); }
 
 void reset_wheel_scroll()
 {
@@ -84,6 +88,26 @@ static ImVec2 g_touch_click_pos;
 // see ui_touch_tap_recent().
 double g_touch_click_time = -1.0e6;
 
+// Ends a direct-manipulation drag: releases the synthetic mouse button once
+// and clears the gesture. Safe to call when no drag is active.
+static void end_widget_drag()
+{
+    if (!g_touch.widget_drag)
+        return;
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddMousePosEvent(g_touch.last_x, g_touch.last_y);
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    g_touch.widget_drag = false;
+    g_touch.active = false;
+}
+
+static void reset_touch_gesture()
+{
+    if (g_touch.widget_drag)
+        end_widget_drag();
+    g_touch.active = false;
+    g_touch.widget_drag = false;
+}
 static void queue_touch_click(float x, float y, int button)
 {
     if (g_touch_click_phase != TouchClickPhase::None)
@@ -125,9 +149,17 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
     if (event.type == SDL_FINGERDOWN)
     {
         if (g_touch.active)
-            return;
+        {
+            // A FINGERUP that never arrived (driver quirk, finger lifted off
+            // the window edge) must not poison every later gesture. Drop the
+            // stale one and release its synthetic button.
+            DLOG("touch: replacing stale gesture (finger %lld -> %lld)",
+                 (long long)g_touch.id, (long long)event.tfinger.fingerId);
+            reset_touch_gesture();
+        }
         g_touch.active = true;
         g_touch.id = event.tfinger.fingerId;
+        g_touch.touch_id = event.tfinger.touchId;
         g_touch.start_x = g_touch.last_x = px(event.tfinger.x);
         g_touch.start_y = g_touch.last_y = py(event.tfinger.y);
         g_touch.start_ticks = SDL_GetTicks();
@@ -150,7 +182,17 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
         return;
     }
 
-    if (!g_touch.active || event.tfinger.fingerId != g_touch.id)
+    if (!g_touch.active)
+        return;
+    // Motion must belong to the tracked finger. A release from the same touch
+    // device still ends the gesture when the ids disagree: some drivers rewrite
+    // finger ids, and a missed up is what latched the slider after one drag.
+    const bool same_finger = event.tfinger.fingerId == g_touch.id;
+    const bool same_touch =
+        g_touch.touch_id != 0 && event.tfinger.touchId == g_touch.touch_id;
+    if (event.type != SDL_FINGERUP && !same_finger)
+        return;
+    if (event.type == SDL_FINGERUP && !same_finger && !same_touch)
         return;
 
     if (event.type == SDL_FINGERMOTION)
@@ -168,7 +210,8 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
         }
         const float dx = x - g_touch.start_x;
         const float dy = y - g_touch.start_y;
-        if (!g_touch.scrolling && dx * dx + dy * dy > 14.0f * 14.0f)
+        const float tap_slop = tunable("scroll.touch_tap_slop_px");
+        if (!g_touch.scrolling && dx * dx + dy * dy > tap_slop * tap_slop)
             g_touch.scrolling = true;
         const Uint32 now_ms = SDL_GetTicks();
         const float pixel_dy = y - g_touch.last_y;
@@ -202,20 +245,19 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
         const float y = py(event.tfinger.y);
         if (g_touch.widget_drag)
         {
-            ImGuiIO &io = ImGui::GetIO();
-            io.AddMousePosEvent(x, y);
-            io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
-            g_touch.widget_drag = false;
-            g_touch.active = false;
+            g_touch.last_x = x;
+            g_touch.last_y = y;
+            end_widget_drag();
             return;
         }
         const bool tap = !g_touch.scrolling && !g_touch.long_fired;
         const Uint32 now_ms = SDL_GetTicks();
         float velocity = g_touch.velocity;
         // Holding still before lifting should not fling.
-        if (now_ms - g_touch.last_move_ticks > 120)
+        if (now_ms - g_touch.last_move_ticks > (Uint32)tunable_int("scroll.touch_fling_stop_ms"))
             velocity = 0.0f;
-        velocity = std::max(-5000.0f, std::min(velocity, 5000.0f));
+        const float touch_fling_max = tunable("scroll.touch_fling_max");
+        velocity = std::max(-touch_fling_max, std::min(velocity, touch_fling_max));
         g_touch.active = false;
         if (g_touch.scrolling && !g_touch.long_fired && std::fabs(velocity) >= 80.0f)
         {
@@ -231,7 +273,18 @@ void handle_touch_event(const SDL_Event &event, SDL_Window *window)
 
 void update_touch_long_press()
 {
-    if (!g_touch.active || g_touch.widget_drag || g_touch.scrolling || g_touch.long_fired)
+    if (g_touch.widget_drag)
+    {
+        // Reconcile with ImGui once the press has been through a frame. If
+        // ImGui no longer holds the button, the gesture is over even when the
+        // FINGERUP never reached us; leaving it latched made every later touch
+        // a duplicate press that ImGui filtered out.
+        if (!ImGui::GetIO().MouseDown[ImGuiMouseButton_Left] &&
+            SDL_GetTicks() - g_touch.start_ticks > 250)
+            reset_touch_gesture();
+        return;
+    }
+    if (!g_touch.active || g_touch.scrolling || g_touch.long_fired)
         return;
     if (SDL_GetTicks() - g_touch.start_ticks < 550)
         return;
@@ -259,7 +312,7 @@ bool update_touch_inertia()
     if (dt > 0.05f)
         dt = 0.05f;
     add_scroll_pixels(g_touch_fling_velocity * dt);
-    g_touch_fling_velocity *= std::exp(-3.2f * dt);
+    g_touch_fling_velocity *= std::exp(-tunable("scroll.touch_inertia_decay") * dt);
     if (std::fabs(g_touch_fling_velocity) < 20.0f)
     {
         g_touch_fling_velocity = 0.0f;
@@ -275,7 +328,7 @@ bool update_touch_inertia()
 bool update_wheel_inertia()
 {
     const Uint32 now_ms = SDL_GetTicks();
-    const bool input_active = (now_ms - g_wheel_last_event_ms) <= kWheelReleaseMs;
+    const bool input_active = (now_ms - g_wheel_last_event_ms) <= wheel_release_ms();
     if (!input_active && !g_wheel_inertia_active &&
         std::fabs(g_scroll_target - g_scroll_pos) < 0.05f)
         return false;
@@ -308,9 +361,9 @@ bool update_wheel_inertia()
     }
     else if (!g_wheel_inertia_active)
     {
-        const float fling = std::max(-kWheelFlingMax,
-                                     std::min(g_wheel_input_velocity, kWheelFlingMax));
-        if (std::fabs(fling) >= kWheelFlingMin)
+        const float fling = std::max(-wheel_fling_max(),
+                                     std::min(g_wheel_input_velocity, wheel_fling_max()));
+        if (std::fabs(fling) >= wheel_fling_min())
         {
             g_wheel_velocity = fling;
             g_wheel_inertia_active = true;
@@ -322,8 +375,8 @@ bool update_wheel_inertia()
     if (g_wheel_inertia_active)
     {
         g_scroll_target += g_wheel_velocity * dt;
-        g_wheel_velocity *= std::exp(-kWheelFlingDecay * dt);
-        if (std::fabs(g_wheel_velocity) < kWheelFlingMin)
+        g_wheel_velocity *= std::exp(-wheel_fling_decay() * dt);
+        if (std::fabs(g_wheel_velocity) < wheel_fling_min())
         {
             g_wheel_velocity = 0.0f;
             g_wheel_inertia_active = false;
@@ -332,7 +385,7 @@ bool update_wheel_inertia()
 
     // Critically-damped chase: the rendered position follows the target,
     // turning discrete wheel packets into continuous sub-pixel motion.
-    const float chase = 1.0f - std::exp(-dt / kWheelChaseTau);
+    const float chase = 1.0f - std::exp(-dt / wheel_chase_tau());
     const float new_pos = g_scroll_pos + (g_scroll_target - g_scroll_pos) * chase;
     add_scroll_pixels(new_pos - g_scroll_pos);
     g_scroll_pos = new_pos;
@@ -377,9 +430,9 @@ void handle_wheel_event(const SDL_Event &event)
 
         const Uint32 now_ms = SDL_GetTicks();
         const Uint32 gap_ms = now_ms - g_wheel_last_event_ms;
-        const float pixels = -delta * kWheelPixelsPerDelta;
+        const float pixels = -delta * wheel_pixels_per_delta();
 
-        if (gap_ms <= kWheelGestureGapMs)
+        if (gap_ms <= wheel_gesture_gap_ms())
         {
             if (gap_ms > 0)
             {
@@ -404,7 +457,7 @@ void handle_wheel_event(const SDL_Event &event)
 
     // Horizontal touchpad swipe: two-finger navigation, like a browser.
     // Deltas accumulate during one swipe (events arriving closer than
-    // kHWheelGapMs); crossing the threshold fires once and re-arms, so a long
+    // hwheel_gap_ms()); crossing the threshold fires once and re-arms, so a long
     // swipe can navigate several steps. A rightward finger swipe sends
     // wheel.x > 0 (Forward); wheel.x < 0 is Back.
 #if SDL_VERSION_ATLEAST(2, 0, 18)
@@ -417,14 +470,14 @@ void handle_wheel_event(const SDL_Event &event)
 
     // A toast under the cursor owns the horizontal gesture: it tracks the
     // fingers (swipe-to-dismiss) instead of triggering navigation.
-    if (ui_notify_swipe_feed(xdelta * kWheelPixelsPerDelta))
+    if (ui_notify_swipe_feed(xdelta * wheel_pixels_per_delta()))
     {
         g_state.repaint_requested = true;
         return;
     }
 
     const Uint32 now_ms = SDL_GetTicks();
-    if (now_ms - g_hwheel_last_ms > kHWheelGapMs ||
+    if (now_ms - g_hwheel_last_ms > hwheel_gap_ms() ||
         (g_hwheel_accum != 0.0f && g_hwheel_accum * xdelta < 0.0f))
     {
         // New swipe: enough time passed since the last event, or the
@@ -433,10 +486,10 @@ void handle_wheel_event(const SDL_Event &event)
     }
     g_hwheel_accum += xdelta;
     g_hwheel_last_ms = now_ms;
-    while (std::abs(g_hwheel_accum) >= kHWheelTrigger)
+    while (std::abs(g_hwheel_accum) >= hwheel_trigger())
     {
         const bool back = g_hwheel_accum < 0.0f;
-        g_hwheel_accum -= back ? -kHWheelTrigger : kHWheelTrigger;
+        g_hwheel_accum -= back ? -hwheel_trigger() : hwheel_trigger();
         if (back)
             ui_go_back(g_state);
         else
