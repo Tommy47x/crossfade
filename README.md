@@ -749,9 +749,14 @@ and security notes are in [`docs/PARTY-MODE.md`](docs/PARTY-MODE.md).
 | Toggle sidebar | `S` |
 | Open Up Next queue | `Q` |
 | Open party mode | `P` |
+| Toggle low power mode | `Shift+P` |
+| Scroll to top of the list | `T` |
 | Back / clear search / close fullscreen QR | `Esc` |
 | Shortcut help | `?` |
 | ImGui demo (development) | `Ctrl+Shift+D` |
+
+Every shortcut is rebindable in **Settings → Shortcuts** (click a binding, then press
+the new keys; Esc cancels).
 
 ### Mouse and touch
 

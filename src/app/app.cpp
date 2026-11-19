@@ -1,4 +1,5 @@
 #include "tasks.h"
+#include "shortcuts.h"
 #include "tunables.h"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
@@ -1239,15 +1240,31 @@ int app_run(int argc, char **argv)
                 if (event.type == SDL_KEYDOWN)
                 {
                     const SDL_Keymod mod = (SDL_Keymod)event.key.keysym.mod;
-                    const bool ctrl = (mod & KMOD_CTRL) != 0;
-                    const bool shift = (mod & KMOD_SHIFT) != 0;
                     const SDL_Keycode key = event.key.keysym.sym;
+                    const uint32_t mods =
+                        (uint32_t)(mod & (KMOD_CTRL | KMOD_SHIFT | KMOD_ALT));
+                    auto hit = [&](const char *id) { return shortcut_matches(id, (int)key, mods); };
 
-                    if (ctrl && shift && key == SDLK_d)
+                    // Settings -> Shortcuts capture: the next key becomes the
+                    // binding. Esc cancels; modifier keys alone are ignored.
+                    if (!g_state.rebind_shortcut_id.empty())
                     {
-                        show_demo = !show_demo;
+                        const bool modifier_key =
+                            key == SDLK_LCTRL || key == SDLK_RCTRL ||
+                            key == SDLK_LSHIFT || key == SDLK_RSHIFT ||
+                            key == SDLK_LALT || key == SDLK_RALT ||
+                            key == SDLK_LGUI || key == SDLK_RGUI;
+                        if (key == SDLK_ESCAPE)
+                            g_state.rebind_shortcut_id.clear();
+                        else if (!modifier_key && !event.key.repeat)
+                        {
+                            shortcuts_set(g_state.rebind_shortcut_id.c_str(), (int)key, mods);
+                            g_state.rebind_shortcut_id.clear();
+                            shortcuts_save_if_dirty();
+                        }
+                        g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_ESCAPE && !ctrl && !shift)
+                    else if (hit("back"))
                     {
                         if (g_state.video_theater)
                             g_state.video_theater = false;
@@ -1268,11 +1285,15 @@ int app_run(int argc, char **argv)
                             ui_go_back(g_state);
                         g_state.repaint_requested = true;
                     }
+                    else if (hit("debug_demo"))
+                    {
+                        show_demo = !show_demo;
+                    }
                     else if (ImGui::GetIO().WantTextInput)
                     {
                         // Let the focused text field keep the remaining keys.
                     }
-                    else if (key == SDLK_l && !ctrl && !shift)
+                    else if (hit("toggle_lyrics"))
                     {
                         g_state.settings.lyrics_panel_open = !g_state.settings.lyrics_panel_open;
                         save_settings(g_state.settings);
@@ -1283,23 +1304,22 @@ int app_run(int argc, char **argv)
                         }
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_v && !ctrl && !shift && !event.key.repeat)
+                    else if (hit("toggle_video") && !event.key.repeat)
                     {
                         g_state.video_toggle_requested = true;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_f && !ctrl && !shift && !event.key.repeat &&
-                             g_state.video_active)
+                    else if (hit("video_theater") && !event.key.repeat && g_state.video_active)
                     {
                         g_state.video_theater = !g_state.video_theater;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_s && !ctrl && !shift)
+                    else if (hit("toggle_sidebar"))
                     {
                         g_state.sidebar_collapsed = !g_state.sidebar_collapsed;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_q && !ctrl && !shift)
+                    else if (hit("queue"))
                     {
                         if (g_state.current_tab != Tab::Queue)
                         {
@@ -1309,28 +1329,28 @@ int app_run(int argc, char **argv)
                         g_state.current_tab = Tab::Queue;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_p && !ctrl && !shift)
+                    else if (hit("party"))
                     {
                         g_state.current_tab = Tab::Party;
                         g_state.repaint_requested = true;
                     }
-                    else if (shift && key == SDLK_SLASH)
+                    else if (hit("shortcut_help"))
                     {
                         g_state.show_shortcuts = !g_state.show_shortcuts;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_F2 && !ctrl && !shift)
+                    else if (hit("backend_debug"))
                     {
                         g_state.show_backend_debug = !g_state.show_backend_debug;
                         g_state.repaint_requested = true;
                     }
-                    else if (ctrl && key == SDLK_COMMA)
+                    else if (hit("settings"))
                     {
                         ui_invalidate_forward(g_state);
                         g_state.current_tab = Tab::Settings;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_SLASH || (ctrl && key == SDLK_f))
+                    else if (hit("focus_search") || hit("focus_search_alt"))
                     {
                         if (g_state.current_tab != Tab::Home &&
                             g_state.current_tab != Tab::Downloads &&
@@ -1346,7 +1366,30 @@ int app_run(int argc, char **argv)
                         g_state.focus_search_requested = true;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_SPACE && !event.key.repeat)
+                    else if (hit("scroll_top"))
+                    {
+                        ui_request_scroll_top();
+                        g_state.repaint_requested = true;
+                    }
+                    else if (hit("low_power"))
+                    {
+                        g_state.settings.low_power = !g_state.settings.low_power;
+                        save_settings(g_state.settings);
+                        apply_ui_scale(g_state.settings);
+                        power::refresh();
+                        const bool active = power::low_power();
+                        if (!g_state.settings.low_power && active)
+                            ui_notify(UiNotifyType::Info, "Low power mode",
+                                      "Still on while on battery. Turn off \"On battery\" in Settings -> Power to disable.",
+                                      4.0f);
+                        else
+                            ui_notify(UiNotifyType::Info, "Low power mode",
+                                      active ? "On: lower frame rate, motion off, no speculative work."
+                                             : "Off: full frame rate and prefetching.",
+                                      3.0f);
+                        g_state.repaint_requested = true;
+                    }
+                    else if (hit("play_pause") && !event.key.repeat)
                     {
                         if (g_state.playing)
                             g_state.user_pause_requested = true;
@@ -1354,37 +1397,42 @@ int app_run(int argc, char **argv)
                             g_state.user_play_requested = true;
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_LEFT || key == SDLK_RIGHT)
+                    else if (hit("prev_track"))
                     {
-                        if (ctrl)
+                        g_state.prev_requested = true;
+                        g_state.repaint_requested = true;
+                    }
+                    else if (hit("next_track"))
+                    {
+                        g_state.next_requested = true;
+                        g_state.repaint_requested = true;
+                    }
+                    else if (hit("seek_back") || hit("seek_fwd") ||
+                             hit("seek_back_long") || hit("seek_fwd_long"))
+                    {
+                        const bool back = hit("seek_back") || hit("seek_back_long");
+                        const bool long_step = hit("seek_back_long") || hit("seek_fwd_long");
+                        const double pos = g_player->get_property_double("time-pos");
+                        const double dur = g_player->get_property_double("duration");
+                        if (pos >= 0.0 && dur > 0.0)
                         {
-                            if (key == SDLK_LEFT)
-                                g_state.prev_requested = true;
-                            else
-                                g_state.next_requested = true;
-                        }
-                        else
-                        {
-                            const double pos = g_player->get_property_double("time-pos");
-                            const double dur = g_player->get_property_double("duration");
-                            if (pos >= 0.0 && dur > 0.0)
-                            {
-                                const double step = shift ? 20.0 : 5.0;
-                                const double target = key == SDLK_LEFT ? pos - step : pos + step;
-                                g_player->seek(std::max(0.0, std::min(dur, target)));
-                            }
+                            const double step = long_step ? 20.0 : 5.0;
+                            const double target = back ? pos - step : pos + step;
+                            g_player->seek(std::max(0.0, std::min(dur, target)));
                         }
                         g_state.repaint_requested = true;
                     }
-                    else if (key == SDLK_UP || key == SDLK_DOWN)
+                    else if (hit("vol_down") || hit("vol_up") ||
+                             hit("vol_down_10") || hit("vol_up_10"))
                     {
-                        const bool fading =
-                            g_cf.pending.load() || g_cf.active.load();
+                        const bool up = hit("vol_up") || hit("vol_up_10");
+                        const double amount = (hit("vol_up_10") || hit("vol_down_10")) ? 10.0 : 5.0;
+                        const bool fading = g_cf.pending.load() || g_cf.active.load();
                         const double cur = fading
                                                ? (double)g_cf.user_volume
                                                : g_player->get_property_double("volume");
-                        const double vol = key == SDLK_UP ? std::min(100.0, cur + (shift ? 10.0 : 5.0))
-                                                          : std::max(0.0, cur - (shift ? 10.0 : 5.0));
+                        const double vol = up ? std::min(100.0, cur + amount)
+                                              : std::max(0.0, cur - amount);
                         if (fading)
                             g_cf.user_volume = (float)vol;
                         else
@@ -2488,31 +2536,25 @@ int app_run(int argc, char **argv)
                 ImGui::Begin("Keyboard shortcuts", &g_state.show_shortcuts,
                              ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize |
                                  ImGuiWindowFlags_NoSavedSettings);
-                ImGui::TextColored(ui_c().text_muted, "Playback");
-                ImGui::Text("Space            Play / pause");
-                ImGui::Text("Left / Right     Seek -5s / +5s");
-                ImGui::Text("Shift + arrows   Seek -20s / +20s");
-                ImGui::Text("Ctrl + Left/Right Previous / next track");
-                ImGui::Text("Up / Down        Volume");
+                const char *group = nullptr;
+                for (const ShortcutDef &d : shortcut_defs())
+                {
+                    if (!group || strcmp(group, d.group) != 0)
+                    {
+                        group = d.group;
+                        ImGui::Spacing();
+                        ImGui::TextColored(ui_c().text_muted, "%s", d.group);
+                    }
+                    ImGui::Text("%-16s %s", shortcut_label(d.id).c_str(), d.label);
+                }
                 ImGui::Spacing();
-                ImGui::Text("L                Toggle lyrics panel");
-                ImGui::Text("V                Watch video");
-                ImGui::Text("F                Video theater mode");
-                ImGui::Text("S  Toggle sidebar");
-                ImGui::Text("Q  Up Next queue");
-                ImGui::Text("P  Party mode");
-                ImGui::Text("F2 Backend debug");
-                ImGui::Spacing();
-                ImGui::TextColored(ui_c().text_muted, "Studio");
+                ImGui::TextColored(ui_c().text_muted, "Studio (in the Studio tab)");
                 ImGui::Text("C                Add cue at playhead");
                 ImGui::Text("[ / ]            Set loop in / out");
                 ImGui::Text("F                Follow the playhead");
                 ImGui::Text("Ctrl+Z           Undo songwriting edit");
                 ImGui::Spacing();
-                ImGui::TextColored(ui_c().text_muted, "Navigation");
-                ImGui::Text("/ or Ctrl+F      Focus search");
-                ImGui::Text("Esc              Back / clear search");
-                ImGui::Text("?                Toggle this help");
+                ImGui::TextDisabled("Rebind any of these in Settings -> Shortcuts.");
                 ImGui::End();
             }
 

@@ -2,10 +2,19 @@
 
 All notable changes to crossfade are documented here.
 
-## Unreleased
+## 0.4.2 - 2026-11-19
 
 ### Added
 
+- **Rebindable keyboard shortcuts.** Settings -> Shortcuts is now a full editor:
+  click a binding, press the new keys (Esc cancels), reset per row or all,
+  with duplicate bindings flagged. Overrides are stored in
+  `<config>/shortcuts.json`. The shortcut help popup and the README table now
+  follow the same registry.
+- **Scroll to top** — press **T** (rebindable) to jump the current list back to
+  the start, the same action as the floating back-to-top button.
+- **Toggle low power mode** — press **Shift+P** with a toast confirming the new
+  state (and a note when the battery setting keeps it on).
 - **Settings -> Tunables.** A searchable panel with every value that used to be
   hardcoded: playback retries and fades, search/typeahead debounce and limits,
   prefetch counts, video sync thresholds, frame budgets, scroll physics, toast

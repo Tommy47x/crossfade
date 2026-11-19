@@ -266,6 +266,9 @@ void reset_wheel_scroll();
 // so an external content change (new search results) neither glides from a
 // stale offset nor gets pulled back by inertia.
 void ui_scroll_to_top();
+// Ask the next scroll child that supports back-to-top to jump to the start.
+// The keyboard shortcut sets this; ui_scroll_top_begin() consumes it.
+void ui_request_scroll_top();
 
 // Direct-manipulation touch zones (bottom-bar sliders). A finger that lands
 // inside one is translated into a mouse drag by the input layer instead of a

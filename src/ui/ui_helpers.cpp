@@ -433,6 +433,12 @@ static float g_frame_scroll_pixels = 0.0f;
 static bool g_frame_scroll_consumed = false;
 // Set for the frame while a back-to-top jump is driving the scroll.
 static bool g_scroll_top_animating = false;
+static bool g_scroll_top_requested = false;
+
+void ui_request_scroll_top()
+{
+    g_scroll_top_requested = true;
+}
 static float g_scroll_clamp_unapplied = 0.0f;
 
 // Absolute sub-pixel scroll accumulator. ImGui rounds every scroll position
@@ -976,6 +982,11 @@ void ensure_lattice(FadeLattice &c, const ImVec2 &pos, const ImVec2 &size,
 
 void ui_scroll_top_begin()
 {
+    if (g_scroll_top_requested)
+    {
+        g_scroll_top_requested = false;
+        ui_scroll_to_top();
+    }
     if (g_fade_cache.size() > 64)
         g_fade_cache.clear();
     WindowFadeCache &cache = g_fade_cache[ImGui::GetCurrentWindow()->ID];

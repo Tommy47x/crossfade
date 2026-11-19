@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(crossfade VERSION 0.4.1 LANGUAGES C CXX)
+project(crossfade VERSION 0.4.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,6 +63,7 @@ set(SOURCES
     src/core/power.cpp
     src/core/tasks.cpp
     src/core/tunables.cpp
+    src/core/shortcuts.cpp
     src/data/accent.cpp
     src/data/paths.cpp
     src/net/ytdlp.cpp

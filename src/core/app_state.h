@@ -181,6 +181,9 @@ struct AppState
     std::atomic<bool> artist_search_loading{false};
     bool artist_search_active = false;
 
+    // Settings -> Shortcuts: action id waiting for a key press, empty when idle.
+    std::string rebind_shortcut_id;
+
     // Search
     char search_buffer[512] = "";
     bool search_dirty = false;

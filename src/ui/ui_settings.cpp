@@ -16,6 +16,7 @@
 #include "library.h"
 #include "diagnostics.h"
 #include "tunables.h"
+#include "shortcuts.h"
 #include "data_transfer.h"
 #include "power.h"
 #include "misc/cpp/imgui_stdlib.h"
@@ -23,6 +24,7 @@
 #include <filesystem>
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <cfloat>
 #include <cstdio>
 #include <ctime>
@@ -2380,14 +2382,70 @@ void draw_settings_panel(AppState &state)
     }
     if (s_settings_category == SC_SHORTCUTS)
     {
-        SettingsCard card("Shortcuts", "Every action, one keystroke.", UiIcon::More);
-    ImGui::TextDisabled("Space  Play / pause          Left / Right  Seek 5s");
-    ImGui::TextDisabled("Shift + arrows  Seek 20s    Ctrl + Left / Right  Previous / next");
-    ImGui::TextDisabled("Up / Down  Volume            / or Ctrl+F  Focus search");
-    ImGui::TextDisabled("L  Toggle lyrics            S  Toggle sidebar");
-    ImGui::TextDisabled("Ctrl + ,  Open settings");
-    ImGui::TextDisabled("Esc  Back / clear search      ?  Shortcut help");
+        SettingsCard card("Shortcuts", "Click a binding, then press the new keys. Esc cancels.",
+                          UiIcon::More);
 
+        const int custom = shortcuts_custom_count();
+        if (custom > 0)
+        {
+            ImGui::TextColored(ui_c().text_muted, "%d custom binding%s", custom,
+                               custom == 1 ? "" : "s");
+            ImGui::SameLine(0.0f, m.space_4);
+            if (ui_ghost_button("Reset all", ImVec2(130.0f * m.layout_scale, m.control_h)))
+            {
+                shortcuts_reset_all();
+                shortcuts_save_if_dirty();
+            }
+        }
+        if (!state.rebind_shortcut_id.empty())
+            ImGui::TextColored(ui_c().accent_text,
+                               "Press the new key combination, or Esc to cancel.");
+        ImGui::Dummy(ImVec2(0.0f, m.space_2));
+
+        // Highlight bindings that collide with another action: the first match
+        // in the dispatch chain wins, so a duplicate is almost always a bug.
+        std::map<long long, int> usage;
+        for (const ShortcutDef &d : shortcut_defs())
+            ++usage[(long long)shortcut_key(d.id) * 8 + (long long)shortcut_mods(d.id)];
+
+        const char *group = nullptr;
+        for (const ShortcutDef &d : shortcut_defs())
+        {
+            if (!group || std::strcmp(group, d.group) != 0)
+            {
+                group = d.group;
+                settings_group_label(group);
+            }
+            ImGui::PushID(d.id);
+            ImGui::TextUnformatted(d.label);
+
+            const long long slot =
+                (long long)shortcut_key(d.id) * 8 + (long long)shortcut_mods(d.id);
+            const bool duplicate = usage[slot] > 1;
+            const bool capturing = state.rebind_shortcut_id == d.id;
+            const std::string shown =
+                capturing ? "Press keys..." : shortcut_label(d.id);
+            if (ui_ghost_button(shown.c_str(), ImVec2(170.0f * m.layout_scale, m.control_h)))
+                state.rebind_shortcut_id = d.id;
+            if (duplicate)
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(ui_c().accent_text, "duplicate");
+            }
+            ImGui::SameLine(0.0f, m.space_4);
+            ImGui::TextDisabled("default %s",
+                                shortcut_binding_label(d.key, d.mods).c_str());
+            if (shortcut_is_custom(d.id))
+            {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset"))
+                {
+                    shortcuts_reset(d.id);
+                    shortcuts_save_if_dirty();
+                }
+            }
+            ImGui::PopID();
+        }
     }
     if (s_settings_category == SC_LIBRARY)
     {
