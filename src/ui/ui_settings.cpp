@@ -1465,8 +1465,19 @@ static void draw_tunables_panel()
         ImGui::PopID();
     }
 
+    // Write once the drag/slider interaction settles instead of on every frame
+    // the value moves (values still apply live through tunable()).
+    static bool s_pending_save = false;
     if (changed)
+    {
+        s_pending_save = true;
+        ui_anim_request();
+    }
+    if (s_pending_save && !ImGui::IsAnyItemActive())
+    {
         tunables_save_if_dirty();
+        s_pending_save = false;
+    }
 }
 
 void draw_settings_panel(AppState &state)
