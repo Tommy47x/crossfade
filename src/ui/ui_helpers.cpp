@@ -475,6 +475,43 @@ void smooth_scroll_begin_frame()
     g_scroll_top_animating = false;
 }
 
+// Touch landings inside one of these rects are handled as a drag rather than
+// a scroll. The bottom bar republishes the seek strip, the seek slider and the
+// volume slider every frame.
+struct TouchDragZone
+{
+    float x0, y0, x1, y1;
+};
+static constexpr int kMaxTouchDragZones = 4;
+static TouchDragZone g_touch_drag_zones[kMaxTouchDragZones];
+static int g_touch_drag_zone_count = 0;
+
+void ui_set_touch_drag_zone(bool enabled, float x0, float y0, float x1, float y1)
+{
+    // A "set" always replaces the whole list; pass enabled=false to clear.
+    g_touch_drag_zone_count = 0;
+    if (enabled)
+        ui_add_touch_drag_zone(x0, y0, x1, y1);
+}
+
+void ui_add_touch_drag_zone(float x0, float y0, float x1, float y1)
+{
+    if (g_touch_drag_zone_count >= kMaxTouchDragZones)
+        return;
+    g_touch_drag_zones[g_touch_drag_zone_count++] = TouchDragZone{x0, y0, x1, y1};
+}
+
+bool ui_touch_drag_zone_contains(float x, float y)
+{
+    for (int i = 0; i < g_touch_drag_zone_count; ++i)
+    {
+        const TouchDragZone &z = g_touch_drag_zones[i];
+        if (x >= z.x0 && x <= z.x1 && y >= z.y0 && y <= z.y1)
+            return true;
+    }
+    return false;
+}
+
 void smooth_scroll_child()
 {
     if (g_frame_scroll_consumed || g_frame_scroll_pixels == 0.0f)

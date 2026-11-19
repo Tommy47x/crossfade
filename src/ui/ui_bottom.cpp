@@ -139,6 +139,10 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
 
+    // Republished below if the volume control is visible; a finger landing in
+    // it is treated as a drag instead of a scroll.
+    ui_set_touch_drag_zone(false, 0.0f, 0.0f, 0.0f, 0.0f);
+
     // The separator between the main UI and the bar doubles as the seek
     // indicator: it fills with accent as the track progresses, and the strip
     // can be clicked / dragged to seek. The knob rides a spring (slightly
@@ -181,6 +185,14 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
                 s_edge_seeking = true;
         }
         const float mouse_frac = std::clamp((io.MousePos.x - wp.x) / ws.x, 0.0f, 1.0f);
+        // Touchscreens: the seek strip also opts into direct manipulation, so
+        // a finger drags the progress line instead of scrolling the page. The
+        // seek itself still happens once, on release (see below); the spring
+        // follows the finger in the meantime.
+        if (have_dur && seekable)
+            ui_add_touch_drag_zone(wp.x, wp.y, wp.x + ws.x,
+                                   wp.y + std::max(edge_hover_h * 2.0f,
+                                                   20.0f * m.layout_scale));
         if (s_edge_seeking && !ImGui::IsMouseDown(0))
         {
             // Seek once on release (same semantics as the in-bar seek bar,
@@ -702,6 +714,14 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
                 ImVec2(center_x, wp.y + seek_y + (seek_h - 15.0f * m.text_scale * 1.2f) * 0.5f),
                 ui_text_muted_u32(), fmt_time((int)current).c_str());
     ImGui::SetCursorScreenPos(ImVec2(center_x + time_w + m.space_2, wp.y + seek_y));
+    // Touchscreens: the in-bar seek slider is direct manipulation too. The
+    // value follows the finger; draw_progress_bar commits the seek only when
+    // the item is no longer active, i.e. on release.
+    if (have_duration && !fading)
+        ui_add_touch_drag_zone(center_x + time_w + m.space_2 - m.space_2,
+                               wp.y + seek_y - m.space_2,
+                               center_x + time_w + m.space_2 + seek_bar_w + m.space_2,
+                               wp.y + seek_y + seek_h + m.space_2);
     ImGui::BeginDisabled(fading);
     const bool seek_changed =
         draw_progress_bar("##seek", &seek_value01, seek_bar_w, seek_h,
@@ -914,6 +934,14 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
 
         ui_draw_icon(dl, UiIcon::Volume, ImVec2(vol_x + vol_icon * 0.5f, wp.y + bar_h * 0.5f),
                      vol_icon, ui_text_muted_u32(), 1.5f);
+
+        // Touchscreens: let a finger that lands here drive the slider instead
+        // of scrolling the page. The band is taller than the 24 px track so a
+        // finger can grab it reliably. Appends to the seek zones above.
+        const float touch_pad = m.space_3;
+        ui_add_touch_drag_zone(vol_x - m.space_1, vol_y - touch_pad,
+                               bar_x + vol_bar_w + m.space_1,
+                               vol_y + seek_h + touch_pad);
 
         // Wheel / two-finger scroll over the slider nudges the volume. The
         // readme promises this; without it the wheel only scrolled the page
