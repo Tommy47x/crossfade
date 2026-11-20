@@ -1,8 +1,10 @@
 #include "ui.h"
+#include "ui_audio_reactive.h"
 #include "ui_backdrop.h"
 #include "ui_icons.h"
 #include "ui_theme.h"
 #include "mpvplayer.h"
+#include "texture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -282,6 +284,37 @@ void soft_glow(ImDrawList *dl, ImVec2 centre, float radius, ImVec4 col, float pe
         }
     }
 }
+ImVec4 mix4(const ImVec4 &a, const ImVec4 &b, float t)
+{
+    return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                  a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+
+// Four anchor points the ambient blooms wander between. Normalised so the
+// layout survives window resizes.
+const ImVec2 kBgCorners[4] = {
+    ImVec2(0.17f, 0.24f), ImVec2(0.83f, 0.21f),
+    ImVec2(0.80f, 0.79f), ImVec2(0.20f, 0.77f)};
+
+unsigned bg_rand()
+{
+    static unsigned s = 0x2545F491u;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}
+
+struct ImmersiveBg
+{
+    bool init = false;
+    ImVec2 pos[3];
+    ImVec2 target[3];
+    int corner[3] = {0, 2, 1};
+    double next_move[3] = {0.0, 0.0, 0.0};
+};
+ImmersiveBg g_bg;
+
 ImmersiveAnim g_imm;
 bool g_hint_done = false;
 double g_hint_start = 0.0;
@@ -467,6 +500,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
     {
         ImGui::OpenPopup("##lyrics_immersive");
         s_open = true;
+        ui_audio_start();
 
         const double now = ImGui::GetTime();
         g_imm = ImmersiveAnim{};
@@ -586,16 +620,108 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (chrome_a < 0.03f)
             ImGui::SetMouseCursor(ImGuiMouseCursor_None);
 
-        // ---- Background: hide the app UI, keep its ambient colour ----
-        // Opaque theme fill so the takeover is genuinely full-screen, then an
-        // album-tinted bloom pair in the corners so it still reads as the same
-        // ambient backdrop rather than a flat black sheet.
-        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
+        // ---- Background: cover art + audio-reactive ambient blooms ----
         const ImVec4 tint = ui_backdrop_tint();
-        soft_glow(dl, ImVec2(w * 0.20f, h * 0.28f), std::min(w, h) * 0.72f,
-                  tint, 0.16f);
-        soft_glow(dl, ImVec2(w * 0.82f, h * 0.74f), std::min(w, h) * 0.60f,
-                  tint, 0.13f);
+        const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ui_accent_u32(1.0f));
+        const float day = clampf(ui_theme_progress(), 0.0f, 1.0f);
+        const AudioReactive &au = ui_audio_levels();
+        const float energy = clampf(au.rms, 0.0f, 1.0f);
+        const bool reactive = au.active && energy > 0.008f && motion;
+
+        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
+
+        // Cover art, heavily blurred and held well back so the lyrics stay the
+        // focal point. The blur texture is shared with the hero card.
+        if (!display.thumbnail_url.empty())
+        {
+            ui_hero_blur_request(display.thumbnail_url);
+            const GLuint blur = ui_hero_blur_texture(display.thumbnail_url);
+            int bw = 0, bh = 0;
+            if (blur != 0 && ui_hero_blur_size(display.thumbnail_url, bw, bh))
+            {
+                float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+                const TextureInfo info{blur, bw, bh};
+                if (cover_uv(info, w, h, u0, v0, u1, v1))
+                {
+                    const float zoom = 1.04f + (reactive ? 0.020f * au.beat +
+                                                              0.008f * au.bass
+                                                         : 0.0f);
+                    const float cx = (u0 + u1) * 0.5f;
+                    const float cy = (v0 + v1) * 0.5f;
+                    const float hw = (u1 - u0) * 0.5f / zoom;
+                    const float hh = (v1 - v0) * 0.5f / zoom;
+                    const float drift = reactive ? 0.004f * std::sin((float)now * 0.17f)
+                                                 : 0.0f;
+                    const float a = (0.34f - 0.14f * day) * (0.85f + 0.35f * energy);
+                    dl->AddImage((ImTextureID)(intptr_t)blur, wp,
+                                 ImVec2(wp.x + w, wp.y + h),
+                                 ImVec2(cx - hw + drift, cy - hh),
+                                 ImVec2(cx + hw + drift, cy + hh),
+                                 IM_COL32(255, 255, 255,
+                                          (int)(clampf(a, 0.0f, 1.0f) * 255.0f)));
+                }
+            }
+        }
+
+        // Scrim plus a theme/cover colour blend: keeps the takeover readable in
+        // both day and night themes while making the artwork feel like part of
+        // the existing palette rather than a separate layer.
+        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
+                          ui_with_alpha(ui_col(ui_c().bg), 0.52f + 0.14f * day));
+        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
+                          ui_with_alpha(ui_col(mix4(tint, accent, 0.25f)),
+                                        0.10f * (1.0f - 0.45f * day)));
+
+        // Bloom anchors wander between the four corners, easing between them
+        // and re-targeting more often as the music gets louder. When nothing
+        // is playing they simply hold their last position.
+        if (!g_bg.init)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                g_bg.pos[i] = kBgCorners[g_bg.corner[i]];
+                g_bg.target[i] = g_bg.pos[i];
+                g_bg.next_move[i] = now + 2.0 + 1.5 * i;
+            }
+            g_bg.init = true;
+        }
+
+        const ImVec4 bloom_col[3] = {mix4(tint, accent, 0.22f),
+                                     mix4(tint, accent, 0.48f),
+                                     mix4(accent, tint, 0.35f)};
+        const float move_speed = 1.1f + 2.2f * energy + 3.2f * au.beat;
+
+        for (int i = 0; i < 3; ++i)
+        {
+            ImVec2 &p = g_bg.pos[i];
+            ImVec2 &t = g_bg.target[i];
+            if (reactive)
+            {
+                const float e = 1.0f - std::exp(-move_speed * dt);
+                p.x += (t.x - p.x) * e;
+                p.y += (t.y - p.y) * e;
+                animating = true;
+                const float dx = t.x - p.x;
+                const float dy = t.y - p.y;
+                if (now >= g_bg.next_move[i] && dx * dx + dy * dy < 0.0025f)
+                {
+                    int nc = (int)(bg_rand() % 4u);
+                    if (nc == g_bg.corner[i])
+                        nc = (nc + 1) % 4;
+                    g_bg.corner[i] = nc;
+                    g_bg.target[i] = kBgCorners[nc];
+                    g_bg.next_move[i] = now + 1.4 + (double)(bg_rand() % 1400u) / 1000.0;
+                }
+            }
+
+            const ImVec2 gc(wp.x + p.x * w, wp.y + p.y * h);
+            const float base_r = std::min(w, h) * (i == 0 ? 0.70f : (i == 1 ? 0.55f : 0.46f));
+            const float r = base_r * (1.0f + 0.14f * au.bass + 0.22f * au.beat);
+            const float base_peak = i == 0 ? 0.15f : (i == 1 ? 0.11f : 0.085f);
+            const float peak = base_peak * (0.75f + 0.75f * energy + 0.50f * au.beat) *
+                               (0.70f + 0.30f * (1.0f - day));
+            soft_glow(dl, gc, r, bloom_col[i], peak * view_a);
+        }
 
         if (g_imm.pulse > 0.002f && motion)
         {
@@ -608,15 +734,19 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.pulse = 0.0f;
 
         const float glow_r = std::min(w, h) * 0.46f;
-        const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ui_accent_u32(1.0f));
         soft_glow(dl, focal, glow_r,
-                  accent, (0.030f + g_imm.pulse * 0.045f) * view_a);
+                  accent, (0.030f + g_imm.pulse * 0.045f + 0.020f * au.bass +
+                           0.025f * au.beat) * view_a);
         soft_glow(dl, focal, glow_r * 0.72f,
-                  accent, (0.022f + g_imm.pulse * 0.030f) * view_a);
-        if (g_imm.pulse > 0.0f)
+                  accent, (0.022f + g_imm.pulse * 0.030f + 0.014f * au.mid +
+                           0.018f * au.beat) * view_a);
+        if (g_imm.pulse > 0.0f || reactive)
         {
-            dl->AddCircle(focal, glow_r * (0.70f + 0.03f * g_imm.pulse),
-                          ui_accent_u32(0.06f * g_imm.pulse * view_a), 96, ui_px(1.5f));
+            const float ring = 0.70f + 0.03f * g_imm.pulse + 0.02f * au.beat;
+            dl->AddCircle(focal, glow_r * ring,
+                          ui_accent_u32((0.06f * g_imm.pulse + 0.035f * au.beat +
+                                         0.020f * au.bass) * view_a),
+                          96, ui_px(1.5f));
         }
 
         // ---- Lyrics ----
@@ -1082,6 +1212,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             ImGui::CloseCurrentPopup();
             s_open = false;
             state.lyrics_immersive = false;
+            ui_audio_stop();
         }
 
         if (animating)
@@ -1100,6 +1231,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
     {
         s_open = false;
         state.lyrics_immersive = false;
+        ui_audio_stop();
     }
 
     ImGui::PopStyleColor(4);
