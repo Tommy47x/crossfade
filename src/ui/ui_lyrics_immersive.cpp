@@ -630,14 +630,15 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
         dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
 
-        // Cover art, heavily blurred and held well back so the lyrics stay the
-        // focal point. The blur texture is shared with the hero card.
+        // Cover art, blurred and held well back so the lyrics stay the focal
+        // point. This uses the full-screen (512px) blur rather than the hero
+        // card's 128px one, which looks blocky when stretched over a window.
         if (!display.thumbnail_url.empty())
         {
-            ui_hero_blur_request(display.thumbnail_url);
-            const GLuint blur = ui_hero_blur_texture(display.thumbnail_url);
+            ui_immersive_blur_request(display.thumbnail_url);
+            const GLuint blur = ui_immersive_blur_texture(display.thumbnail_url);
             int bw = 0, bh = 0;
-            if (blur != 0 && ui_hero_blur_size(display.thumbnail_url, bw, bh))
+            if (blur != 0 && ui_immersive_blur_size(display.thumbnail_url, bw, bh))
             {
                 float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
                 const TextureInfo info{blur, bw, bh};
@@ -671,6 +672,31 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
                           ui_with_alpha(ui_col(mix4(tint, accent, 0.25f)),
                                         0.10f * (1.0f - 0.45f * day)));
+
+        // Centred ambient colour sampled from the artwork itself. The palette
+        // is computed once when the cover is decoded; invalid bands fall back
+        // to the dominant tint, and a touch of the theme accent keeps the
+        // gradient in the same family as the rest of the UI.
+        TextureColor palette[3];
+        if (texture_cover_palette(display.thumbnail_url, palette))
+        {
+            const ImVec2 spots[3] = {
+                ImVec2(wp.x + w * 0.28f, wp.y + focal.y * 0.94f),
+                ImVec2(wp.x + w * 0.50f, wp.y + focal.y),
+                ImVec2(wp.x + w * 0.72f, wp.y + focal.y * 0.94f)};
+            const float radii[3] = {0.62f, 0.82f, 0.62f};
+            const float peaks[3] = {0.075f, 0.105f, 0.075f};
+            for (int i = 0; i < 3; ++i)
+            {
+                ImVec4 col = tint;
+                if (palette[i].valid)
+                    col = ImVec4(palette[i].r, palette[i].g, palette[i].b, 1.0f);
+                col = mix4(col, accent, 0.18f);
+                const float peak = peaks[i] * (1.0f - 0.35f * day) *
+                                   (0.85f + 0.30f * energy) * view_a;
+                soft_glow(dl, spots[i], std::min(w, h) * radii[i], col, peak);
+            }
+        }
 
         // Bloom anchors wander between the four corners, easing between them
         // and re-targeting more often as the music gets louder. When nothing
