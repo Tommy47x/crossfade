@@ -222,17 +222,64 @@ struct ImmersiveAnim
     bool chrome_init = false;
 };
 
-// Soft radial bloom built from concentric circles. Used to carry the app's
-// album-colour backdrop into the takeover without exposing the UI underneath.
+// Soft radial bloom used to carry the app's album-colour backdrop into the
+// takeover. Drawn as a vertex-coloured triangle fan so the falloff is
+// interpolated per-pixel by the GPU rather than stacked as visible
+// concentric rings: a shader-style gradient with a smooth (1 - t)^2 profile.
 void soft_glow(ImDrawList *dl, ImVec2 centre, float radius, ImVec4 col, float peak)
 {
-    const int steps = 14;
-    const ImU32 c = ui_col(col);
-    for (int i = steps; i >= 1; --i)
+    if (radius <= 0.5f || peak <= 0.0005f)
+        return;
+    const int rings = 8;
+    const int segs = 96;
+    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+
+    const int vtx_count = 1 + (rings + 1) * segs;
+    const int idx_count = segs * 3 + rings * segs * 6;
+    const unsigned int base = dl->VtxBuffer.Size;
+    dl->PrimReserve(idx_count, vtx_count);
+
+    dl->PrimWriteVtx(centre, uv,
+                     ImGui::GetColorU32(ImVec4(col.x, col.y, col.z, peak)));
+    for (int r = 0; r <= rings; ++r)
     {
-        const float t = (float)i / (float)steps;
-        dl->AddCircleFilled(centre, radius * t,
-                            ui_with_alpha(c, peak * 1.6f / (float)steps), 48);
+        const float t = (float)r / (float)rings;
+        const float rr = radius * t;
+        // Quadratic falloff keeps the core bright and the rim invisible.
+        const float a = peak * (1.0f - t) * (1.0f - t);
+        const ImU32 c = ImGui::GetColorU32(ImVec4(col.x, col.y, col.z, a));
+        for (int s = 0; s < segs; ++s)
+        {
+            const float ang = (float)s / (float)segs * 6.28318530718f;
+            dl->PrimWriteVtx(ImVec2(centre.x + std::cos(ang) * rr,
+                                    centre.y + std::sin(ang) * rr),
+                             uv, c);
+        }
+    }
+
+    // Centre fan.
+    const unsigned int ring0 = base + 1;
+    for (int s = 0; s < segs; ++s)
+    {
+        dl->PrimWriteIdx((ImDrawIdx)base);
+        dl->PrimWriteIdx((ImDrawIdx)(ring0 + s));
+        dl->PrimWriteIdx((ImDrawIdx)(ring0 + (s + 1) % segs));
+    }
+    // Ring-to-ring quads.
+    for (int r = 0; r < rings; ++r)
+    {
+        const unsigned int a0 = base + 1 + r * segs;
+        const unsigned int a1 = a0 + segs;
+        for (int s = 0; s < segs; ++s)
+        {
+            const int n = (s + 1) % segs;
+            dl->PrimWriteIdx((ImDrawIdx)(a0 + s));
+            dl->PrimWriteIdx((ImDrawIdx)(a1 + s));
+            dl->PrimWriteIdx((ImDrawIdx)(a1 + n));
+            dl->PrimWriteIdx((ImDrawIdx)(a0 + s));
+            dl->PrimWriteIdx((ImDrawIdx)(a1 + n));
+            dl->PrimWriteIdx((ImDrawIdx)(a0 + n));
+        }
     }
 }
 ImmersiveAnim g_imm;
@@ -250,8 +297,37 @@ std::string fmt_time(int secs)
     return std::string(buf);
 }
 
+int count_cp(const std::string &s)
+{
+    int n = 0;
+    for (unsigned char c : s)
+        if ((c & 0xC0) != 0x80)
+            ++n;
+    return n;
+}
+
+int count_cp_layout(const TextLayout &lay)
+{
+    int n = 0;
+    for (const TextRow &r : lay.rows)
+        n += count_cp(r.text);
+    return n;
+}
+
+ImU32 lerp_col(ImU32 a, ImU32 b, float t)
+{
+    t = clampf(t, 0.0f, 1.0f);
+    const ImVec4 ca = ImGui::ColorConvertU32ToFloat4(a);
+    const ImVec4 cb = ImGui::ColorConvertU32ToFloat4(b);
+    return ImGui::GetColorU32(ImVec4(ca.x + (cb.x - ca.x) * t,
+                                     ca.y + (cb.y - ca.y) * t,
+                                     ca.z + (cb.z - ca.z) * t,
+                                     ca.w + (cb.w - ca.w) * t));
+}
+
 void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 center,
-               ImU32 col, float alpha, float scale, float glow)
+               ImU32 col, float alpha, float scale, float glow,
+               float karaoke = -1.0f)
 {
     if (alpha <= 0.001f)
         return;
@@ -260,22 +336,73 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
     const float total_h = (float)lay.rows.size() * line_h;
     float y = center.y - total_h * 0.5f;
     const ImU32 glow_col = ui_accent_text_u32();
+    // Un-sung text stays readable but recedes; the accent "fills" it in as the
+    // line plays, like a karaoke wipe.
+    const ImU32 unsung = ui_with_alpha(ui_text_dim_u32(), alpha * 0.80f);
+    const int total = karaoke >= 0.0f ? std::max(1, count_cp_layout(lay)) : 0;
+    const float reveal = clampf(karaoke, 0.0f, 1.0f) * (float)total;
+    int seen = 0;
 
     for (const TextRow &row : lay.rows)
     {
         const float w = measure(font, size, row.text);
         const float x = center.x - w * 0.5f;
-        if (glow > 0.01f && !row.text.empty())
+        if (karaoke >= 0.0f && !row.text.empty())
         {
-            const float o = (1.4f + 1.8f * glow) * scale;
-            const float a = alpha * 0.075f * glow;
-            dl->AddText(font, size, ImVec2(x - o, y), ui_with_alpha(glow_col, a), row.text.c_str());
-            dl->AddText(font, size, ImVec2(x + o, y), ui_with_alpha(glow_col, a), row.text.c_str());
-            dl->AddText(font, size, ImVec2(x, y - o), ui_with_alpha(glow_col, a), row.text.c_str());
-            dl->AddText(font, size, ImVec2(x, y + o), ui_with_alpha(glow_col, a), row.text.c_str());
+            const char *p = row.text.c_str();
+            const char *end = p + row.text.size();
+            float tx = x;
+            while (p < end)
+            {
+                const bool space = (*p == ' ' || *p == '\t');
+                const char *tok = p;
+                int chars = 0;
+                while (p < end)
+                {
+                    const bool sp = (*p == ' ' || *p == '\t');
+                    if (sp != space)
+                        break;
+                    ++p;
+                    while (p < end && (((unsigned char)*p) & 0xC0) == 0x80)
+                        ++p;
+                    ++chars;
+                }
+                const float frac =
+                    clampf((reveal - (float)seen) / std::max(1, chars), 0.0f, 1.0f);
+                const ImU32 c = lerp_col(unsung, ui_with_alpha(col, alpha), frac);
+                const std::string piece(tok, p - tok);
+                if (!space && glow > 0.01f && frac > 0.0f)
+                {
+                    const float o = (1.4f + 1.8f * glow) * scale;
+                    const float a = alpha * 0.075f * glow * frac;
+                    dl->AddText(font, size, ImVec2(tx - o, y),
+                                ui_with_alpha(glow_col, a), piece.c_str());
+                    dl->AddText(font, size, ImVec2(tx + o, y),
+                                ui_with_alpha(glow_col, a), piece.c_str());
+                    dl->AddText(font, size, ImVec2(tx, y - o),
+                                ui_with_alpha(glow_col, a), piece.c_str());
+                    dl->AddText(font, size, ImVec2(tx, y + o),
+                                ui_with_alpha(glow_col, a), piece.c_str());
+                }
+                dl->AddText(font, size, ImVec2(tx, y), c, piece.c_str());
+                tx += measure(font, size, piece);
+                seen += chars;
+            }
         }
-        if (!row.text.empty())
-            dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(col, alpha), row.text.c_str());
+        else
+        {
+            if (glow > 0.01f && !row.text.empty())
+            {
+                const float o = (1.4f + 1.8f * glow) * scale;
+                const float a = alpha * 0.075f * glow;
+                dl->AddText(font, size, ImVec2(x - o, y), ui_with_alpha(glow_col, a), row.text.c_str());
+                dl->AddText(font, size, ImVec2(x + o, y), ui_with_alpha(glow_col, a), row.text.c_str());
+                dl->AddText(font, size, ImVec2(x, y - o), ui_with_alpha(glow_col, a), row.text.c_str());
+                dl->AddText(font, size, ImVec2(x, y + o), ui_with_alpha(glow_col, a), row.text.c_str());
+            }
+            if (!row.text.empty())
+                dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(col, alpha), row.text.c_str());
+        }
         y += line_h;
     }
 }
@@ -481,10 +608,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.pulse = 0.0f;
 
         const float glow_r = std::min(w, h) * 0.46f;
-        dl->AddCircleFilled(focal, glow_r,
-                            ui_accent_u32((0.030f + g_imm.pulse * 0.045f) * view_a), 96);
-        dl->AddCircleFilled(focal, glow_r * 0.72f,
-                            ui_accent_u32((0.022f + g_imm.pulse * 0.030f) * view_a), 96);
+        const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ui_accent_u32(1.0f));
+        soft_glow(dl, focal, glow_r,
+                  accent, (0.030f + g_imm.pulse * 0.045f) * view_a);
+        soft_glow(dl, focal, glow_r * 0.72f,
+                  accent, (0.022f + g_imm.pulse * 0.030f) * view_a);
         if (g_imm.pulse > 0.0f)
         {
             dl->AddCircle(focal, glow_r * (0.70f + 0.03f * g_imm.pulse),
@@ -664,6 +792,25 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             if (!active_text.empty())
             {
                 const bool preview = active < 0;
+
+                // Karaoke wipe: use the gap to the next timed line as this
+                // line's duration, so the accent colour sweeps the words in
+                // step with playback.
+                float karaoke = -1.0f;
+                if (!preview && active_idx < (int)lx->times.size())
+                {
+                    const double t = lyrics_playback_time(state, player) -
+                                     state.settings.lyrics_offset;
+                    const double t0 = lx->times[active_idx];
+                    double t1 = active_idx + 1 < (int)lx->times.size()
+                                    ? lx->times[active_idx + 1]
+                                    : t0 + 4.0;
+                    if (t1 <= t0)
+                        t1 = t0 + 0.5;
+                    karaoke = clampf((float)((t - t0) / (t1 - t0)), 0.0f, 1.0f);
+                    if (karaoke < 1.0f && state.playing)
+                        animating = true;
+                }
                 const float pref = preview ? active_pref * 0.62f : active_pref;
                 TextLayout act = layout_text(font, active_text, max_text_w, pref,
                                              std::max(20.0f, pref * 0.5f));
@@ -682,7 +829,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 draw_rows(dl, font, act,
                           ImVec2(focal.x + slide_x, focal.y + slide),
                           preview ? ui_text_dim_u32() : ui_accent_text_u32(),
-                          alpha, scale, preview ? 0.0f : (0.35f + 0.65f * g_imm.pulse));
+                          alpha, scale, preview ? 0.0f : (0.35f + 0.65f * g_imm.pulse),
+                          karaoke);
 
                 // Previous line lifts away above the active one.
                 if (motion && !g_imm.prev_text.empty())
