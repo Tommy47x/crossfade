@@ -1,5 +1,7 @@
 #include "ui_audio_reactive.h"
 
+#if defined(__unix__) || defined(__APPLE__)
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -15,7 +17,7 @@
 #include <unistd.h>
 
 // ----------------------------------------------------------------------
-// Monitor capture
+// Monitor capture (POSIX)
 //
 // `parec` gives us the default sink's monitor as raw s16 mono at 8 kHz: enough
 // bandwidth for loudness and broad bands, cheap enough for a UI thread to
@@ -272,3 +274,20 @@ const AudioReactive &ui_audio_levels()
     out.active = g_shared.active.load(std::memory_order_relaxed);
     return out;
 }
+
+#else // !POSIX
+
+// Windows has no PulseAudio monitor and no `parec`. Keep the same API so the
+// immersive lyrics view needs no platform branches; levels just stay idle,
+// which is how the visuals already behave before capture starts. A WASAPI
+// loopback backend can replace this stub without touching any callers.
+void ui_audio_start() {}
+void ui_audio_stop() {}
+
+const AudioReactive &ui_audio_levels()
+{
+    static const AudioReactive idle;
+    return idle;
+}
+
+#endif // POSIX
