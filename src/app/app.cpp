@@ -98,6 +98,22 @@ static void handle_accent_signal(int)
 // loop values: 0 none, 1 show, 2 hide, 3 toggle, 4 quit.
 static std::atomic<int> g_warm_command{0};
 static std::atomic<bool> g_sdl_ready{false};
+// A maximised window puts its bottom bar inside the shell's dock autohide
+// input region. Track that condition so the layout can reserve a small
+// inactive band and keep the transport buttons clickable.
+static void update_screen_bottom_state(AppState &state, SDL_Window *window)
+{
+    int x = 0, y = 0, w = 0, h = 0;
+    SDL_GetWindowPosition(window, &x, &y);
+    SDL_GetWindowSize(window, &w, &h);
+    const int display = SDL_GetWindowDisplayIndex(window);
+    SDL_Rect bounds{};
+    if (display >= 0 && SDL_GetDisplayBounds(display, &bounds) == 0)
+        state.window_at_screen_bottom = (y + h >= bounds.y + bounds.h - 4);
+    else
+        state.window_at_screen_bottom = false;
+}
+
 static void handle_quit_signal(int)
 {
     g_quit_requested = 1;
@@ -246,6 +262,10 @@ std::string g_recording_id;
 // finished recording's duration before it's accepted into the cache.
 bool g_recording_started = false;
 double g_recording_duration = 0.0;
+// Duration from the track's metadata (independent of whatever stream the
+// backend handed us). A stream whose length differs wildly from this is a
+// different song, even if mpv reports its own duration consistently.
+int g_recording_expected_duration = 0;
 bool notify_init_done = false;
 
 // Session-restore seek that had to wait for the demuxer cache: seeking past
@@ -751,6 +771,7 @@ int app_run(int argc, char **argv)
         return fatal_exit(1);
     }
     SDL_SetWindowMinimumSize(window, 860, 600);
+    update_screen_bottom_state(g_state, window);
     g_window_hidden = start_hidden;
     diagnostics::mark("window");
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
@@ -930,6 +951,7 @@ int app_run(int argc, char **argv)
         g_state.pending_play_title = r.track_title;
         g_state.pending_play_artist = r.track_artist;
         g_state.pending_play_thumbnail_url = r.track_thumbnail;
+        g_state.pending_play_duration_sec = 0; // session state has no duration
         g_state.pending_video_id = r.track_id;
         g_state.pending_video_url = playable_track_url(r.track_id, r.track_url);
     }
@@ -1218,6 +1240,33 @@ int app_run(int argc, char **argv)
         {
             do
             {
+                // Handle the full-screen lyrics shortcut before ImGui sees it.
+                // Enter would otherwise also activate whatever button currently
+                // has keyboard focus (e.g. Play), which was an unwanted side
+                // effect when leaving the takeover. Text fields and shortcut
+                // rebinding keep priority over the shortcut.
+                if (event.type == SDL_KEYDOWN && !event.key.repeat &&
+                    g_state.rebind_shortcut_id.empty() &&
+                    !ImGui::GetIO().WantTextInput)
+                {
+                    const SDL_Keymod mod = (SDL_Keymod)event.key.keysym.mod;
+                    const uint32_t mods =
+                        (uint32_t)(mod & (KMOD_CTRL | KMOD_SHIFT | KMOD_ALT));
+                    const int key = (int)event.key.keysym.sym;
+                    if (shortcut_matches("immersive_lyrics", key, mods) ||
+                        (key == SDLK_KP_ENTER &&
+                         shortcut_matches("immersive_lyrics", SDLK_RETURN, mods)))
+                    {
+                        static Uint32 s_last_toggle = 0;
+                        const Uint32 now = SDL_GetTicks();
+                        if (now - s_last_toggle > 250)
+                        {
+                            s_last_toggle = now;
+                            ui_toggle_immersive_lyrics(g_state);
+                        }
+                        continue;
+                    }
+                }
                 ImGui_ImplSDL2_ProcessEvent(&event);
                 if (event.type == SDL_QUIT)
                 {
@@ -1261,7 +1310,16 @@ int app_run(int argc, char **argv)
                     case SDL_WINDOWEVENT_HIDDEN:
                         g_window_hidden = true;
                         break;
+                    case SDL_WINDOWEVENT_RESIZED:
+                    case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    case SDL_WINDOWEVENT_MOVED:
+                    case SDL_WINDOWEVENT_MAXIMIZED:
+                        update_screen_bottom_state(g_state, window);
+                        g_state.repaint_requested = true;
+                        break;
                     case SDL_WINDOWEVENT_RESTORED:
+                        update_screen_bottom_state(g_state, window);
+                        [[fallthrough]];
                     case SDL_WINDOWEVENT_SHOWN:
                     case SDL_WINDOWEVENT_EXPOSED:
                         if (g_window_hidden)
@@ -1851,6 +1909,7 @@ int app_run(int argc, char **argv)
                         const std::string pending_title = g_state.pending_play_title;
                         const std::string pending_artist = g_state.pending_play_artist;
                         const std::string pending_thumb = g_state.pending_play_thumbnail_url;
+                        const int pending_duration = g_state.pending_play_duration_sec;
                         // Bump the generation when we actually commit to a new
                         // resolve. ui_play_track() does not bump it (only the
                         // natural-advance path via begin_play_track() does), so
@@ -1859,9 +1918,10 @@ int app_run(int argc, char **argv)
                         // track and play the wrong song over the right one.
                         const std::uint64_t pending_gen = g_play_generation.fetch_add(1) + 1;
                         tasks::spawn("resolve", [pending_id, pending_url, pending_title, pending_artist,
-                                      pending_thumb, fresh, pending_gen]() {
+                                      pending_thumb, pending_duration, fresh, pending_gen]() {
                             resolve_audio(pending_id, pending_url, pending_title,
-                                          pending_artist, pending_thumb, fresh, pending_gen);
+                                          pending_artist, pending_thumb, pending_duration,
+                                          fresh, pending_gen);
                         });
                         g_state.pending_play_url.clear();
                     }
@@ -1917,6 +1977,7 @@ int app_run(int argc, char **argv)
                             g_recording_temp.clear();
                             g_recording_path.clear();
                             g_recording_id.clear();
+                            g_recording_expected_duration = 0;
                             g_player->set_stream_record("");
                         }
                         else
@@ -1924,6 +1985,7 @@ int app_run(int argc, char **argv)
                             g_recording_id = req.id;
                             g_recording_started = false;
                             g_recording_duration = 0.0;
+                            g_recording_expected_duration = req.expected_duration_sec;
                             // Record into the .tmp subdir (not scanned by
                             // Downloads) and move it into place on finish.
                             g_player->set_stream_record(g_recording_temp);

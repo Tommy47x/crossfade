@@ -7,6 +7,7 @@ cannot work in one backend and silently fail in the other.
 
 import array
 import base64
+import glob
 import json
 import math
 import os
@@ -1929,6 +1930,46 @@ def _url_playable(url, timeout=None, attempts=None):
 
 _WARM_EXTRACTOR = os.environ.get('P100_WARM_EXTRACTOR') == '1'
 
+
+def _js_runtime():
+    """Return (params, cli_args) enabling a JavaScript runtime for yt-dlp.
+
+    yt-dlp 2026+ needs one to solve YouTube's signature/n challenges; only
+    deno is enabled by default, and Debian systems commonly have node instead.
+    Without this, extraction silently drops the audio formats and reports
+    "Requested format is not available". P100_JS_RUNTIME can override the path.
+    """
+    preferred = os.environ.get('P100_JS_RUNTIME') or ''
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    for name in ('deno', 'node', 'bun', 'quickjs'):
+        try:
+            import shutil
+            found = shutil.which(name if name != 'quickjs' else 'qjs')
+        except Exception:
+            found = None
+        if found:
+            candidates.append(found)
+        # Backends started from a desktop session don't inherit nvm's PATH.
+        if name == 'node':
+            exe = 'node.exe' if os.name == 'nt' else 'node'
+            for d in sorted(glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin')),
+                            reverse=True):
+                candidate = os.path.join(d, exe)
+                if os.access(candidate, os.X_OK):
+                    candidates.append(candidate)
+    for path in candidates:
+        name = os.path.basename(path).lower()
+        name = name[:-4] if name.endswith('.exe') else name
+        if name == 'qjs':
+            name = 'quickjs'
+        if name not in ('deno', 'node', 'bun', 'quickjs'):
+            continue
+        return {name: {'path': path}}, ['--js-runtimes', f'{name}:{path}']
+    return None, []
+
+
 # In-process extraction (P100_WARM_EXTRACTOR=1): run yt-dlp as a module so a
 # resolve skips the per-subprocess Python interpreter startup (~1-3 s). The
 # module is imported lazily; any failure falls back to the subprocess path.
@@ -1970,6 +2011,9 @@ def _in_process_extract(video_id, client_arg, browser):
         'skip_download': True,
         'noplaylist': True,
     }
+    js_params, _ = _js_runtime()
+    if js_params:
+        opts['js_runtimes'] = js_params
     if client_arg:
         opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
     if browser:
@@ -2020,6 +2064,9 @@ def _extract_stream_url(video_id, client_arg, browser):
     else:
         last_error = "yt-dlp returned no URL"
     cmd = [YTDLP, "-f", "bestaudio", "-g", "--no-warnings"]
+    _, js_args = _js_runtime()
+    if js_args:
+        cmd += js_args
     if client_arg:
         cmd += ["--extractor-args", f"youtube:player_client={client_arg}"]
     cmd.append(f"https://www.youtube.com/watch?v={video_id}")
@@ -2055,6 +2102,150 @@ def _client_from_url(url):
     return None
 
 
+# Some YouTube Music ids point at a video that is available only to Premium
+# members, so yt-dlp cannot extract any audio format for them. Resolve a
+# public upload of the same song instead. The C++ side keys its offline cache
+# by the *requested* id, so the stand-in URL is cached under the original id
+# and the library keeps showing the correct title/artist.
+_yt_client = None
+_FALLBACK_BAD_WORDS = re.compile(
+    r'parody|cover|karaoke|remix|sped[ -]?up|slowed|instrumental|reaction|'
+    r'1 hour|loop|tribute|mashup|acoustic|extended', re.I)
+_fallback_ids_lock = threading.RLock()
+_fallback_ids = None
+
+
+def _fallback_path():
+    return os.path.join(_config_dir(), 'fallback_ids.json')
+
+
+def _load_fallback_ids():
+    global _fallback_ids
+    with _fallback_ids_lock:
+        if _fallback_ids is None:
+            try:
+                with open(_fallback_path(), encoding='utf-8') as f:
+                    data = json.load(f)
+                _fallback_ids = data if isinstance(data, dict) else {}
+            except Exception:
+                _fallback_ids = {}
+        return dict(_fallback_ids)
+
+
+def _save_fallback_id(video_id, source_id):
+    with _fallback_ids_lock:
+        _load_fallback_ids()
+        _fallback_ids[video_id] = {'id': source_id, 'ts': time.time()}
+        try:
+            tmp = '%s.%d.tmp' % (_fallback_path(), os.getpid())
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(_fallback_ids, f, separators=(',', ':'))
+            os.replace(tmp, _fallback_path())
+        except Exception:
+            pass
+
+
+def _drop_fallback_id(video_id):
+    with _fallback_ids_lock:
+        _load_fallback_ids()
+        if _fallback_ids.pop(video_id, None) is not None:
+            try:
+                with open(_fallback_path(), 'w', encoding='utf-8') as f:
+                    json.dump(_fallback_ids, f, separators=(',', ':'))
+            except Exception:
+                pass
+
+
+def _norm_title(s):
+    return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
+
+
+def _find_public_equivalent(video_id, title, artist, duration):
+    """Search public YouTube uploads for the same song, preferring a close
+    duration match and an official/channel upload over fan edits."""
+    query = ' '.join(x for x in (artist, title) if x).strip()[:120]
+    if not query:
+        return None
+    cmd = [YTDLP, '--no-warnings', '--flat-playlist', '--print',
+           '%(id)s\t%(duration)s\t%(title)s\t%(channel)s']
+    _, js_args = _js_runtime()
+    if js_args:
+        cmd += js_args
+    cmd.append('ytsearch8:' + query)
+    try:
+        out = subprocess.check_output(cmd, text=True, timeout=40,
+                                      creationflags=_NO_WINDOW)
+    except Exception:
+        return None
+    want = set(w for w in _norm_title(title).split() if len(w) > 2)
+    best = None
+    best_score = None
+    for line in (out or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        sid, sdur, stitle = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        channel = parts[3].strip() if len(parts) > 3 else ''
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', sid) or sid == video_id:
+            continue
+        norm = _norm_title(stitle)
+        if not norm or _FALLBACK_BAD_WORDS.search(stitle):
+            continue
+        if want and not all(w in norm for w in want):
+            continue
+        try:
+            dur = int(float(sdur))
+        except (TypeError, ValueError):
+            dur = 0
+        if duration and dur and abs(dur - duration) > max(30, duration * 0.35):
+            continue
+        score = abs(dur - duration) if duration and dur else 600.0
+        low = stitle.lower()
+        if artist and artist.lower() in channel.lower():
+            score -= 20
+        if 'official' in low:
+            score -= 10
+        if 'audio' in low:
+            score -= 5
+        if best_score is None or score < best_score:
+            best, best_score = sid, score
+    return best
+
+
+_fallback_resolve_lock = threading.Lock()
+
+
+def _fallback_stream_url(video_id):
+    """Best-effort URL for a Premium-only / blocked id."""
+    global _yt_client
+    if _yt_client is None:
+        return None
+    # One search + probe per id at a time; prefetch can ask for the same
+    # Premium track from several worker threads at once.
+    with _fallback_resolve_lock:
+        entry = _load_fallback_ids().get(video_id) or {}
+        source = entry.get('id') if isinstance(entry, dict) else None
+        if not source:
+            try:
+                meta = get_track_meta(_yt_client, video_id) or {}
+            except Exception:
+                return None
+            if not meta.get('ok'):
+                return None
+            source = _find_public_equivalent(video_id, meta.get('title') or '',
+                                             meta.get('artist') or '',
+                                             int(meta.get('durationSec') or 0))
+            if not source:
+                return None
+            _save_fallback_id(video_id, source)
+        browser = os.environ.get('P100_BROWSER')
+        for client_arg in ('visionos', 'web_music', None) + _PLAYER_CLIENT_FALLBACKS:
+            url, _ = _extract_stream_url(source, client_arg, browser)
+            if url and _url_playable(url):
+                return url
+        return None
+
+
 def get_stream_url(video_id, fresh=False):
     # Resolved googlevideo URLs stay valid for hours; reuse one for repeat
     # plays (and the player's prefetch) instead of re-running extraction.
@@ -2062,6 +2253,7 @@ def get_stream_url(video_id, fresh=False):
     if fresh:
         with _stream_lock:
             _stream_cache.pop(video_id, None)
+        _drop_fallback_id(video_id)
     else:
         _load_stream_disk()
         with _stream_lock:
@@ -2105,6 +2297,13 @@ def get_stream_url(video_id, fresh=False):
     # still accept it, and if not, the player's fresh-resolve retry fires.
     if last_url:
         return {'url': last_url, 'id': video_id}
+    # E.g. "This video is only available to Music Premium members": use a
+    # public upload of the same song. Cached under the requested id.
+    fallback = _fallback_stream_url(video_id)
+    if fallback:
+        _cache_stream_url(video_id, fallback)
+        _save_stream_disk()
+        return {'url': fallback, 'id': video_id}
     return {'error': last_error}
 
 
@@ -2365,6 +2564,9 @@ def _in_process_extract_video(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
         'skip_download': True,
         'noplaylist': True,
     }
+    js_params, _ = _js_runtime()
+    if js_params:
+        opts['js_runtimes'] = js_params
     if client_arg:
         opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
     if browser:
@@ -2401,6 +2603,9 @@ def _extract_video_urls(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
     else:
         last_error = 'yt-dlp returned no URL'
     cmd = [YTDLP, '-f', fmt, '-g', '--no-warnings']
+    _, js_args = _js_runtime()
+    if js_args:
+        cmd += js_args
     if client_arg:
         cmd += ['--extractor-args', f'youtube:player_client={client_arg}']
     cmd.append(f'https://www.youtube.com/watch?v={video_id}')
@@ -3121,6 +3326,8 @@ def run_command_loop(yt, stdin=None, stdout=None, guest=False):
                 reconfigure(encoding="utf-8")
             except (ValueError, OSError):
                 pass
+    global _yt_client
+    _yt_client = yt
     for line in stdin:
         line = line.strip()
         if not line:

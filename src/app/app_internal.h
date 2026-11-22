@@ -47,6 +47,7 @@ struct PlayRequest
     std::string id;        // video id (for the offline cache)
     bool remote;           // true when path is a network stream to be recorded
     std::uint64_t gen = 0; // play generation the request was issued for
+    int expected_duration_sec = 0; // from track metadata; guards against wrong streams
 };
 extern std::queue<PlayRequest> g_play_queue;
 extern std::mutex g_play_queue_mutex;
@@ -79,6 +80,7 @@ extern std::string g_recording_temp;
 extern std::string g_recording_id;
 extern bool g_recording_started;
 extern double g_recording_duration;
+extern int g_recording_expected_duration;
 extern bool notify_init_done;
 
 extern std::mutex g_play_fail_mutex;
@@ -99,8 +101,8 @@ void handle_player_event(const std::string &event, MprisPlayer *mpris);
 void stop_fade();
 void resolve_audio(const std::string &video_id, const std::string &video_url,
                    const std::string &title, const std::string &artist,
-                   const std::string &thumb, bool fresh = false,
-                   std::uint64_t gen = 0);
+                   const std::string &thumb, int expected_duration_sec,
+                   bool fresh = false, std::uint64_t gen = 0);
 std::string stream_container_ext(const std::string &url);
 void rebuild_queue_from_source();
 void prefetch_next_track();
