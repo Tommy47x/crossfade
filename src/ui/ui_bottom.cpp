@@ -8,6 +8,7 @@
 #include "mpvplayer.h"
 #include "texture.h"
 #include "power.h"
+#include "shortcuts.h"
 
 #include <algorithm>
 #include <chrono>
@@ -113,6 +114,38 @@ static void draw_round_control(AppState &state, const char *id, UiIcon icon, flo
     }
 }
 
+void ui_toggle_immersive_lyrics(AppState &state)
+{
+    if (state.lyrics_immersive)
+    {
+        state.lyrics_immersive = false;
+    }
+    else
+    {
+        const Track display = lyrics_display_track(state);
+        auto snap = std::atomic_load(&state.lyrics);
+        const bool usable = !display.id.empty() && snap &&
+                            snap->track_id == display.id &&
+                            snap->lyrics.ok && !snap->lyrics.none &&
+                            !snap->lyrics.lines.empty();
+        if (usable)
+        {
+            state.lyrics_immersive = true;
+            state.settings.lyrics_panel_open = true;
+            save_settings(state.settings);
+        }
+        else
+        {
+            // Let the docked panel show loading / retry / "no lyrics".
+            state.settings.lyrics_panel_open = true;
+            save_settings(state.settings);
+            state.lyrics_requested_id = state.current_track_id;
+            state.lyrics_refresh_requested = true;
+        }
+    }
+    state.repaint_requested = true;
+}
+
 void draw_bottom_bar(AppState &state, MpvPlayer &player)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -120,11 +153,10 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const UiMetrics &m = ui_m();
     const float bar_h = l.bottom_h;
     const float bar_w = io.DisplaySize.x;
-    const float bar_y = io.DisplaySize.y - bar_h;
 
     ScopedNoMinSize no_min_size;
-    ImGui::SetNextWindowPos(ImVec2(0, bar_y));
-    ImGui::SetNextWindowSize(ImVec2(bar_w, bar_h));
+    ImGui::SetNextWindowPos(l.bottom_pos);
+    ImGui::SetNextWindowSize(l.bottom_size);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_backdrop_window_bg());
@@ -930,40 +962,12 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     // (or outgoing, mid-crossfade) track has no usable lyrics yet, open the
     // normal panel so its loading / none / error state explains why.
     ImGui::SetCursorScreenPos(ImVec2(immersive_x, wp.y + (bar_h - icon_size) * 0.5f));
+    const std::string immersive_tip =
+        state.lyrics_immersive ? "Exit full-screen lyrics (" + shortcut_label("immersive_lyrics") + ")"
+                               : "Full-screen lyrics (" + shortcut_label("immersive_lyrics") + ")";
     if (ui_icon_button("##lyrics_immersive", UiIcon::Expand, icon_size,
-                       state.lyrics_immersive, 0,
-                       state.lyrics_immersive ? "Exit full-screen lyrics"
-                                              : "Full-screen lyrics"))
-    {
-        if (state.lyrics_immersive)
-        {
-            state.lyrics_immersive = false;
-        }
-        else
-        {
-            const Track display = lyrics_display_track(state);
-            auto snap = std::atomic_load(&state.lyrics);
-            const bool usable = !display.id.empty() && snap &&
-                                snap->track_id == display.id &&
-                                snap->lyrics.ok && !snap->lyrics.none &&
-                                !snap->lyrics.lines.empty();
-            if (usable)
-            {
-                state.lyrics_immersive = true;
-                state.settings.lyrics_panel_open = true;
-                save_settings(state.settings);
-            }
-            else
-            {
-                // Let the docked panel show loading / retry / "no lyrics".
-                state.settings.lyrics_panel_open = true;
-                save_settings(state.settings);
-                state.lyrics_requested_id = state.current_track_id;
-                state.lyrics_refresh_requested = true;
-            }
-        }
-        state.repaint_requested = true;
-    }
+                       state.lyrics_immersive, 0, immersive_tip.c_str()))
+        ui_toggle_immersive_lyrics(state);
 
     const int vol = state.crossfade_active
                         ? state.crossfade_user_volume

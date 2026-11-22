@@ -2,6 +2,7 @@
 #include "ui_audio_reactive.h"
 #include "ui_backdrop.h"
 #include "ui_icons.h"
+#include "ui_layout.h"
 #include "ui_theme.h"
 #include "mpvplayer.h"
 #include "texture.h"
@@ -523,6 +524,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
     ImGuiIO &io = ImGui::GetIO();
     const UiMetrics &m = ui_m();
+    const AppLayout l = ui_compute_layout(state, io);
     const double now = ImGui::GetTime();
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -1088,7 +1090,10 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
             const float bar_w = std::max(20.0f, w - pad * 2.0f);
             const float bar_x = pad;
-            const float bar_y = h - pad - ui_px(12.0f);
+            // Same dock safe band as the main bar: without this the immersive
+            // transport and seek bar land inside the shell's bottom hot zone
+            // and every click goes to the desktop instead of the app.
+            const float bar_y = h - pad - ui_px(12.0f) - l.bottom_safe;
             const float ctrl_y = bar_y - ui_px(40.0f);
             const float time_y = bar_y - ui_px(26.0f);
 
@@ -1220,7 +1225,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 a = hint_age / 0.35f;
             else if (hint_age > 4.2f)
                 a = clampf((5.0f - hint_age) / 0.8f, 0.0f, 1.0f);
-            const float y = h - pad - ui_px(106.0f);
+            const float y = h - pad - ui_px(106.0f) - l.bottom_safe;
             const std::string hint = "Esc to exit";
             const float tw = measure(g_ui_fonts.body, 13.0f * m.text_scale, hint);
             dl->AddText(g_ui_fonts.body, 13.0f * m.text_scale,
