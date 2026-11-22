@@ -128,6 +128,7 @@ void ui_play_track(AppState &state, const Track &track, int index)
     state.pending_play_title = track.title;
     state.pending_play_artist = track.artist;
     state.pending_play_thumbnail_url = thumb_url;
+    state.pending_play_duration_sec = track.duration_sec;
     state.pending_video_id = track.id;
     state.pending_video_url = playable_track_url(track.id, track.url);
     state.pending_manual_play = true;

@@ -145,8 +145,8 @@ void rebuild_queue_from_source()
 
 void resolve_audio(const std::string &video_id, const std::string &video_url,
                           const std::string &title, const std::string &artist,
-                          const std::string &thumb, bool fresh,
-                          std::uint64_t gen)
+                          const std::string &thumb, int expected_duration_sec,
+                          bool fresh, std::uint64_t gen)
 {
     (void)title;
     (void)artist;
@@ -154,6 +154,7 @@ void resolve_audio(const std::string &video_id, const std::string &video_url,
     PlayRequest req;
     req.id = video_id;
     req.gen = gen;
+    req.expected_duration_sec = expected_duration_sec;
     if (is_local_track_id(video_id))
     {
         // A file on disk: play it directly and never touch the network or the
@@ -180,6 +181,27 @@ void resolve_audio(const std::string &video_id, const std::string &video_url,
     }
     req.path = find_cached_audio_path(video_id);
     req.remote = false;
+    // A cache entry is only usable if its length agrees with the track
+    // metadata. A wrong song can otherwise sit under the right id forever
+    // (mpv reports that file's own duration, so stream validation alone
+    // cannot catch it) and be replayed on every play.
+    if (!req.path.empty() && expected_duration_sec > 0)
+    {
+        const double cached_duration = probe_audio_file_duration(req.path);
+        const double meta_duration = (double)expected_duration_sec;
+        if (cached_duration > 0.0 &&
+            std::abs(cached_duration - meta_duration) > std::max(10.0, meta_duration * 0.2))
+        {
+            fprintf(stderr, "Quarantining cached audio for %s: %.1fs vs metadata %ds\n",
+                    video_id.c_str(), cached_duration, expected_duration_sec);
+            std::error_code ec;
+            std::filesystem::rename(req.path, req.path + ".wrong-duration", ec);
+            if (ec)
+                std::filesystem::remove(req.path, ec);
+            std::filesystem::remove(req.path + ".meta.json", ec);
+            req.path.clear();
+        }
+    }
     if (req.path.empty())
     {
         // Not cached: play the resolved stream URL immediately. The bytes
@@ -459,6 +481,7 @@ void finalize_recording()
     g_recording_id.clear();
     g_recording_started = false;
     g_recording_duration = 0.0;
+    g_recording_expected_duration = 0;
     if (g_player->was_seeked())
     {
         // A seek outside the demuxer cache makes mpv skip stream data, so
@@ -471,13 +494,26 @@ void finalize_recording()
     // Validate off-thread: mpv documents that seeks/stream switches can stop
     // the recorder outright, and a truncated or empty file must never reach
     // the cache as a "downloaded" song.
-    tasks::spawn("finalize-recording", [temp, path, id, expected_duration]() mutable
+    const int expected_meta_duration = g_recording_expected_duration;
+    tasks::spawn("finalize-recording", [temp, path, id, expected_duration,
+                                        expected_meta_duration]() mutable
                 {
         const double got = probe_audio_file_duration(temp);
-        if (got <= 0.0 || (expected_duration > 0.0 && got < expected_duration - 5.0))
+        // `expected_duration` comes from the stream mpv just played, so it
+        // cannot detect the backend handing us an entirely different song
+        // with its own self-consistent length. Compare with the track's
+        // metadata too: a large disagreement means wrong audio, not a
+        // truncated download.
+        const double meta = expected_meta_duration > 0 ? (double)expected_meta_duration : 0.0;
+        const double tolerance = std::max(10.0, meta * 0.2);
+        const bool wrong_song = meta > 0.0 && std::abs(got - meta) > tolerance;
+        if (got <= 0.0 || (expected_duration > 0.0 && got < expected_duration - 5.0) ||
+            wrong_song)
         {
-            fprintf(stderr, "Discarding recording %s: duration %.1fs (source %.1fs)\n",
-                    id.c_str(), got, expected_duration);
+            fprintf(stderr,
+                    "Discarding recording %s: duration %.1fs (stream %.1fs, metadata %ds)%s\n",
+                    id.c_str(), got, expected_duration, expected_meta_duration,
+                    wrong_song ? " [wrong song]" : "");
             remove(temp.c_str());
             // mpv's recorder can stop silently mid-stream (documented for
             // seeks / stream switches); the bytes are unusable but the song
@@ -515,6 +551,7 @@ void discard_recording()
     g_recording_id.clear();
     g_recording_started = false;
     g_recording_duration = 0.0;
+    g_recording_expected_duration = 0;
 }
 
 
@@ -1342,6 +1379,7 @@ void begin_play_track(const Track &t, int index)
     g_state.pending_play_title = t.title;
     g_state.pending_play_artist = t.artist;
     g_state.pending_play_thumbnail_url = thumb_url;
+    g_state.pending_play_duration_sec = t.duration_sec;
     g_state.pending_video_id = t.id;
     g_state.pending_video_url = playable_track_url(t.id, t.url);
 }
