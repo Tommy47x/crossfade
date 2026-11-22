@@ -427,6 +427,10 @@ void draw_lyrics_panel(AppState &state, MpvPlayer &player, float width, float he
 // Full-window, effects-driven lyrics view. Drawn as a top-most modal takeover
 // so it also blocks the bottom bar / panels underneath.
 void draw_lyrics_immersive(AppState &state, MpvPlayer &player);
+// Enters/exits the full-screen lyrics takeover. When the current track has no
+// usable lyrics yet, opens the docked panel so its loading / none state is
+// visible. Shared by the bottom-bar button and the Enter shortcut.
+void ui_toggle_immersive_lyrics(AppState &state);
 
 // Shared lyrics timing helpers so the docked panel and the immersive view can
 // never disagree about which track or line is current.

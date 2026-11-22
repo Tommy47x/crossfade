@@ -13,6 +13,10 @@ struct AppLayout
     float sidebar_w = 0.0f;
     float header_h = 0.0f;
     float bottom_h = 0.0f;
+    // Inactive band below the controls when the window touches the screen edge
+    // (e.g. a GNOME dock autohide hot zone). Kept separate from bottom_h so the
+    // controls stay away from the shell's input region.
+    float bottom_safe = 0.0f;
     ImVec2 sidebar_pos = ImVec2(0, 0);
     ImVec2 sidebar_size = ImVec2(0, 0);
     ImVec2 content_pos = ImVec2(0, 0);
