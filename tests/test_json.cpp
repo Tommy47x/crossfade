@@ -143,6 +143,20 @@ int main()
     }
 
     {
+        // Liked Music ("LM") replies have "id": null at the top level and a
+        // nested author id; the parser must still find every track.
+        const std::string lm =
+            "{\"owned\": false, \"id\": null, \"privacy\": \"PUBLIC\", "
+            "\"trackCount\": 2, \"title\": \"Liked Music\", "
+            "\"author\": {\"name\": \"x\", \"id\": \"UC_author\"}, \"tracks\": ["
+            "{\"videoId\":\"v1\",\"title\":\"One\",\"artists\":[{\"name\":\"A\",\"id\":\"UC1\"}]},"
+            "{\"videoId\":\"v2\",\"title\":\"Two\",\"artists\":[{\"name\":\"B\",\"id\":\"UC2\"}]}]}";
+        auto tracks = parse_youtube_playlist_tracks_response(lm);
+        check(tracks.size() == 2, "LM-shaped playlist parses");
+        check(tracks[0].id == "v1" && tracks[1].id == "v2", "LM track ids");
+    }
+
+    {
         // A "local:" id is a file on disk and must never be handed to yt-dlp
         // or the backend's stream resolver.
         check(get_cached_audio_path("local:test").empty(), "local id not downloaded");

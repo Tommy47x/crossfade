@@ -16,8 +16,8 @@ from ytmusicapi import OAuthCredentials, YTMusic
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py"))
 from cf_backend.core import (  # noqa: E402
-    check_logged_in,
     ensure_config_dir,
+    login_state,
     run_command_loop,
     secure_auth_file,
 )
@@ -115,11 +115,16 @@ def main():
         yt = YTMusic()  # anonymous default header; public browsing only
 
     if not guest:
-        logged_in, err = check_logged_in(yt)
-        if not logged_in:
+        state = login_state(yt)
+        if state is False:
+            print("Stored OAuth session is signed out; starting as guest.",
+                  file=sys.stderr)
+            guest = True
+            yt = YTMusic()
+        elif state is None:
             print(
-                f"Note: logged_in check was inconclusive ({err}). "
-                "Continuing - will confirm via actual data instead.",
+                "Note: logged_in check was inconclusive; continuing - will "
+                "confirm via actual data instead.",
                 file=sys.stderr,
             )
 

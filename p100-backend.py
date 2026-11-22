@@ -10,11 +10,18 @@ points stay behaviorally identical.
 import json
 import os
 import sys
+import time
 
 from ytmusicapi import YTMusic
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py"))
-from cf_backend.core import _err, ensure_config_dir, run_command_loop, secure_auth_file  # noqa: E402
+from cf_backend.core import (  # noqa: E402
+    _err,
+    ensure_config_dir,
+    login_state,
+    run_command_loop,
+    secure_auth_file,
+)
 
 
 def _config_dir():
@@ -55,7 +62,23 @@ def main():
         secure_auth_file(AUTH_FILE)
         try:
             yt = YTMusic(AUTH_FILE)
-            guest = False
+            # A cookie file can construct a YTMusic object and still be
+            # anonymous (expired/incomplete cookies). Verify the account flag so
+            # Home is not filled with a generic feed and cached as personalized.
+            # A file written by the sign-in helper moments ago was already
+            # verified, so skip the extra round-trip right after signing in.
+            fresh = False
+            try:
+                fresh = time.time() - os.path.getmtime(AUTH_FILE) < 300
+            except OSError:
+                pass
+            state = None if fresh else login_state(yt)
+            if state is False:
+                print("Stored session is signed out; starting as guest.",
+                      file=sys.stderr)
+                yt = None
+            else:
+                guest = False
         except Exception as e:
             # A broken session must not block public browsing: fall back to
             # guest and let the UI offer a re-sign-in.

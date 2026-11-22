@@ -142,6 +142,14 @@ def main():
     check(out[24]["kind"] == "backend", "missing query kind")
     check(len(out) == 25, "quit stops the loop")
 
+    # Timeout resync: the pipe is realigned by a nonce-bearing ping, which must
+    # also work while the backend is in guest mode.
+    ping_out = run(["ping 4242", "quit"])
+    check(ping_out[0].get("nonce") == 4242 and ping_out[0].get("ok") is True,
+          "ping echoes the resync nonce")
+    guest_ping = run(["ping 7", "quit"], guest=True)
+    check(guest_ping[0].get("nonce") == 7, "ping works in guest mode")
+
     # Guest mode: public browsing still works; account surfaces return auth.
     guest_out = run([
         "recommendations",

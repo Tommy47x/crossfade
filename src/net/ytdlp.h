@@ -198,6 +198,15 @@ struct YouTubePlaylist
 
 std::vector<YouTubePlaylist> fetch_youtube_playlists();
 std::vector<Track> fetch_youtube_playlist(const std::string &playlist_id);
+// Background offline pre-cache variant: uses the speculative prefetch channel
+// so it never sits in front of an interactive request on the main channel.
+std::vector<Track> fetch_youtube_playlist_prefetch(const std::string &playlist_id);
+// Drop account-scoped caches after sign-in / account switch.
+void clear_recommendations_cache();
+void clear_youtube_playlist_caches();
+// True when a cache file predates the current auth file (belongs to an older
+// or anonymous session).
+bool cache_older_than_auth(const std::string &path);
 
 // ------------------ Server write-back ------------------
 // Mutations of the signed-in YouTube Music account. All are blocking and

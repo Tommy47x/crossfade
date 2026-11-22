@@ -1372,23 +1372,41 @@ def get_episodes_later(yt):
     return [_podcast_episode(x) for x in (data.get("tracks") or [])]
 
 
+def login_state(yt):
+    """Whether YouTube actually sees this session as signed in.
+
+    Returns True (signed in), False (the server answered and said the request
+    is anonymous) or None (the check could not run: network/API error). A
+    YTMusic object can be constructed from an incomplete or stale cookie file
+    and then silently send anonymous requests; only this flag distinguishes
+    that from a real sign-in.
+    """
+    try:
+        response = yt._send_request("account/account_menu", {})
+    except Exception:
+        return None
+    tracking = response.get('responseContext', {}).get('serviceTrackingParams', [])
+    for service in tracking:
+        if service.get('service') != 'GFEEDBACK':
+            continue
+        for param in service.get('params', []):
+            if param.get('key') == 'logged_in':
+                return str(param.get('value')) == '1'
+    return None
+
+
 def check_logged_in(yt):
     """
     Sanity check: confirms the server actually sees us as authenticated,
     rather than silently falling back to anonymous/generic behavior.
     Returns (True, None) or (False, error_message).
     """
-    try:
-        response = yt._send_request("account/account_menu", {})
-        tracking = response.get('responseContext', {}).get('serviceTrackingParams', [])
-        for service in tracking:
-            if service.get('service') == 'GFEEDBACK':
-                for param in service.get('params', []):
-                    if param.get('key') == 'logged_in':
-                        return param.get('value') == '1', None
+    state = login_state(yt)
+    if state is None:
         return False, "Could not find logged_in flag in response"
-    except Exception as e:
-        return False, str(e)
+    if not state:
+        return False, "YouTube Music reports this session as signed out"
+    return True, None
 
 
 def get_home_tracks(yt, limit=40):
@@ -2049,11 +2067,11 @@ def get_stream_url(video_id, fresh=False):
         with _stream_lock:
             cached = _stream_cache.get(video_id)
         if cached and time.time() - cached[0] < _STREAM_TTL:
-            return {'url': cached[1]}
+            return {'url': cached[1], 'id': video_id}
         # Another backend channel may have resolved this id after we loaded.
         url = _stream_disk_lookup(video_id)
         if url:
-            return {'url': url}
+            return {'url': url, 'id': video_id}
 
     browser = os.environ.get('P100_BROWSER')
     last_error = "yt-dlp returned no URL"
@@ -2078,7 +2096,7 @@ def get_stream_url(video_id, fresh=False):
             _cache_stream_url(video_id, url)
             _warm_client = _client_from_url(url) or client_arg
             _save_stream_disk()
-            return {'url': url}
+            return {'url': url, 'id': video_id}
         last_url = url
         last_error = ("resolved URL rejected at fetch "
                       f"(client: {client_arg or 'yt-dlp default'})")
@@ -2086,7 +2104,7 @@ def get_stream_url(video_id, fresh=False):
     # Hand over the last extraction anyway rather than erroring out: mpv may
     # still accept it, and if not, the player's fresh-resolve retry fires.
     if last_url:
-        return {'url': last_url}
+        return {'url': last_url, 'id': video_id}
     return {'error': last_error}
 
 
@@ -3112,7 +3130,15 @@ def run_command_loop(yt, stdin=None, stdout=None, guest=False):
         arg = parts[1] if len(parts) > 1 else None
 
         try:
-            if guest and cmd in _GUEST_MESSAGES:
+            if cmd == 'ping':
+                # Resync probe: the C++ side sends this after a timed-out
+                # command and discards stale replies until the nonce returns.
+                try:
+                    nonce = int(arg) if arg else 0
+                except ValueError:
+                    nonce = 0
+                result = {'ok': True, 'nonce': nonce}
+            elif guest and cmd in _GUEST_MESSAGES:
                 # Anonymous YTMusic() can browse public content, but the
                 # account surface stays behind a sign-in. The UI shows a
                 # dedicated prompt for these.

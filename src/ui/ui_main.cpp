@@ -1116,6 +1116,9 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
             ui_searching_state(UiIcon::Search, "Searching YouTube Music", "Looking for tracks");
         else if (home && state.search_buffer[0])
             ui_empty_state(UiIcon::Search, "No results", "Try a different search");
+        else if (home && state.home_refreshing.load())
+            ui_empty_state(UiIcon::Equalizer, "Refreshing your feed",
+                           "Fetching from YouTube Music");
         else if (state.loading && home)
             ui_empty_state(UiIcon::Equalizer, "Loading your music", "Finding something good for you");
         else if (is_local_search_list(state))

@@ -69,7 +69,18 @@ struct AppState
     std::string youtube_playlist_refreshed_id;
     std::string youtube_playlist_failed_id; // id whose last network fetch failed
     std::string youtube_playlist_error_msg;
-    // Pre-cache all playlist contents (not just the one the user opens).
+    // Which playlist the in-flight contents fetch belongs to. A fast second
+    // click supersedes it; the stale worker is discarded by the request token.
+    std::string youtube_playlist_loading_id;
+    std::atomic<uint64_t> youtube_playlist_request{0};
+    // Account-playlist list fetches are account-scoped too. Signing in/out or
+    // pressing Retry invalidates an older worker so it cannot reinstate the
+    // previous session's playlists.
+    std::atomic<uint64_t> youtube_playlists_request{0};
+    // Automatic retry gate (steady-clock seconds). A failed list fetch used to
+    // be retried on every frame, queueing endless backend commands.
+    double youtube_playlists_retry_at = 0.0;
+    // Pre-cache a few playlist contents (not just the one the user opens).
     std::atomic<bool> youtube_playlist_contents_precaching{false};
     bool youtube_playlist_contents_precached = false;
     // Radio station state. The seed metadata is main-thread only; the

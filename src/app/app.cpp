@@ -794,6 +794,18 @@ int app_run(int argc, char **argv)
     // Touch taps jitter: two taps on the same row easily exceed the default
     // 6 px window, which would make double-tap start unreliable.
     io.MouseDoubleClickMaxDist = 48.0f;
+#ifdef P100_WINDOWS
+    // ImGui's 300 ms default is shorter than many users' Windows double-click
+    // setting. Follow the OS value so a normal double-click is not split into
+    // two single clicks (which made track rows feel like they needed 3 clicks).
+    {
+        const UINT os_ms = GetDoubleClickTime();
+        if (os_ms >= 200 && os_ms <= 900)
+            io.MouseDoubleClickTime = (float)os_ms / 1000.0f;
+    }
+#else
+    io.MouseDoubleClickTime = 0.5f;
+#endif
 
     ui_theme_init_fonts(io, p100_asset_dir() + "/fonts");
     g_state.title_font = g_ui_fonts.semibold;
@@ -1017,6 +1029,7 @@ int app_run(int argc, char **argv)
                 std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                 g_state.home_failed = false;
             }
+            invalidate_home_fetch();
             g_state.home_refreshing = true;
             tasks::spawn("recommendations", []() { load_recommendations(false, true); });
         }
@@ -1029,6 +1042,7 @@ int app_run(int argc, char **argv)
                 std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                 g_state.home_failed = false;
             }
+            invalidate_home_fetch();
             g_state.home_refreshing = true;
             tasks::spawn("recommendations", []() { load_recommendations(false, true); });
         }
@@ -2005,6 +2019,7 @@ int app_run(int argc, char **argv)
             if (g_state.refresh_requested)
             {
                 g_state.refresh_requested = false;
+                invalidate_home_fetch();
                 g_state.home_refreshing = true;
                 g_state.status_text = "Loading...";
                 tasks::spawn("recommendations-refresh", []() { load_recommendations(true); });
@@ -2043,6 +2058,7 @@ int app_run(int argc, char **argv)
                         std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                         g_state.home_failed = false;
                     }
+                    invalidate_home_fetch();
                     g_state.home_refreshing = true;
                     tasks::spawn("recommendations-retry",
                                  []() { load_recommendations(false, true); });
@@ -2139,8 +2155,31 @@ int app_run(int argc, char **argv)
                 backend_boot_reported = false;
                 if (started)
                 {
+                    // The sign-in toast is the success message; drop errors left
+                    // over from tearing down the old backend so Settings and the
+                    // next fetch do not report a contradictory "Backend not
+                    // running".
+                    take_backend_error();
+                    g_state.set_backend_status(BackendError{});
+                    // Any fetch started before the restart is now stale and must
+                    // not clear the refreshing flag or publish an old feed.
+                    invalidate_home_fetch();
                     if (!backend_is_guest())
                     {
+                        // The account-scoped caches belong to the previous
+                        // session. Clearing them prevents a just-signed-in user
+                        // from seeing the anonymous/generic Home feed or the
+                        // previous account's playlists for the next hour.
+                        clear_recommendations_cache();
+                        clear_youtube_playlist_caches();
+                        std::atomic_store(
+                            &g_state.recommendations,
+                            std::make_shared<const std::vector<Track>>());
+                        {
+                            std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
+                            g_state.home_failed = false;
+                            g_state.home_error_msg.clear();
+                        }
                         // The guest-mode guards may have marked account data
                         // as loaded; let the newly signed-in backend refill it.
                         {
@@ -2149,15 +2188,35 @@ int app_run(int argc, char **argv)
                         }
                         {
                             std::lock_guard<std::recursive_mutex> lock(g_state.youtube_mutex);
+                            g_state.youtube_playlists.clear();
+                            std::atomic_store(
+                                &g_state.youtube_playlist_tracks,
+                                std::make_shared<const std::vector<Track>>());
+                            g_state.youtube_playlist_loaded_id.clear();
+                            g_state.youtube_playlist_refreshed_id.clear();
+                            g_state.youtube_playlist_failed_id.clear();
+                            g_state.youtube_playlist_error_msg.clear();
+                            g_state.youtube_playlist_loading_id.clear();
+                            g_state.youtube_playlist_request.fetch_add(
+                                1, std::memory_order_relaxed);
+                            g_state.youtube_playlist_loading = false;
+                            g_state.youtube_playlist_loaded_from_cache = false;
+                            g_state.youtube_playlists_request.fetch_add(
+                                1, std::memory_order_relaxed);
+                            g_state.youtube_playlists_loading = false;
                             g_state.youtube_playlists_loaded = false;
                             g_state.youtube_playlists_refreshed = false;
+                            g_state.youtube_playlists_retry_at = 0.0;
+                            g_state.youtube_playlist_contents_precaching = false;
+                            g_state.youtube_playlist_contents_precached = false;
                         }
                     }
-                    // Fresh session: pull the personalized Home feed again
-                    // (a guest start just clears the refreshing flag).
+                    // Fresh session: pull the personalized Home feed again. Force
+                    // it past the disk cache so a feed cached while the session
+                    // was effectively anonymous can never survive a sign-in.
                     g_state.home_refreshing = true;
                     tasks::spawn("recommendations",
-                                 []() { load_recommendations(false, true); });
+                                 []() { load_recommendations(true, true); });
                 }
                 g_state.repaint_requested = true;
             }

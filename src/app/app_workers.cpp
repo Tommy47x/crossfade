@@ -125,12 +125,26 @@ void background_video_download(const std::string &video_id, int max_height)
     });
 }
 
+// Monotonic Home-feed request generation. A sign-in restarts the backend and
+// starts a fresh feed fetch while an older startup fetch may still be in
+// flight. Only the newest request may publish results, errors or clear the
+// refreshing flag.
+static std::atomic<uint64_t> g_home_fetch_seq{0};
+
+void invalidate_home_fetch()
+{
+    g_home_fetch_seq.fetch_add(1, std::memory_order_relaxed);
+}
+
 void load_recommendations(bool force, bool quiet)
 {
+    const uint64_t token = g_home_fetch_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     // Home is account-personalized. In guest mode the UI shows a sign-in
     // prompt instead of fetching (and instead of an error toast).
     if (backend_is_guest())
     {
+        if (token != g_home_fetch_seq.load(std::memory_order_relaxed))
+            return; // a newer request (e.g. the post-login refresh) owns the UI
         {
             std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
             g_state.home_failed = false;
@@ -141,6 +155,8 @@ void load_recommendations(bool force, bool quiet)
         return;
     }
     auto tracks = fetch_recommendations(force);
+    if (token != g_home_fetch_seq.load(std::memory_order_relaxed))
+        return; // superseded: leave state and errors to the newer fetch
     BackendError err = take_backend_error();
     if (err && !quiet)
         ui_notify_backend_error(err);

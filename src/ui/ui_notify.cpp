@@ -108,6 +108,12 @@ void ui_notify_backend_error(const BackendError &err)
     // account-gated command the backend refuses.
     if (backend_is_guest() && err.kind == BackendErrKind::Auth)
         return;
+    // Signing in restarts the backend. A command from the old channel can
+    // report "Backend not running" after the new backend is already up, which
+    // contradicts the success toast. Only surface it when the backend is
+    // genuinely down.
+    if (err.kind == BackendErrKind::Backend && backend_running())
+        return;
 
     static std::string s_last_msg;
     static double s_last_time = -1e9;

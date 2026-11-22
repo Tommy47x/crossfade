@@ -162,6 +162,10 @@ static std::string json_get_string(const std::string &json, const std::string &k
 static std::string g_ytdl_browser = "firefox";
 static std::string g_auth_mode = "browser";
 static BackendError g_backend_error;
+// Several backend channels (main/play/prefetch) record failures from their
+// own worker threads. Without this, two threads could resize/clear the same
+// std::string at once (heap corruption or a lost error toast).
+static std::mutex g_backend_error_mutex;
 
 std::string backend_error_user_message(const BackendError &err)
 {
@@ -186,6 +190,7 @@ std::string backend_error_user_message(const BackendError &err)
 
 BackendError take_backend_error()
 {
+    std::lock_guard<std::mutex> lock(g_backend_error_mutex);
     BackendError e = g_backend_error;
     g_backend_error.clear();
     return e;
@@ -241,10 +246,18 @@ static BackendErrKind parse_error_kind(const std::string &response)
 
 static void record_backend_error(const std::string &response)
 {
-    g_backend_error.kind = parse_error_kind(response);
-    g_backend_error.message = json_get_string(response, "error");
-    if (g_backend_error.message.empty())
-        g_backend_error.message = response;
+    // Tearing the channels down for a sign-in restart makes every in-flight
+    // command fail with "Backend stopping"/"Backend not running". Those are
+    // expected, not user-facing failures.
+    if (g_backend_stopping.load(std::memory_order_relaxed))
+        return;
+    BackendError err;
+    err.kind = parse_error_kind(response);
+    err.message = json_get_string(response, "error");
+    if (err.message.empty())
+        err.message = response;
+    std::lock_guard<std::mutex> lock(g_backend_error_mutex);
+    g_backend_error = std::move(err);
 }
 
 // Backend commands must never hang the UI thread forever: a wedged Python
@@ -500,11 +513,12 @@ static void backend_reader_thread(BackendChannel *ch)
     }
 }
 
-static std::string backend_read_line(BackendChannel &ch)
+static std::string backend_read_line(BackendChannel &ch, int timeout_sec = -1)
 {
     // Same 45 s deadline and error payloads as the POSIX poll() loop below.
     std::unique_lock<std::mutex> lock(ch.q_mutex);
-    time_t deadline = time(nullptr) + read_timeout_seconds();
+    const int wait_sec = timeout_sec > 0 ? timeout_sec : read_timeout_seconds();
+    time_t deadline = time(nullptr) + wait_sec;
     while (ch.lines.empty())
     {
         if (ch.dead.load())
@@ -514,7 +528,7 @@ static std::string backend_read_line(BackendChannel &ch)
         int remaining = (int)(deadline - time(nullptr));
         if (remaining <= 0)
         {
-            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", read_timeout_seconds());
+            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", wait_sec);
             return "{\"error\":\"Backend did not respond in time\",\"kind\":\"backend\"}";
         }
         ch.q_cv.wait_for(lock, std::chrono::seconds(1));
@@ -562,7 +576,7 @@ static void channel_close(BackendChannel &ch)
 #endif // P100_WINDOWS
 
 #ifndef P100_WINDOWS
-static std::string backend_read_line(BackendChannel &ch)
+static std::string backend_read_line(BackendChannel &ch, int timeout_sec = -1)
 {
     // Raw fd reads (not fgets): stdio buffering hides data from poll(), which
     // would spuriously time out mid-line. One line per command; the backend
@@ -577,7 +591,8 @@ static std::string backend_read_line(BackendChannel &ch)
     std::string line;
     char buf[8192];
     size_t total_read = 0;
-    time_t deadline = time(nullptr) + read_timeout_seconds();
+    const int wait_sec = timeout_sec > 0 ? timeout_sec : read_timeout_seconds();
+    time_t deadline = time(nullptr) + wait_sec;
 
     while (line.find('\n') == std::string::npos)
     {
@@ -589,7 +604,7 @@ static std::string backend_read_line(BackendChannel &ch)
         int remaining = (int)(deadline - time(nullptr));
         if (remaining <= 0)
         {
-            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", read_timeout_seconds());
+            fprintf(stderr, "ERROR: Backend read timed out after %d s.\n", wait_sec);
             return "{\"error\":\"Backend did not respond in time\",\"kind\":\"backend\"}";
         }
 
@@ -652,6 +667,16 @@ static void backend_write_line(BackendChannel &ch, const std::string &cmd)
 
 static bool spawn_backend(BackendChannel &ch)
 {
+#ifdef P100_WINDOWS
+    // A stopped backend's reader queues an empty EOF sentinel. If it survives
+    // into the new process, the first read returns that stale line and the
+    // freshly spawned backend is wrongly declared "not ready" -- which made a
+    // sign-in backend restart fail and left the app on "Backend not running".
+    {
+        std::lock_guard<std::mutex> lock(ch.q_mutex);
+        ch.lines.clear();
+    }
+#endif
 #ifdef P100_WINDOWS
     const std::string python = backend_python();
     const std::string script = backend_script();
@@ -1351,6 +1376,52 @@ bool parse_lyrics_json(const std::string &json, Lyrics &out)
 }
 
 // ------------------ High‑level commands ------------------
+// Write one command line while the caller already holds ch.mutex.
+static bool write_line_locked(BackendChannel &ch, const std::string &cmd)
+{
+#ifndef P100_WINDOWS
+    if (!ch.in)
+        return false;
+    fputs((cmd + "\n").c_str(), ch.in);
+    return !ferror(ch.in) && fflush(ch.in) == 0;
+#else
+    return channel_write_line(ch, cmd);
+#endif
+}
+
+// One command is outstanding per channel. When its reply misses the deadline,
+// the backend will still send it later; the next command would then read that
+// stale line as its own reply (a prefetch batch decodes as "play this random
+// song", a playlist reply as the wrong track list). After a timeout, ping with
+// a nonce and discard everything up to the matching reply so the stream is
+// aligned again before the next real command.
+static bool resync_backend_channel(BackendChannel &ch)
+{
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t nonce = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!write_line_locked(ch, "ping " + std::to_string(nonce)))
+        return false;
+
+    const std::string needle = "\"nonce\":" + std::to_string(nonce);
+    const int wait_sec = std::max(1, tunable_int("backend.resync_timeout_sec"));
+    const time_t deadline = time(nullptr) + wait_sec;
+    int discarded = 0;
+    while (time(nullptr) < deadline && discarded < 32)
+    {
+        const int remaining = (int)(deadline - time(nullptr));
+        if (remaining <= 0)
+            break;
+        const std::string line = backend_read_line(ch, remaining);
+        if (line.find(needle) != std::string::npos)
+            return true;
+        if (line.find("Backend not running") != std::string::npos ||
+            line.find("Backend stopping") != std::string::npos)
+            return false;
+        ++discarded; // stale reply from the timed-out command
+    }
+    return false;
+}
+
 static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
 {
     // A command can arrive while the main worker is still importing Python
@@ -1371,20 +1442,8 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
     }
     const auto cmd_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(ch.mutex);
-#ifndef P100_WINDOWS
-    if (!ch.in)
+    if (!write_line_locked(ch, cmd))
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
-    fputs((cmd + "\n").c_str(), ch.in);
-    if (ferror(ch.in) || fflush(ch.in) != 0)
-    {
-        // The pipe broke (backend died): the read below will hit EOF and
-        // return the "not running" error, but short-circuit for clarity.
-        return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
-    }
-#else
-    if (!channel_write_line(ch, cmd))
-        return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
-#endif
     std::string response = backend_read_line(ch);
     const uint64_t elapsed_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - cmd_start)
@@ -1396,21 +1455,44 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
     {
         // A dead/piped-closed backend previously looked like "empty data";
         // make it an explicit error instead.
-        g_backend_error.kind = BackendErrKind::Backend;
-        g_backend_error.message = "Backend not running";
+        {
+            std::lock_guard<std::mutex> err_lock(g_backend_error_mutex);
+            g_backend_error.kind = BackendErrKind::Backend;
+            g_backend_error.message = "Backend not running";
+        }
         record_backend_log(ch, cmd, elapsed_ms, response, true);
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
     }
     ch.commands.fetch_add(1, std::memory_order_relaxed);
     ch.last_ms.store(elapsed_ms, std::memory_order_relaxed);
+    const bool timed_out =
+        response.find("Backend did not respond in time") != std::string::npos;
     if (response.find("\"error\"") != std::string::npos)
     {
         ch.errors.fetch_add(1, std::memory_order_relaxed);
         record_backend_error(response);
     }
-    else if (g_backend_error.ok())
-        g_backend_error.clear();
+    else
+    {
+        std::lock_guard<std::mutex> err_lock(g_backend_error_mutex);
+        if (g_backend_error.ok())
+            g_backend_error.clear();
+    }
     record_backend_log(ch, cmd, elapsed_ms, response, false);
+    if (timed_out)
+    {
+        const auto resync_start = std::chrono::steady_clock::now();
+        const bool synced = resync_backend_channel(ch);
+        const uint64_t resync_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - resync_start)
+                                       .count();
+        record_backend_log(ch, "resync after timeout", resync_ms,
+                           synced ? "{\"ok\":true}"
+                                  : "{\"error\":\"Backend resync failed\"}",
+                           !synced);
+        if (!synced)
+            ch.dead.store(true, std::memory_order_relaxed);
+    }
     return response;
 }
 
@@ -1660,8 +1742,20 @@ std::vector<Track> fetch_recommendations(bool force_fresh, int limit)
     std::string path = cache_dir() + "/recommendations_cache.json";
     if (!force_fresh)
     {
+        // A feed cached before the current auth file was installed belongs to
+        // a different (or anonymous) session. Serving it after a sign-in is
+        // exactly how a personalized Home could look like guest content for an
+        // hour, even across a relaunch.
+        bool auth_newer = false;
+        {
+            std::error_code cache_ec, auth_ec;
+            const auto cache_time = std::filesystem::last_write_time(path, cache_ec);
+            const auto auth_time =
+                std::filesystem::last_write_time(backend_auth_file_path(), auth_ec);
+            auth_newer = !cache_ec && !auth_ec && auth_time > cache_time;
+        }
         struct stat st;
-        if (stat(path.c_str(), &st) == 0 && st.st_size > 0)
+        if (!auth_newer && stat(path.c_str(), &st) == 0 && st.st_size > 0)
         {
             time_t now = time(nullptr);
             if (now - st.st_mtime < 3600)
@@ -1878,7 +1972,7 @@ std::vector<Track> parse_youtube_playlist_tracks_response(const std::string &res
     std::vector<Track> tracks;
     size_t pos = 0;
     int guard = 0;
-    while ((pos = response.find("\"videoId\"", pos)) != std::string::npos && guard < 500)
+    while ((pos = response.find("\"videoId\"", pos)) != std::string::npos && guard < 1000)
     {
         std::string obj = json_find_object(response, pos);
         if (obj.empty())
@@ -1899,15 +1993,90 @@ std::vector<Track> parse_youtube_playlist_tracks_response(const std::string &res
     return tracks;
 }
 
+// ytmusicapi's get_playlist reply puts the playlist browse id in the top-level
+// "id" key. Auto playlists (Liked Music, "LM") have "id": null, and the first
+// *quoted* "id" after it is the author's channel id — so json_get_string() is
+// the wrong tool for this check. Inspect only the first (top-level) id value:
+// null means "no id, accept"; a quoted value must match the request.
+static bool playlist_reply_matches_id(const std::string &json, const std::string &want)
+{
+    const size_t key = json.find("\"id\"");
+    if (key == std::string::npos)
+        return true;
+    const size_t colon = json.find(':', key + 4);
+    if (colon == std::string::npos)
+        return true;
+    const size_t value = json.find_first_not_of(" \t\r\n", colon + 1);
+    if (value == std::string::npos)
+        return true;
+    if (json.compare(value, 4, "null") == 0)
+        return true; // Liked Music and other browse-less auto playlists
+    if (json[value] != '"')
+        return true;
+    std::string id;
+    for (size_t i = value + 1; i < json.size(); ++i)
+    {
+        const char c = json[i];
+        if (c == '"')
+            break;
+        if (c == '\\' && i + 1 < json.size())
+            ++i; // playlist ids never need unescaping, but don't misread one
+        id += c;
+    }
+    return id == want;
+}
+
+// Shared tail of the two playlist fetchers: validate, parse, cache. A rejected
+// or unparseable reply records a backend error so the UI offers a Retry instead
+// of silently marking the playlist as an empty one.
+static std::vector<Track> accept_youtube_playlist_reply(const std::string &playlist_id,
+                                                         const std::string &response)
+{
+    if (response.empty() || response.find("\"error\"") != std::string::npos)
+        return {};
+    // get_playlist() always carries trackCount; requiring it rejects a stale
+    // reply from a different command (library_playlists, prefetch, search).
+    if (response.find("\"trackCount\"") == std::string::npos)
+    {
+        record_backend_error(
+            "{\"error\":\"Unexpected reply while loading the playlist\",\"kind\":\"backend\"}");
+        return {};
+    }
+    if (!playlist_reply_matches_id(response, playlist_id))
+    {
+        record_backend_error(
+            "{\"error\":\"The playlist reply did not match the request\",\"kind\":\"backend\"}");
+        return {};
+    }
+    const int expected = json_get_int(response, "trackCount");
+    auto tracks = parse_youtube_playlist_tracks_response(response);
+    if (tracks.empty() && expected > 0)
+    {
+        record_backend_error(
+            "{\"error\":\"Could not parse the playlist tracks\",\"kind\":\"backend\"}");
+        return {};
+    }
+    write_text_file(youtube_playlist_cache_path(playlist_id), response);
+    return tracks;
+}
+
 std::vector<Track> fetch_youtube_playlist(const std::string &playlist_id)
 {
     if (playlist_id.empty())
         return {};
-    std::string response = send_command("playlist " + playlist_id);
-    if (response.empty() || response.find("\"error\"") != std::string::npos)
+    const std::string response = send_command("playlist " + playlist_id);
+    return accept_youtube_playlist_reply(playlist_id, response);
+}
+
+// Background variant for the offline pre-cache sweep. It runs on the prefetch
+// channel so warming playlist contents can never queue in front of an
+// interactive pick, radio station or Home refresh on the main channel.
+std::vector<Track> fetch_youtube_playlist_prefetch(const std::string &playlist_id)
+{
+    if (playlist_id.empty())
         return {};
-    write_text_file(youtube_playlist_cache_path(playlist_id), response);
-    return parse_youtube_playlist_tracks_response(response);
+    const std::string response = send_prefetch_command("playlist " + playlist_id);
+    return accept_youtube_playlist_reply(playlist_id, response);
 }
 
 
@@ -2856,6 +3025,11 @@ std::string fetch_stream_url(const std::string &video_id)
     std::string response = send_play_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
+    // Guard against a stale reply from the previous command (see the timeout
+    // resync in send_command_on): never hand another track's URL to mpv.
+    const std::string id = json_get_string(response, "id");
+    if (!id.empty() && id != video_id)
+        return "";
     return json_get_string(response, "url");
 }
 
@@ -2870,6 +3044,9 @@ std::string fetch_stream_url_prefetch(const std::string &video_id)
     std::string response = send_prefetch_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
+    const std::string id = json_get_string(response, "id");
+    if (!id.empty() && id != video_id)
+        return "";
     return json_get_string(response, "url");
 }
 
@@ -2879,6 +3056,9 @@ std::string fetch_stream_url_fresh(const std::string &video_id)
         return "";
     std::string response = send_play_command("play_fresh " + video_id);
     if (response.find("\"error\"") != std::string::npos)
+        return "";
+    const std::string id = json_get_string(response, "id");
+    if (!id.empty() && id != video_id)
         return "";
     return json_get_string(response, "url");
 }
@@ -3523,6 +3703,7 @@ bool backend_running()
 
 BackendError backend_error_snapshot()
 {
+    std::lock_guard<std::mutex> lock(g_backend_error_mutex);
     return g_backend_error;
 }
 
@@ -3597,6 +3778,45 @@ std::string youtube_playlist_cache_path(const std::string &playlist_id)
         if (!isalnum((unsigned char)c) && c != '_' && c != '-')
             c = '_';
     return cache_dir() + "/youtube_playlist_" + safe + ".json";
+}
+
+// The recommendation feed and the account playlists belong to the signed-in
+// user. After a sign-in (or an account switch) the old files must not be served
+// again, or Home keeps showing an anonymous/generic feed for up to an hour and
+// the playlist pane shows the previous account's lists.
+void clear_recommendations_cache()
+{
+    std::error_code ec;
+    std::filesystem::remove(cache_dir() + "/recommendations_cache.json", ec);
+}
+
+void clear_youtube_playlist_caches()
+{
+    std::error_code ec;
+    std::filesystem::remove(youtube_playlists_cache_path(), ec);
+    const std::string dir = cache_dir();
+    for (const std::string &name : list_dir_names(dir))
+    {
+        if (name.rfind("youtube_playlist_", 0) != 0)
+            continue;
+        if (name.size() < 5 || name.compare(name.size() - 5, 5, ".json") != 0)
+            continue;
+        std::filesystem::remove(dir + "/" + name, ec);
+    }
+}
+
+// True when `path` was written before the auth file was last replaced. A cache
+// in that state belongs to a previous (or anonymous) session and must not be
+// shown as if it were the current account's data.
+bool cache_older_than_auth(const std::string &path)
+{
+    std::error_code cache_ec, auth_ec;
+    const auto cache_time = std::filesystem::last_write_time(path, cache_ec);
+    if (cache_ec)
+        return false;
+    const auto auth_time =
+        std::filesystem::last_write_time(backend_auth_file_path(), auth_ec);
+    return !auth_ec && auth_time > cache_time;
 }
 
 bool read_text_file(const std::string &path, std::string &out)

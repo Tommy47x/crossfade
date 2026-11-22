@@ -94,6 +94,17 @@ const std::vector<TunableDef> &build_defs()
         TUNE("radio.half_life_days", "Radio", "Recency half-life",
              "Score half-life for older listening events, days.", 7.0f, 0.5f, 365.0f),
 
+        // ---- YouTube account ------------------------------------------
+        TUNE_I("youtube.precache_count", "YouTube", "Playlist pre-cache",
+               "Playlist contents warmed in the background after sign-in.",
+               5, 0, 100),
+        TUNE_I("youtube.precache_gap_ms", "YouTube", "Pre-cache gap",
+               "Pause between background playlist fetches, milliseconds.",
+               350, 0, 5000),
+        TUNE_I("youtube.retry_sec", "YouTube", "Playlist retry delay",
+               "Wait before retrying a failed playlist-list fetch, seconds.",
+               10, 1, 300),
+
         // ---- Video ----------------------------------------------------
         TUNE_I("video.load_fail_sec", "Video", "Load fail watchdog",
                "Seconds a stream may stall before it counts as failed.", 8, 2, 120),
@@ -323,6 +334,9 @@ const std::vector<TunableDef> &build_defs()
                 "Default HTTP request timeout, seconds.", 10, 1, 120),
         TUNE_RI("backend.read_timeout_sec", "Backend", "Backend read timeout",
                 "Seconds to wait for a reply from the Python backend.", 45, 5, 600),
+        TUNE_I("backend.resync_timeout_sec", "Backend", "Backend resync timeout",
+               "Time spent realigning the command pipe after a timed-out reply, seconds.",
+               15, 2, 120),
         TUNE_RI("backend.playable_timeout_sec", "Backend", "Probe timeout",
                 "Timeout for the URL playable probe, seconds.", 8, 1, 60),
         TUNE_RI("backend.playable_attempts", "Backend", "Probe attempts",

@@ -156,6 +156,10 @@ void background_video_download(const std::string &video_id, int max_height);
 // `quiet` suppresses the backend-error toast (used by automatic retries that
 // would otherwise repeat the same "no connection" warning every 30 s).
 void load_recommendations(bool force = false, bool quiet = false);
+// Make every in-flight Home feed fetch stale. Call before dispatching a new one
+// when the session changes (sign-in) so an older worker cannot clear the
+// refreshing state or publish an error after the new fetch starts.
+void invalidate_home_fetch();
 void artist_search_and_update(const std::string &query, int expect_id);
 bool text_matches_query(const std::string &haystack, const std::string &needle);
 void merge_local_search_results(const std::string &query, SearchAllResult &results);
