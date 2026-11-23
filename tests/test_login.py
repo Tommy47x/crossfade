@@ -61,6 +61,32 @@ def test_clean_headers(failures):
     check("__Secure-3PAPISID=b" in cleaned, "parses cURL -H cookie headers", failures)
     check("SAPISID=c" in cleaned, "parses cURL -b cookie jars", failures)
 
+    # Chromium's two-line "Copy request headers": name on one line, value on
+    # the next. This was the format that reported "no Cookie header found".
+    two_line = (
+        ":authority\n"
+        "music.youtube.com\n"
+        ":method\n"
+        "POST\n"
+        "cookie\n"
+        "PREF=x; SAPISID=s; __Secure-3PAPISID=p\n"
+        "x-goog-authuser\n"
+        "0\n"
+        "accept-encoding\n"
+        "gzip, deflate, br\n"
+        "Decoded:\n"
+        "message ClientVariations {\n"
+        "  repeated int32 variation_id = [1];\n"
+        "}\n"
+    )
+    cleaned = login.clean_headers(two_line)
+    check("cookie: PREF=x; SAPISID=s; __Secure-3PAPISID=p" in cleaned,
+          "parses the two-line Copy request headers format", failures)
+    check("x-goog-authuser: 0" in cleaned, "keeps x-goog-authuser from pairs", failures)
+    check(":authority" not in cleaned, "drops pseudo-header pairs", failures)
+    check("accept-encoding" not in cleaned, "drops hop-by-hop pairs", failures)
+    check("ClientVariations" not in cleaned, "stops at the Decoded block", failures)
+
 
 def test_cookie_mapping(failures):
     cookies = {"SAPISID": "s", "__Secure-3PAPISID": "p", "IGNORE": "x"}
@@ -175,12 +201,76 @@ def test_helper_cli(failures):
         check(f.read().strip() == "2", "helper records the exit code", failures)
 
 
+def test_webview2_cookie_map(failures):
+    """pywebview returns SimpleCookie morsels, not .name/.value objects."""
+    import importlib.util
+    from http.cookies import SimpleCookie
+
+    helper = os.path.join(ROOT, "scripts", "crossfade-login-helper.py")
+    spec = importlib.util.spec_from_file_location("crossfade_login_helper", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    first = SimpleCookie()
+    first["SAPISID"] = "s"
+    first["SAPISID"]["domain"] = ".youtube.com"
+    second = SimpleCookie()
+    second["__Secure-3PAPISID"] = "p"
+    mapping = module._cookie_map([first, second])
+    check(mapping.get("SAPISID") == "s", "reads SimpleCookie values", failures)
+    check(mapping.get("__Secure-3PAPISID") == "p", "reads the secure cookie", failures)
+
+    class Cookie:
+        name = "SID"
+        value = "v"
+
+    check(module._cookie_map([Cookie()]).get("SID") == "v",
+          "still reads attribute-style cookies", failures)
+    check(module._cookie_map([{"HSID": "h"}]).get("HSID") == "h",
+          "still reads dict-style cookies", failures)
+
+
+def test_chrome_lock_hint(failures):
+    """yt-dlp #7271 gets an actionable message instead of a raw traceback."""
+    import types
+
+    fake_pkg = types.ModuleType("yt_dlp")
+    fake = types.ModuleType("yt_dlp.cookies")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("ERROR: Could not copy Chrome cookie database. "
+                           "See https://github.com/yt-dlp/yt-dlp/issues/7271")
+
+    fake.extract_cookies_from_browser = fail
+    old_pkg, old_mod = sys.modules.get("yt_dlp"), sys.modules.get("yt_dlp.cookies")
+    sys.modules["yt_dlp"], sys.modules["yt_dlp.cookies"] = fake_pkg, fake
+    try:
+        try:
+            login.cookies_from_ytdlp_browser("chrome")
+            check(False, "locked Chrome DB raises", failures)
+        except RuntimeError as e:
+            text = str(e)
+            check("7271" in text and "Paste request headers" in text,
+                  "locked Chrome DB explains the workaround", failures)
+    finally:
+        if old_pkg is None:
+            sys.modules.pop("yt_dlp", None)
+        else:
+            sys.modules["yt_dlp"] = old_pkg
+        if old_mod is None:
+            sys.modules.pop("yt_dlp.cookies", None)
+        else:
+            sys.modules["yt_dlp.cookies"] = old_mod
+
+
 def main():
     failures = []
     test_clean_headers(failures)
     test_cookie_mapping(failures)
     test_atomic_install(failures)
     test_ytdlp_jar(failures)
+    test_webview2_cookie_map(failures)
+    test_chrome_lock_hint(failures)
     test_helper_cli(failures)
     if not failures:
         print("login: all checks passed")
