@@ -2,6 +2,36 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.5.4 - 2026-11-23
+
+Rolls up 0.5.2 (sign-in fixes) and 0.5.3 (Windows in-app update fix) and adds
+the backend reliability fixes from 2026-11-22.
+
+### Fixed
+
+- **Backend restarts no longer leave the play/prefetch workers dead.** On
+  Windows the channel reader's EOF sentinel is cleared before spawning a
+  replacement, so a sign-in restart no longer reports "Backend not ready" and
+  leaves the Home feed empty until a manual refresh. Transient backend errors
+  are suppressed while the backend is booting or restarting, and the stale
+  status is cleared after a successful sign-in restart.
+- **Home refresh state is generation-tokened.** A pre-login fetch can no
+  longer clear `home_refreshing` or publish an old/error feed after sign-in.
+- **Liked Music shows the whole playlist.** The top-level playlist id is null
+  and the first quoted "id" is the author's channel id; only the top-level
+  value is validated now (null accepted) and the track cap went from 500 to
+  1000, so all 673 tracks appear instead of being rejected or truncated.
+- **Late backend replies cannot be parsed as the next result.** A timed-out
+  channel is resynced with a nonce ping after the read deadline.
+- **Playlist pre-caching moved to the prefetch channel** with a cap, gap and
+  retry backoff, plus request tokens so a slow fetch cannot overwrite a newer
+  selection.
+- **Account-scoped caches are dropped after sign-in**, including
+  recommendations and YouTube playlist contents, with auth-mtime checks across
+  launches, so the next Home feed is fresh.
+- Protocol regression tests cover ping/resync and the Liked Music-shaped
+  playlist reply.
+
 ## 0.5.3 - 2026-11-19
 
 ### Fixed
