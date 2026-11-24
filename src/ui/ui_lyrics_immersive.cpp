@@ -630,11 +630,33 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const float energy = clampf(au.rms, 0.0f, 1.0f);
         const bool reactive = au.active && energy > 0.008f && motion;
 
-        // Translucent by exactly the backdrop's visibility, so the app's
-        // dithered shader backdrop shows through instead of an opaque fill
-        // (which made this view look flat/banded next to the rest of the app).
-        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
-                          ui_col(ui_backdrop_window_bg()));
+        // The real backdrop shader is painted below ImGui, so a transparent
+        // takeover would show the app's panels underneath. Sample that same
+        // backdrop on a coarse grid and fill it opaquely with interpolated
+        // quads: smooth like the shader, but covering everything.
+        if (ui_backdrop_visibility() > 0.001f)
+        {
+            auto opaque = [](const ImVec2 &p) {
+                ImVec4 c = ui_backdrop_sample(p);
+                c.w = 1.0f; // never let the backdrop sample show the UI through
+                return ui_col(c);
+            };
+            const int cols = 14, rows = 9;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < cols; ++c)
+                {
+                    const ImVec2 p0(wp.x + w * (float)c / (float)cols,
+                                    wp.y + h * (float)r / (float)rows);
+                    const ImVec2 p1(wp.x + w * (float)(c + 1) / (float)cols,
+                                    wp.y + h * (float)(r + 1) / (float)rows);
+                    dl->AddRectFilledMultiColor(p0, p1, opaque(p0),
+                                                opaque(ImVec2(p1.x, p0.y)),
+                                                opaque(p1),
+                                                opaque(ImVec2(p0.x, p1.y)));
+                }
+        }
+        else
+            dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
 
         // Cover art, blurred and held well back so the lyrics stay the focal
         // point. This uses the full-screen (512px) blur rather than the hero
@@ -979,18 +1001,19 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 g_imm.last_size = act.size;
                 const float act_h = act.rows.size() * act.line_h;
 
-                const float line_dir = ((active_idx & 1) ? 1.0f : -1.0f);
-                const float slide = (1.0f - line_t) * ui_px(22.0f);
-                const float slide_x = (1.0f - line_t) * line_dir * ui_px(22.0f);
+                // Always rise from below. The old alternating left/right
+                // entry made consecutive lines fly in from different corners,
+                // which read as a defocus rather than a lyric change.
+                const float slide = (1.0f - line_t) * ui_px(18.0f);
                 // No zoom and no bloom on the lyrics: scaling text makes the
                 // glyphs shimmer/soft, and the offset glow halo reads as
                 // "out of focus". Positions still slide and alpha still fades.
                 const float scale = 1.0f;
                 const float alpha = (preview ? 0.58f : 1.0f) * view_a *
-                                    (motion ? (0.35f + 0.65f * line_t) : 1.0f);
+                                    (motion ? (0.55f + 0.45f * line_t) : 1.0f);
 
                 draw_rows(dl, font, act,
-                          ImVec2(focal.x + slide_x, focal.y + slide),
+                          ImVec2(focal.x, focal.y + slide),
                           preview ? ui_text_dim_u32() : ui_accent_text_u32(),
                           alpha, scale, 0.0f, karaoke);
 
