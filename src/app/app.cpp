@@ -743,7 +743,13 @@ int app_run(int argc, char **argv)
     // Touch is translated to ImGui input manually (tap/scroll/long-press),
     // so suppress SDL's synthetic touch-to-mouse events.
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    // This hint only exists in SDL 2.0.22+; the release builder uses Ubuntu
+    // 22.04's SDL 2.0.20 to keep the glibc floor at 2.35. On older SDL the
+    // event loop already treats a close-triggered SDL_QUIT as a hide in warm
+    // mode, so no workaround is needed there.
+#if SDL_VERSION_ATLEAST(2, 0, 22)
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#endif
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER);
     g_sdl_ready.store(true, std::memory_order_relaxed);
     diagnostics::mark("sdl");
