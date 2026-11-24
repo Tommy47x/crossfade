@@ -41,6 +41,7 @@ const float kChromeIdle = 2.5f;    // seconds before the chrome hides
 const float kPulseDecay = 3.6f;    // higher = snappier pulse
 const float kLineEnter = 0.42f;    // active-line entrance duration
 const float kViewEnter = 0.45f;    // whole-view fade-in
+const float kViewExit = 0.30f;     // fade back to the app on close
 
 float clampf(float v, float lo, float hi)
 {
@@ -217,6 +218,8 @@ struct ImmersiveAnim
     double view_start = 0.0;
     float enter = 0.0f;
     float pulse = 0.0f;
+    bool exiting = false;
+    float exit = 0.0f;
     std::string prev_text;
     float prev_size = 0.0f;
     float last_size = 0.0f;
@@ -546,7 +549,6 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0, 0, 0, 0));
 
-    bool close = !want;
     if (ImGui::BeginPopupModal("##lyrics_immersive", nullptr,
                                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -565,11 +567,34 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             dt = 1.0f / 60.0f;
 
         const bool motion = ui_animations_enabled();
+        bool animating = false;
+
+        // Closing fades the takeover back to the app instead of cutting. The
+        // app flips `lyrics_immersive` off on Esc/close; re-opening before the
+        // fade finishes cancels it.
+        if (want && g_imm.exiting)
+        {
+            g_imm.exiting = false;
+            g_imm.exit = 0.0f;
+        }
+        if (!want && !g_imm.exiting)
+        {
+            g_imm.exiting = true;
+            g_imm.exit = 0.0f;
+            g_imm.last_input = now;
+        }
+        if (g_imm.exiting)
+        {
+            g_imm.exit = motion ? std::min(1.0f, g_imm.exit + dt / kViewExit) : 1.0f;
+            if (motion)
+                animating = true;
+        }
+        const float exit_a = g_imm.exiting ? (1.0f - ease_out(g_imm.exit)) : 1.0f;
+
         const float pad = std::max(ui_px(24.0f), std::min(w, h) * 0.045f);
         const float max_text_w = std::min(w - pad * 2.0f, w * 0.84f);
         const float focal_y = h * 0.455f;
         const ImVec2 focal(w * 0.5f, focal_y);
-        bool animating = false;
 
         // ---- Resolve the track + payload, exactly like the docked panel ----
         const Track display = lyrics_display_track(state);
@@ -596,7 +621,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         }
         if (!motion)
             g_imm.enter = 1.0f;
-        const float view_a = ease_out(g_imm.enter);
+        const float view_a = ease_out(g_imm.enter) * exit_a;
 
         // Seek target survives the chrome fading out mid-drag.
         static float s_seek = -1.0f;
@@ -639,9 +664,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         // quads: smooth like the shader, but covering everything.
         if (ui_backdrop_visibility() > 0.001f)
         {
-            auto opaque = [](const ImVec2 &p) {
+            auto opaque = [view_a](const ImVec2 &p) {
                 ImVec4 c = ui_backdrop_sample(p);
-                c.w = 1.0f; // never let the backdrop sample show the UI through
+                c.w = view_a; // opaque at rest, fades with the takeover
                 return ui_col(c);
             };
             const int cols = 14, rows = 9;
@@ -659,7 +684,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 }
         }
         else
-            dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
+            dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
+                              ui_with_alpha(ui_col(ui_c().bg), view_a));
 
         // Cover art, blurred and held well back so the lyrics stay the focal
         // point. This uses the full-screen (512px) blur rather than the hero
@@ -684,7 +710,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     const float hh = (v1 - v0) * 0.5f / zoom;
                     const float drift = reactive ? 0.004f * std::sin((float)now * 0.17f)
                                                  : 0.0f;
-                    const float a = (0.34f - 0.14f * day) * (0.85f + 0.35f * energy);
+                    const float a = (0.34f - 0.14f * day) * (0.85f + 0.35f * energy) * view_a;
                     dl->AddImage((ImTextureID)(intptr_t)blur, wp,
                                  ImVec2(wp.x + w, wp.y + h),
                                  ImVec2(cx - hw + drift, cy - hh),
@@ -699,10 +725,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         // both day and night themes while making the artwork feel like part of
         // the existing palette rather than a separate layer.
         dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
-                          ui_with_alpha(ui_col(ui_c().bg), 0.52f + 0.14f * day));
+                          ui_with_alpha(ui_col(ui_c().bg),
+                                        (0.52f + 0.14f * day) * view_a));
         dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
                           ui_with_alpha(ui_col(mix4(tint, accent, 0.25f)),
-                                        0.10f * (1.0f - 0.45f * day)));
+                                        0.10f * (1.0f - 0.45f * day) * view_a));
 
         // Centred ambient colour sampled from the artwork itself. The palette
         // is computed once when the cover is decoded; invalid bands fall back
@@ -1226,15 +1253,13 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         }
 
         // ---- Close / exit ----
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-            close = true;
-
-        if (close)
+        if (g_imm.exiting && g_imm.exit >= 1.0f)
         {
             ImGui::CloseCurrentPopup();
             s_open = false;
             state.lyrics_immersive = false;
             ui_audio_stop();
+            g_imm.exiting = false;
         }
 
         if (animating)
