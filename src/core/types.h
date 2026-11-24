@@ -318,6 +318,10 @@ struct Settings
     std::vector<EqBand> room_eq_bands;
     // Headroom for boosted bands; <= 0 dB. Applied as a volume trim.
     float room_eq_preamp = 0.0f;
+    // Live tone trim on top of the correction (shelf filters). Does not need a
+    // new measurement; -6..+6 dB.
+    float room_eq_bass_db = 0.0f;
+    float room_eq_treble_db = 0.0f;
     // Microphone profile: "" (flat), "phone_generic", "custom".
     std::string room_eq_mic;
     // Correction target: "balanced" (default), "warm" or "flat".
@@ -382,6 +386,8 @@ struct Settings
                room_eq_enabled == o.room_eq_enabled &&
                room_eq_bands == o.room_eq_bands &&
                room_eq_preamp == o.room_eq_preamp && room_eq_mic == o.room_eq_mic &&
+               room_eq_bass_db == o.room_eq_bass_db &&
+               room_eq_treble_db == o.room_eq_treble_db &&
                room_eq_target == o.room_eq_target &&
                room_eq_strength == o.room_eq_strength &&
                room_eq_label == o.room_eq_label &&

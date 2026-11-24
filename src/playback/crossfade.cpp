@@ -98,6 +98,22 @@ std::string audio_filter(const Settings &s)
         }
         for (const EqBand &b : s.room_eq_bands)
             add_band(b);
+        // Live tone trim: shelves on top of the correction, adjustable without
+        // re-measuring.
+        if (std::fabs(s.room_eq_bass_db) >= 0.05f)
+        {
+            char shelf[56];
+            std::snprintf(shelf, sizeof(shelf), "bass=g=%.2f:f=120",
+                          (double)s.room_eq_bass_db);
+            add(shelf);
+        }
+        if (std::fabs(s.room_eq_treble_db) >= 0.05f)
+        {
+            char shelf[56];
+            std::snprintf(shelf, sizeof(shelf), "treble=g=%.2f:f=4000",
+                          (double)s.room_eq_treble_db);
+            add(shelf);
+        }
     }
     return af;
 }

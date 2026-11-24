@@ -14,8 +14,11 @@ Settings → **Room correction**.
    **Record with this microphone** (Linux: PulseAudio/PipeWire), **or** play the
    sweep once and upload a recording from the phone page.
 3. Review the curve: **orange** is what the mic heard, the **dashed blue** line
-   is the target, and the **accent-coloured** line is the predicted result.
-   Apply or discard.
+   is the target, the **accent-coloured** line is the predicted result, and the
+   **filled band around 0 dB is the EQ's own gain** — that last one is what to
+   look at when you want to know whether the correction is doing anything at a
+   given frequency. The panel also states the range it trusts ("Correcting
+   45 Hz – 11.5 kHz"). Apply or discard.
 
 The page stays open after a measurement, so **Measure again** on the phone
 works without scanning a new code (it closes on cancel, "Close phone page", or
@@ -49,12 +52,19 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
   effect). The house curve is applied outside the frequency taper, so the
   treble lift actually happens.
 - **Strength**: Gentle / Balanced / Strong scales the correction amount.
+- If a measurement is noisy or the speaker simply does not produce a band, the
+  correction stops there and the panel says which range it trusted. That is why
+  a phone measurement often cannot fix anything above ~10 kHz.
 - Designs up to 12 peaking filters inside a correction window (40 Hz–16 kHz for
   a calibrated mic, 90 Hz–12 kHz for a phone), with at most +3 dB of boost and
   −12 dB of cut.
-- Correction strength tapers with frequency: full below 400 Hz, ~65% at 2 kHz,
-  ~30% at 10 kHz. Above the room's transition region a single-point measurement
-  is dominated by comb filtering, so correcting it makes things worse.
+- Correction strength tapers with frequency: full below 400 Hz, ~85% at 2 kHz,
+  ~60% at 10 kHz. Above the room's transition region a single-point measurement
+  is dominated by comb filtering, so the taper (plus the no-null-filling rule)
+  keeps it from turning into harshness.
+- **Tone (live)**: Bass and Treble shelves (120 Hz / 4 kHz) on top of the
+  correction, adjustable without re-measuring. They are not part of the curve
+  shown above.
 - Never fills a narrow null: positive corrections are capped by the 1-octave
   trend, and the fitter can only place filters where the measurement is trusted.
 - Adds a preamp trim for the summed boost so the output cannot clip (usually

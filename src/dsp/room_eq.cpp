@@ -627,11 +627,11 @@ double correction_taper(double f)
     if (f <= 400.0)
         return 1.0;
     if (f <= 2000.0)
-        return 1.0 - 0.35 * std::log2(f / 400.0) / std::log2(5.0);
+        return 1.0 - 0.15 * std::log2(f / 400.0) / std::log2(5.0);
     if (f <= 10000.0)
-        return 0.65 - 0.35 * std::log2(f / 2000.0) / std::log2(5.0);
+        return 0.85 - 0.25 * std::log2(f / 2000.0) / std::log2(5.0);
     if (f <= 20000.0)
-        return 0.30 - 0.30 * std::log2(f / 10000.0);
+        return 0.60 - 0.45 * std::log2(f / 10000.0);
     return 0.0;
 }
 } // namespace

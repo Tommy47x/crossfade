@@ -169,6 +169,41 @@ void draw_response_graph(const roomeq::Status &st)
                     ui_text_muted_u32(), label);
     }
 
+    // Untrusted parts stay visible but faded (a broken line read as "scarce").
+    plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db,
+                ui_overlay_u32(0.12f), 1.2f * m.layout_scale, nullptr);
+
+    // The EQ's own response, drawn as a filled band around 0 dB. Without it a
+    // small correction looks like "nothing happened" because the corrected
+    // curve sits on top of the measured one.
+    if (st.corrected_db.size() == st.hz.size() && st.measured_db.size() == st.hz.size())
+    {
+        const double span = std::max(1e-6, ceil_db - floor_db);
+        const float zero_y = br.y - (float)((0.0 - floor_db) / span) * (br.y - tl.y);
+        const ImU32 fill = ui_accent_u32(0.10f);
+        const ImU32 edge = ui_accent_u32(0.45f);
+        ImVec2 prev;
+        bool have = false;
+        for (std::size_t i = 0; i < st.hz.size(); ++i)
+        {
+            const bool ok = st.valid.empty() || (i < st.valid.size() && st.valid[i]);
+            const double gain = st.corrected_db[i] - st.measured_db[i];
+            const double v = std::max(floor_db, std::min(ceil_db, gain));
+            const float y = br.y - (float)((v - floor_db) / span) * (br.y - tl.y);
+            const float x = plot_x(tl, br, st.hz[i]);
+            if (!ok)
+            {
+                have = false;
+                continue;
+            }
+            dl->AddLine(ImVec2(x, zero_y), ImVec2(x, y), fill, 1.2f);
+            if (have)
+                dl->AddLine(prev, ImVec2(x, y), edge, 1.0f);
+            prev = ImVec2(x, y);
+            have = true;
+        }
+    }
+
     plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, kMeasuredCol,
                 1.4f * m.layout_scale, &st.valid);
     plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, kTargetCol,
@@ -201,7 +236,43 @@ void draw_response_graph(const roomeq::Status &st)
     legend("measured", kMeasuredCol, false);
     legend("target", kTargetCol, true);
     legend("corrected", ui_accent_u32(0.95f), false);
+
+    // Correction fill swatch + trusted range.
+    {
+        const float y = p.y + line_h * 0.5f;
+        const float x0 = p.x;
+        dl->AddRectFilled(ImVec2(x0, y - 4.0f * m.layout_scale),
+                          ImVec2(x0 + sample_w, y + 4.0f * m.layout_scale),
+                          ui_accent_u32(0.18f));
+        dl->AddLine(ImVec2(x0, y), ImVec2(x0 + sample_w, y), ui_accent_u32(0.55f), 1.0f);
+        dl->AddText(ImVec2(x0 + sample_w + 6.0f * m.layout_scale, p.y), ui_text_muted_u32(),
+                    "EQ gain");
+    }
     ImGui::Dummy(ImVec2(0.0f, line_h));
+
+    int lo_i = -1, hi_i = -1;
+    for (std::size_t i = 0; i < st.valid.size(); ++i)
+        if (st.valid[i])
+        {
+            if (lo_i < 0)
+                lo_i = (int)i;
+            hi_i = (int)i;
+        }
+    auto fmt_hz = [](double f) {
+        char b[32];
+        if (f >= 1000.0)
+            std::snprintf(b, sizeof(b), "%.1f kHz", f / 1000.0);
+        else
+            std::snprintf(b, sizeof(b), "%.0f Hz", f);
+        return std::string(b);
+    };
+    if (lo_i >= 0 && hi_i > lo_i)
+        ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y, ui_c().text_muted.z,
+                                  1.0f),
+                           "Correcting %s – %s", fmt_hz(st.hz[lo_i]).c_str(),
+                           fmt_hz(st.hz[hi_i]).c_str());
+    else
+        room_help("Nothing in this measurement is trusted enough to correct.");
 }
 
 void start_phone_or_notify(AppState &state)
@@ -328,6 +399,18 @@ void draw_room_eq_panel(AppState &state)
         st.room_eq_strength = strength == 0 ? 0.6f : (strength == 2 ? 1.3f : 1.0f);
         save_settings(st);
     }
+
+    ImGui::TextUnformatted("Tone (live)");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SliderFloat("##rq_bass", &st.room_eq_bass_db, -6.0f, 6.0f, "Bass %+.1f dB");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        save_settings(st);
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SliderFloat("##rq_treble", &st.room_eq_treble_db, -6.0f, 6.0f, "Treble %+.1f dB");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        save_settings(st);
+    room_help("Shelves on top of the correction (120 Hz / 4 kHz). They apply immediately and "
+              "need no new measurement; the curve above shows the correction only, not these.");
 
     room_gap();
     if (status.stage == roomeq::Stage::Waiting || status.stage == roomeq::Stage::Measuring ||
