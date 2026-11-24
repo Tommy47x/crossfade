@@ -250,14 +250,6 @@ void draw_response_graph(const roomeq::Status &st)
     }
     ImGui::Dummy(ImVec2(0.0f, line_h));
 
-    int lo_i = -1, hi_i = -1;
-    for (std::size_t i = 0; i < st.valid.size(); ++i)
-        if (st.valid[i])
-        {
-            if (lo_i < 0)
-                lo_i = (int)i;
-            hi_i = (int)i;
-        }
     auto fmt_hz = [](double f) {
         char b[32];
         if (f >= 1000.0)
@@ -266,13 +258,26 @@ void draw_response_graph(const roomeq::Status &st)
             std::snprintf(b, sizeof(b), "%.0f Hz", f);
         return std::string(b);
     };
-    if (lo_i >= 0 && hi_i > lo_i)
+    if (st.correct_hi_hz > st.correct_lo_hz && st.correct_lo_hz > 0.0)
         ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y, ui_c().text_muted.z,
                                   1.0f),
-                           "Correcting %s – %s", fmt_hz(st.hz[lo_i]).c_str(),
-                           fmt_hz(st.hz[hi_i]).c_str());
+                           "Correcting %s – %s", fmt_hz(st.correct_lo_hz).c_str(),
+                           fmt_hz(st.correct_hi_hz).c_str());
     else
         room_help("Nothing in this measurement is trusted enough to correct.");
+
+    if (st.correct_hi_hz > 0.0 && st.correct_hi_hz < 6000.0)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.72f, 0.40f, 1.0f));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextWrapped("The recording is only usable up to ~%.1f kHz. That is what an "
+                           "8 kHz voice/Bluetooth capture looks like, so the highs cannot be "
+                           "measured at all. Disconnect Bluetooth headsets, use the phone's own "
+                           "microphone (or a USB mic), and measure again.",
+                           st.correct_hi_hz / 1000.0);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
 }
 
 void start_phone_or_notify(AppState &state)
@@ -409,8 +414,9 @@ void draw_room_eq_panel(AppState &state)
     ImGui::SliderFloat("##rq_treble", &st.room_eq_treble_db, -6.0f, 6.0f, "Treble %+.1f dB");
     if (ImGui::IsItemDeactivatedAfterEdit())
         save_settings(st);
-    room_help("Shelves on top of the correction (120 Hz / 4 kHz). They apply immediately and "
-              "need no new measurement; the curve above shows the correction only, not these.");
+    room_help("Shelves on top of the correction (120 Hz / 4 kHz). They apply immediately, "
+              "independently of the correction, and need no measurement at all; the curve "
+              "above shows the correction only, not these.");
 
     room_gap();
     if (status.stage == roomeq::Stage::Waiting || status.stage == roomeq::Stage::Measuring ||

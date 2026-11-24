@@ -98,22 +98,22 @@ std::string audio_filter(const Settings &s)
         }
         for (const EqBand &b : s.room_eq_bands)
             add_band(b);
-        // Live tone trim: shelves on top of the correction, adjustable without
-        // re-measuring.
-        if (std::fabs(s.room_eq_bass_db) >= 0.05f)
-        {
-            char shelf[56];
-            std::snprintf(shelf, sizeof(shelf), "bass=g=%.2f:f=120",
-                          (double)s.room_eq_bass_db);
-            add(shelf);
-        }
-        if (std::fabs(s.room_eq_treble_db) >= 0.05f)
-        {
-            char shelf[56];
-            std::snprintf(shelf, sizeof(shelf), "treble=g=%.2f:f=4000",
-                          (double)s.room_eq_treble_db);
-            add(shelf);
-        }
+    }
+    // Live tone trim. Deliberately independent of room_eq_enabled: moving a
+    // tone slider should be audible immediately, even before a measurement is
+    // applied (and it is not part of the plotted correction).
+    if (std::fabs(s.room_eq_bass_db) >= 0.05f)
+    {
+        char shelf[56];
+        std::snprintf(shelf, sizeof(shelf), "bass=g=%.2f:f=120", (double)s.room_eq_bass_db);
+        add(shelf);
+    }
+    if (std::fabs(s.room_eq_treble_db) >= 0.05f)
+    {
+        char shelf[56];
+        std::snprintf(shelf, sizeof(shelf), "treble=g=%.2f:f=4000",
+                      (double)s.room_eq_treble_db);
+        add(shelf);
     }
     return af;
 }

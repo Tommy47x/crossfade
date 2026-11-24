@@ -105,6 +105,8 @@ std::vector<double> g_target;
 std::vector<double> g_corrected;
 dsp::Design g_design;
 double g_before_db = 0.0;
+double g_correct_lo_hz = 0.0;
+double g_correct_hi_hz = 0.0;
 int g_session = 0;
 
 #ifndef P100_WINDOWS
@@ -126,6 +128,8 @@ struct JobResult
     std::vector<double> corrected;
     dsp::Design design;
     double before_db = 0.0;
+    double correct_lo = 0.0;
+    double correct_hi = 0.0;
 };
 
 std::mutex g_job_mutex;
@@ -383,6 +387,14 @@ void start_job(std::vector<float> samples, int rate)
                     ++n;
                 }
             r.before_db = n ? std::sqrt(sse / n) : 0.0;
+            for (std::size_t i = 0; i < grid.hz.size(); ++i)
+                if (grid.hz[i] >= limits.lo_hz && grid.hz[i] <= limits.hi_hz &&
+                    (r.meas.valid.empty() || r.meas.valid[i]))
+                {
+                    if (r.correct_lo == 0.0)
+                        r.correct_lo = grid.hz[i];
+                    r.correct_hi = grid.hz[i];
+                }
             r.ok = true;
         }
         else
@@ -426,6 +438,8 @@ void finish_job()
     g_corrected = r.corrected;
     g_design = r.design;
     g_before_db = r.before_db;
+    g_correct_lo_hz = r.correct_lo;
+    g_correct_hi_hz = r.correct_hi;
     g_has_result = true;
     g_stage = Stage::Ready;
     g_message = "Correction ready.";
@@ -733,6 +747,8 @@ Status status()
     s.sample_rate = g_spec.sample_rate;
     s.residual_before_db = g_before_db;
     s.residual_after_db = g_design.residual_rms_db;
+    s.correct_lo_hz = g_correct_lo_hz;
+    s.correct_hi_hz = g_correct_hi_hz;
     if (g_has_result)
     {
         s.hz = g_grid.hz;
@@ -786,6 +802,8 @@ void reset_result()
 {
     g_has_result = false;
     g_effective_mic.clear();
+    g_correct_lo_hz = 0.0;
+    g_correct_hi_hz = 0.0;
     g_design = dsp::Design{};
     g_meas = dsp::Measurement{};
     g_smooth.clear();

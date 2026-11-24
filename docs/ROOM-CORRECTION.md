@@ -62,9 +62,9 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
   ~60% at 10 kHz. Above the room's transition region a single-point measurement
   is dominated by comb filtering, so the taper (plus the no-null-filling rule)
   keeps it from turning into harshness.
-- **Tone (live)**: Bass and Treble shelves (120 Hz / 4 kHz) on top of the
-  correction, adjustable without re-measuring. They are not part of the curve
-  shown above.
+- **Tone (live)**: Bass and Treble shelves (120 Hz / 4 kHz), applied
+  independently of the correction and without any measurement. They are not
+  part of the curve shown above, so judge them by ear.
 - Never fills a narrow null: positive corrections are capped by the 1-octave
   trend, and the fitter can only place filters where the measurement is trusted.
 - Adds a preamp trim for the summed boost so the output cannot clip (usually
@@ -92,6 +92,10 @@ without the EQ trying to "fix" it.
 
 ## Accuracy and honest limits
 
+- **Watch the upper trusted edge.** If the panel says it only trusts up to
+  ~3-4 kHz, the phone is capturing an 8 kHz voice/Bluetooth signal (a connected
+  headset is the usual cause). Nothing above that was recorded, so it cannot be
+  corrected; disconnect the headset and use the phone's own mic, or a USB mic.
 - **Phone mics are the weak link.** They are not flat, vary by unit, and the OS
   may apply voice processing. The page asks the browser to disable echo
   cancellation, noise suppression and AGC, but that is a request, not a

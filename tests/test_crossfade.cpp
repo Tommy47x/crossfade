@@ -139,14 +139,16 @@ int main()
         check(f.find("equalizer=f=100.0:t=q:w=2.000:g=-4.00") != std::string::npos,
               "room eq band");
         r.room_eq_enabled = false;
+        r.room_eq_bass_db = 0.0f;
+        r.room_eq_treble_db = 0.0f;
         check(crossfade::audio_filter(r).empty(), "room eq off is silent");
 
-        r.room_eq_enabled = true;
         r.room_eq_bass_db = 2.5f;
         r.room_eq_treble_db = -1.5f;
         const std::string tone = crossfade::audio_filter(r);
         check(tone.find("bass=g=2.50:f=120") != std::string::npos, "live bass shelf");
         check(tone.find("treble=g=-1.50:f=4000") != std::string::npos, "live treble shelf");
+        check(tone.find("equalizer=") == std::string::npos, "tone alone adds no room bands");
     }
 
     if (testutil::failures == 0)

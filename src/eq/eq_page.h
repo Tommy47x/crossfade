@@ -70,6 +70,7 @@ input[type=file]{display:none}
     <div class="meter" id="meter"><i id="meterFill"></i></div>
     <div class="row"><span id="levelHint">Make some noise to test the mic</span><span id="countdown"></span></div>
     <div class="wave" id="wave"></div>
+    <div class="note" id="inputInfo"></div>
     <div class="note" id="liveNote">The sweep starts by itself. Keep quiet until it finishes.</div>
   </div>
 
@@ -144,13 +145,31 @@ async function begin() {
   $("start").disabled = true;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+               channelCount: 1, sampleRate: RATE },
       video: false
     });
   } catch (e) {
     $("start").disabled = false;
     fail("Microphone permission was denied. Allow it in the browser's site settings and try again.");
     return;
+  }
+  // Which input did we actually get? A Bluetooth headset (or a call-mode
+  // route) silently swaps the mic for a narrowband one, which caps the
+  // measurement around 3-4 kHz.
+  {
+    const track = stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+    const settings = track && track.getSettings ? track.getSettings() : {};
+    const label = track && track.label ? track.label : "microphone";
+    const rate = settings.sampleRate || 0;
+    $("inputInfo").textContent = "Input: " + label + (rate ? " · " + (rate / 1000).toFixed(1) + " kHz" : "");
+    if (rate && rate <= 16000) {
+      $("inputInfo").className = "note err";
+      $("inputInfo").textContent = "Input: " + label + " (" + (rate / 1000).toFixed(1) +
+        " kHz) — narrowband. Highs above ~4 kHz cannot be measured. Disconnect Bluetooth or pick the phone microphone.";
+    } else {
+      $("inputInfo").className = "note";
+    }
   }
   try {
     ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });

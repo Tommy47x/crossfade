@@ -48,6 +48,11 @@ struct Status
     std::string mic;
     // The phone page is still being served (so it can measure again).
     bool page_open = false;
+    // Range that was actually corrected: the trusted part of the measurement
+    // intersected with the correction window. An upper edge around 3-4 kHz
+    // means the phone captured a narrowband (voice/Bluetooth) signal.
+    double correct_lo_hz = 0.0;
+    double correct_hi_hz = 0.0;
 };
 
 void init();
