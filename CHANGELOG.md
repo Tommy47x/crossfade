@@ -2,6 +2,44 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.5.5 - 2026-11-24
+
+### Added
+
+- **Room correction.** Measure the system at the listening position with a
+  phone (QR code over a self-signed HTTPS page) or a computer microphone,
+  review the measured/target curves, and apply the result through the player's
+  audio filter chain — same code path on Linux and Windows. Includes
+  three-sweep averaging, a trust mask for bands the recording cannot resolve,
+  Balanced/Warm/Dynamic targets, a 12/20/32 filter-detail choice, saved rooms,
+  and automatic room switching when the output device changes.
+- **Immersive full-screen lyrics** (thanks @Tommy47x): Enter opens a
+  karaoke-style takeover with a colour wipe, audio-reactive backdrop and a
+  smooth scrolling focus; Esc fades back to the app.
+- Live bass/treble trim for room correction, independent of the measurement.
+- Bundled JavaScript runtime provisioning for yt-dlp
+  (`scripts/fetch-js-runtime.sh`), required by current YouTube
+  signature/n challenges.
+
+### Fixed
+
+- **Uncached playback on accounts in YouTube's SABR-only experiment.** Stream
+  resolution now extracts anonymously first and only retries with browser
+  cookies, instead of failing the challenge and skipping the fallback.
+- The download cache retries clients in the same order and logs one line per
+  failure; the full yt-dlp output goes to `downloads.log`.
+- Wrong-song cache rejection and the public-upload fallback for Premium-only
+  tracks.
+- Lyrics transitions no longer zoom or bloom (crisp glyphs), long lines keep a
+  stable fitted size, and the takeover fades in and out instead of cutting.
+
+### Changed
+
+- The main backend channel answers commands concurrently (four workers); the
+  play, prefetch and metadata channels stay serial.
+- Room correction lives in `settings.json` (`rq_*`) with saved rooms under
+  `<config>/rooms/`.
+
 ## 0.5.4 - 2026-11-23
 
 Rolls up 0.5.2 (sign-in fixes) and 0.5.3 (Windows in-app update fix) and adds
