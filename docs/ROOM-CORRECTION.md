@@ -55,13 +55,14 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
 - If a measurement is noisy or the speaker simply does not produce a band, the
   correction stops there and the panel says which range it trusted. That is why
   a phone measurement often cannot fix anything above ~10 kHz.
-- Designs up to 12 peaking filters inside a correction window (40 Hz–16 kHz for
-  a calibrated mic, 90 Hz–12 kHz for a phone), with at most +3 dB of boost and
-  −12 dB of cut.
+- Designs up to 12 peaking filters inside a correction window (40 Hz–20 kHz,
+  90 Hz–20 kHz for a phone), with at most +3 dB of boost and −12 dB of cut. The
+  window is the maximum; the recording and the trust mask decide how much of it
+  is actually used.
 - Correction strength tapers with frequency: full below 400 Hz, ~85% at 2 kHz,
-  ~60% at 10 kHz. Above the room's transition region a single-point measurement
-  is dominated by comb filtering, so the taper (plus the no-null-filling rule)
-  keeps it from turning into harshness.
+  ~60% at 10 kHz, ~45% at 20 kHz. Above the room's transition region a
+  single-point measurement is dominated by comb filtering, so the taper (plus
+  the no-null-filling rule) keeps it from turning into harshness.
 - **Tone (live)**: Bass and Treble shelves (120 Hz / 4 kHz), applied
   independently of the correction and without any measurement. They are not
   part of the curve shown above, so judge them by ear.
@@ -71,6 +72,21 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
   0 dB with Balanced, since it hardly boosts).
 - Applies *after* the manual equalizer, as a separate band set, so the two never
   overwrite each other. Turning room correction off leaves the manual EQ alone.
+
+## Saved rooms and automatic switching
+
+`Settings → Room correction → Room` stores a complete playback correction
+(12 filters, preamp, tone trim) as a named profile in `<config>/rooms/*.json`.
+Saving a room also records the output sink it was measured on.
+
+With **Switch rooms with the output device** on, crossfade polls the default
+output sink (PipeWire/PulseAudio via `pactl`) and, when it changes, activates
+the room bound to the new sink. Typical setup: "Desk" bound to the USB DAC,
+"Living room" bound to the speakers, "Headphones" bound to the BT sink — then
+unplugging/selecting a device switches the correction with no clicks.
+
+Limit: device detection is Linux-only for now; on Windows rooms still save and
+apply, they just do not switch by themselves.
 
 ## Trusted vs. untrusted parts of the curve
 
@@ -115,7 +131,7 @@ without the EQ trying to "fix" it.
 
 ## How the measurement works
 
-1. **Excitation** — three 4 s exponential sine sweeps, 25 Hz–19 kHz, separated by
+1. **Excitation** — three 4 s exponential sine sweeps, 25 Hz–22 kHz, separated by
    1 s of silence, with lead-in, tail and raised-cosine fades
    (`dsp::make_sweep`).
 2. **Capture** — the phone records the whole train (~16 s) at 48 kHz mono

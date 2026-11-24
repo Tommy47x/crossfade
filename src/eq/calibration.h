@@ -53,6 +53,9 @@ struct Status
     // means the phone captured a narrowband (voice/Bluetooth) signal.
     double correct_lo_hz = 0.0;
     double correct_hi_hz = 0.0;
+    // Highest frequency the recording itself carried signal at (independent of
+    // what was trusted for correction).
+    double content_hi_hz = 0.0;
 };
 
 void init();

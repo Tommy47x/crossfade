@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include "calibration.h"
+#include "rooms.h"
 #include "ui_components.h"
 #include "ui_icons.h"
 #include "ui_notify.h"
@@ -266,17 +267,29 @@ void draw_response_graph(const roomeq::Status &st)
     else
         room_help("Nothing in this measurement is trusted enough to correct.");
 
-    if (st.correct_hi_hz > 0.0 && st.correct_hi_hz < 6000.0)
+    if (st.content_hi_hz > 0.0)
+        ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y, ui_c().text_muted.z,
+                                  1.0f),
+                           "Recording reaches %s", fmt_hz(st.content_hi_hz).c_str());
+
+    if (st.content_hi_hz > 0.0 && st.content_hi_hz < 6000.0)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.72f, 0.40f, 1.0f));
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextWrapped("The recording is only usable up to ~%.1f kHz. That is what an "
-                           "8 kHz voice/Bluetooth capture looks like, so the highs cannot be "
-                           "measured at all. Disconnect Bluetooth headsets, use the phone's own "
-                           "microphone (or a USB mic), and measure again.",
-                           st.correct_hi_hz / 1000.0);
+        ImGui::TextWrapped("The recording itself stops at %.1f kHz, so there is nothing above "
+                           "that to correct. This is an 8 kHz voice/Bluetooth capture path, not "
+                           "the speaker. Disconnect headsets, use the phone's own microphone (or "
+                           "a USB mic), and measure again.",
+                           st.content_hi_hz / 1000.0);
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
+    }
+    else if (st.content_hi_hz > 0.0 && st.correct_hi_hz > 0.0 &&
+             st.correct_hi_hz < st.content_hi_hz * 0.75)
+    {
+        room_help("The recording reaches further up, but the part above the corrected range "
+                  "was too noisy or not repeatable enough to trust. Measure again in a quieter "
+                  "moment, or turn the volume up slightly.");
     }
 }
 
@@ -332,6 +345,66 @@ void draw_room_eq_panel(AppState &state)
     if (!st.room_eq_label.empty())
         room_help((st.room_eq_label +
                    (st.room_eq_enabled ? " · active" : " · paused")).c_str());
+
+    // ---- saved rooms ---------------------------------------------------
+    static std::vector<rooms::Profile> s_rooms;
+    static bool s_rooms_loaded = false;
+    static int s_room_sel = 0;
+    if (!s_rooms_loaded)
+    {
+        s_rooms = rooms::list();
+        s_rooms_loaded = true;
+    }
+    ImGui::TextUnformatted("Room");
+    std::vector<std::string> room_names;
+    room_names.push_back("(unsaved / none)");
+    for (const rooms::Profile &r : s_rooms)
+        room_names.push_back(r.name);
+    s_room_sel = 0;
+    for (std::size_t i = 0; i < s_rooms.size(); ++i)
+        if (s_rooms[i].id == st.room_eq_active_id)
+            s_room_sel = (int)i + 1;
+    std::vector<const char *> room_ptrs;
+    for (const std::string &n : room_names)
+        room_ptrs.push_back(n.c_str());
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##rq_room", room_ptrs[s_room_sel]))
+    {
+        for (int i = 0; i < (int)room_ptrs.size(); ++i)
+        {
+            const bool selected = i == s_room_sel;
+            if (ImGui::Selectable(room_ptrs[i], selected))
+            {
+                if (i == 0)
+                    rooms::deactivate(state.settings);
+                else
+                    rooms::activate(state.settings, s_rooms[(std::size_t)i - 1].id);
+                save_settings(state.settings);
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (s_room_sel > 0)
+    {
+        const rooms::Profile &active = s_rooms[(std::size_t)s_room_sel - 1];
+        room_help(active.device.empty()
+                      ? "Bound to no particular output."
+                      : ("Bound to " + active.device).c_str());
+        if (ui_ghost_button("Delete this room", ImVec2(170.0f * m.layout_scale, 0.0f)))
+        {
+            rooms::remove(active.id);
+            rooms::deactivate(state.settings);
+            save_settings(state.settings);
+            s_rooms = rooms::list();
+        }
+    }
+    if (ImGui::Checkbox("Switch rooms with the output device", &st.room_eq_auto_room))
+        save_settings(st);
+    const std::string dev_label = rooms::output_device_label();
+    room_help(dev_label.empty() ? "Output device: unknown (switch rooms manually)."
+                                : ("Listening on: " + dev_label).c_str());
 
     room_gap();
     ImGui::TextUnformatted("Microphone");
@@ -480,7 +553,32 @@ void draw_room_eq_panel(AppState &state)
             for (const dsp::Band &b : status.bands)
                 ImGui::Text("%7.1f Hz   %+5.1f dB   Q %.2f", b.freq, b.gain, b.q);
             ImGui::EndChild();
-            if (ImGui::Button("Apply correction", ImVec2(190.0f * m.layout_scale, 0.0f)))
+            static std::string s_save_name;
+            if (s_save_name.empty())
+                s_save_name = "Room";
+            ImGui::SetNextItemWidth(190.0f * m.layout_scale);
+            ImGui::InputTextWithHint("##rq_save_name", "Room name", &s_save_name);
+            ImGui::SameLine();
+            if (ImGui::Button("Save as room", ImVec2(150.0f * m.layout_scale, 0.0f)))
+            {
+                if (roomeq::apply(state))
+                {
+                    std::string error;
+                    if (rooms::save_current(state.settings,
+                                            s_save_name.empty() ? "Room" : s_save_name, error))
+                    {
+                        save_settings(state.settings);
+                        s_rooms = rooms::list();
+                        ui_notify(UiNotifyType::Info, "Room correction",
+                                  "Saved as \"" + s_save_name + "\" and applied.", 5.0f);
+                    }
+                    else
+                    {
+                        ui_notify(UiNotifyType::Error, "Room correction", error, 6.0f);
+                    }
+                }
+            }
+            if (ImGui::Button("Apply without saving", ImVec2(190.0f * m.layout_scale, 0.0f)))
             {
                 if (roomeq::apply(state))
                     ui_notify(UiNotifyType::Info, "Room correction",

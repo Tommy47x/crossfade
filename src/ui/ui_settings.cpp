@@ -235,7 +235,9 @@ void save_settings(const Settings &settings)
         << ",\"rq_target2\":\"" << json_escape(settings.room_eq_target) << "\""
         << ",\"rq_strength\":" << settings.room_eq_strength
         << ",\"rq_label\":\"" << json_escape(settings.room_eq_label) << "\""
-        << ",\"rq_residual\":" << settings.room_eq_residual_db << ",\"rq_freq\":[";
+        << ",\"rq_residual\":" << settings.room_eq_residual_db
+        << ",\"rq_room_active\":\"" << json_escape(settings.room_eq_active_id) << "\""
+        << ",\"rq_auto_room\":" << (settings.room_eq_auto_room ? "true" : "false") << ",\"rq_freq\":[";
     for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
         out << (i ? "," : "") << settings.room_eq_bands[i].freq;
     out << "],\"rq_gain\":[";
@@ -445,6 +447,9 @@ Settings load_settings()
         s.room_eq_strength = std::max(0.3f, std::min(1.5f, s.room_eq_strength));
         s.room_eq_label = get_str("rq_label");
         s.room_eq_residual_db = get_float("rq_residual");
+        s.room_eq_active_id = get_str("rq_room_active");
+        if (json.find("\"rq_auto_room\"") != std::string::npos)
+            s.room_eq_auto_room = get_bool("rq_auto_room");
         s.discord_client_id = get_str("discord_client_id");
         if (json.find("\"server_sync\"") != std::string::npos)
             s.server_sync = get_bool("server_sync");

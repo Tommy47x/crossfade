@@ -502,6 +502,14 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
     for (std::size_t i = 0; i < db_len; ++i)
         m.db[i] -= offset;
 
+    // How far up the *recording* actually has signal, independent of the mask.
+    for (std::size_t i = db_len; i-- > 0;)
+        if (trusted[i] && m.db[i] > -20.0)
+        {
+            m.content_hi_hz = grid.hz[i];
+            break;
+        }
+
     // Clean the mask: a real response is contiguous, while a single noise bin
     // can pass both tests by chance (and would then attract a filter).
     if (db_len >= 7)
@@ -631,8 +639,8 @@ double correction_taper(double f)
     if (f <= 10000.0)
         return 0.85 - 0.25 * std::log2(f / 2000.0) / std::log2(5.0);
     if (f <= 20000.0)
-        return 0.60 - 0.45 * std::log2(f / 10000.0);
-    return 0.0;
+        return 0.60 - 0.15 * std::log2(f / 10000.0);
+    return 0.45;
 }
 } // namespace
 

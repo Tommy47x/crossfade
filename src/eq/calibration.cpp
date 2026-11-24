@@ -4,6 +4,7 @@
 #include "eq_server.h"
 #include "mpvplayer.h"
 #include "party_net.h"
+#include "rooms.h"
 #include "paths.h"
 #include "ui.h"
 
@@ -52,14 +53,10 @@ double now_sec()
 
 dsp::SweepSpec default_spec()
 {
+    // Single source of truth: the defaults live on SweepSpec. (This used to
+    // duplicate them, which silently kept an older 30-17k, 6 s sweep.)
     dsp::SweepSpec s;
     s.sample_rate = 48000;
-    s.f1 = 30.0;
-    s.f2 = 17000.0;
-    s.seconds = 6.0;
-    s.lead_in = 0.8;
-    s.tail = 1.2;
-    s.amplitude = 0.30f;
     return s;
 }
 
@@ -198,7 +195,10 @@ dsp::DesignLimits limits_for(const std::string &mic, float strength)
     // A phone below ~90 Hz is guesswork even with the built-in profile, and
     // its top octave is mostly mic roll-off.
     l.lo_hz = phone ? 90.0 : 40.0;
-    l.hi_hz = phone ? 12000.0 : 16000.0;
+    // A full-range driver speaker needs the top octave. The window is the
+    // maximum; the trust mask and the mic calibration stop it where the
+    // measurement actually runs out.
+    l.hi_hz = 20000.0;
     l.max_bands = 12;
     l.max_boost_db = 3.0; // boosting room dips usually makes things worse
     l.max_cut_db = -12.0;
@@ -547,6 +547,8 @@ void end_of_measure(AppState &state)
 void init()
 {
     ensure_dir();
+    rooms::init();
+    rooms::refresh_output_device();
 }
 
 void set_wake(void (*fn)())
@@ -558,6 +560,24 @@ void set_wake(void (*fn)())
 void tick(AppState &state, const MpvPlayer &player)
 {
     const double now = now_sec();
+
+    // Output-device tracking for automatic room switching. A tiny pactl query
+    // every few seconds; nothing happens unless a saved room is bound to the
+    // new device.
+    static double next_device_check = 0.0;
+    if (now >= next_device_check)
+    {
+        next_device_check = now + 10.0;
+        const std::string dev = rooms::refresh_output_device();
+        if (!dev.empty() && state.settings.room_eq_auto_room)
+        {
+            const std::string id = rooms::match_device(dev);
+            if (!id.empty() && id != state.settings.room_eq_active_id &&
+                rooms::activate(state.settings, id))
+                save_settings(state.settings);
+        }
+    }
+
     if (g_probe)
         g_probe->process_events();
     if (g_server_stop_at > 0.0 && now >= g_server_stop_at)
@@ -749,6 +769,7 @@ Status status()
     s.residual_after_db = g_design.residual_rms_db;
     s.correct_lo_hz = g_correct_lo_hz;
     s.correct_hi_hz = g_correct_hi_hz;
+    s.content_hi_hz = g_meas.content_hi_hz;
     if (g_has_result)
     {
         s.hz = g_grid.hz;

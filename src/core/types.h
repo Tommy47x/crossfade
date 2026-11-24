@@ -332,6 +332,10 @@ struct Settings
     std::string room_eq_label;
     // Residual deviation from the target after correction, dB RMS.
     float room_eq_residual_db = 0.0f;
+    // Saved room profile currently applied ("" = unsaved correction).
+    std::string room_eq_active_id;
+    // Switch the saved room automatically when the output device changes.
+    bool room_eq_auto_room = true;
 
     // Discord Rich Presence: application client id (empty = off). Also
     // overridable via P100_DISCORD_CLIENT_ID.
@@ -392,6 +396,8 @@ struct Settings
                room_eq_strength == o.room_eq_strength &&
                room_eq_label == o.room_eq_label &&
                room_eq_residual_db == o.room_eq_residual_db &&
+               room_eq_active_id == o.room_eq_active_id &&
+               room_eq_auto_room == o.room_eq_auto_room &&
                discord_client_id == o.discord_client_id &&
                server_sync == o.server_sync && party == o.party;
     }

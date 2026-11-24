@@ -14,7 +14,7 @@ struct SweepSpec
 {
     int sample_rate = 48000;
     double f1 = 25.0;          // Hz
-    double f2 = 19000.0;       // Hz
+    double f2 = 22000.0;       // Hz (trusted to ~20 kHz)
     double seconds = 4.0;      // one sweep, excluding lead-in/tail
     double amplitude = 0.30;   // linear peak (~ -10.5 dBFS)
     double lead_in = 0.8;      // silence before the first sweep, seconds
@@ -77,6 +77,10 @@ struct Measurement
     // spreads evenly and sits near ~5. This catches a recording made without
     // the sweep far more reliably than any level check.
     double ir_peak_ratio = 0.0;
+    // Highest frequency the recording itself still carries (midband -20 dB),
+    // independent of the trust mask. Tells "the mic/path cannot hear the
+    // highs" apart from "we chose not to correct them".
+    double content_hi_hz = 0.0;
     int clipped = 0;
     int repeats_used = 1;
     std::vector<double> db;  // deconvolved magnitude, normalised at midband

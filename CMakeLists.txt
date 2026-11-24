@@ -76,6 +76,7 @@ set(SOURCES
     src/dsp/room_eq.cpp
     src/eq/eq_server.cpp
     src/eq/calibration.cpp
+    src/eq/rooms.cpp
     src/ui/ui_helpers.cpp
     src/ui/format.cpp
     src/ui/playlists_io.cpp
@@ -342,6 +343,11 @@ if(CROSSFADE_BUILD_TESTS)
     p100_test(test_settings)
     add_test(NAME settings COMMAND test_settings)
 
+    add_executable(test_rooms tests/test_rooms.cpp
+        src/eq/rooms.cpp src/data/paths.cpp)
+    p100_test(test_rooms)
+    add_test(NAME rooms COMMAND test_rooms)
+
     add_executable(test_version_compare tests/test_version_compare.cpp
         src/net/version_compare.cpp)
     p100_test(test_version_compare)
@@ -416,7 +422,7 @@ if(CROSSFADE_BUILD_TESTS)
         foreach(tgt test_party_link test_party_queue test_party_util test_library
                     test_crossfade test_cache test_json test_session test_playlists
                     test_settings test_studio_project test_version_compare test_sha256
-                    test_room_eq)
+                    test_room_eq test_rooms)
             target_compile_options(${tgt} PRIVATE ${CROSSFADE_WARNINGS})
         endforeach()
     endif()
