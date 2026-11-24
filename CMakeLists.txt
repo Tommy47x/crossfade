@@ -195,6 +195,10 @@ if(P100_WIN)
         ws2_32
         iphlpapi
         bcrypt
+        # httplib uses the Windows chain verifier when OpenSSL is enabled; its
+        # #pragma comment(lib, "crypt32") only applies to MSVC, so MinGW needs
+        # the library on the link line.
+        crypt32
         shell32
         advapi32
         runtimeobject
