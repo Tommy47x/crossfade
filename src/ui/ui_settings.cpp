@@ -231,6 +231,7 @@ void save_settings(const Settings &settings)
         << ",\"rq_preamp\":" << settings.room_eq_preamp
         << ",\"rq_bass\":" << settings.room_eq_bass_db
         << ",\"rq_treble\":" << settings.room_eq_treble_db
+        << ",\"rq_max_bands\":" << std::max(6, std::min(32, settings.room_eq_max_bands))
         << ",\"rq_mic\":\"" << json_escape(settings.room_eq_mic) << "\""
         << ",\"rq_target2\":\"" << json_escape(settings.room_eq_target) << "\""
         << ",\"rq_strength\":" << settings.room_eq_strength
@@ -431,6 +432,9 @@ Settings load_settings()
         s.room_eq_preamp = std::max(-24.0f, std::min(0.0f, get_float("rq_preamp")));
         s.room_eq_bass_db = std::max(-6.0f, std::min(6.0f, get_float("rq_bass")));
         s.room_eq_treble_db = std::max(-6.0f, std::min(6.0f, get_float("rq_treble")));
+        s.room_eq_max_bands = std::max(6, std::min(32, (int)std::lround(get_float("rq_max_bands"))));
+        if (s.room_eq_max_bands != 20 && s.room_eq_max_bands != 32)
+            s.room_eq_max_bands = 12;
         s.room_eq_mic = get_str("rq_mic");
         if (s.room_eq_mic == "galaxy_s24") // profile removed
             s.room_eq_mic = "phone_generic";

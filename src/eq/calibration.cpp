@@ -102,6 +102,9 @@ std::vector<double> g_target;
 std::vector<double> g_corrected;
 dsp::Design g_design;
 double g_before_db = 0.0;
+int g_max_bands = 12;
+std::vector<double> g_target_base;
+std::vector<double> g_tilt;
 double g_correct_lo_hz = 0.0;
 double g_correct_hi_hz = 0.0;
 int g_session = 0;
@@ -121,7 +124,9 @@ struct JobResult
     std::string error;
     dsp::Measurement meas;
     std::vector<double> smooth;
-    std::vector<double> target;
+    std::vector<double> target;      // base + house curve, for display
+    std::vector<double> target_base; // trend / flat target
+    std::vector<double> tilt;        // house curve only
     std::vector<double> corrected;
     dsp::Design design;
     double before_db = 0.0;
@@ -188,7 +193,7 @@ std::vector<dsp::CalPoint> load_cal(const std::string &mic, std::string &error)
     return pts;
 }
 
-dsp::DesignLimits limits_for(const std::string &mic, float strength)
+dsp::DesignLimits limits_for(const std::string &mic, float strength, int max_bands)
 {
     dsp::DesignLimits l;
     const bool phone = (mic == "phone_generic");
@@ -199,7 +204,7 @@ dsp::DesignLimits limits_for(const std::string &mic, float strength)
     // maximum; the trust mask and the mic calibration stop it where the
     // measurement actually runs out.
     l.hi_hz = 20000.0;
-    l.max_bands = 12;
+    l.max_bands = std::max(6, std::min(32, max_bands));
     l.max_boost_db = 3.0; // boosting room dips usually makes things worse
     l.max_cut_db = -12.0;
     l.strength = std::max(0.3f, std::min(1.5f, strength));
@@ -353,7 +358,7 @@ void start_job(std::vector<float> samples, int rate)
     const std::string eff_mic = resolve_mic(g_mic);
     std::string cal_error;
     const std::vector<dsp::CalPoint> cal = load_cal(eff_mic, cal_error);
-    const dsp::DesignLimits limits = limits_for(eff_mic, g_strength);
+    const dsp::DesignLimits limits = limits_for(eff_mic, g_strength, g_max_bands);
     g_effective_mic = eff_mic;
 
     std::thread worker([samples = std::move(samples), rate, session, spec, grid, kind, cal,
@@ -369,6 +374,8 @@ void start_job(std::vector<float> samples, int rate)
             r.smooth = dsp::smooth_octave(grid, r.meas.db, 1.0 / 6.0);
             const std::vector<double> base = dsp::target_curve(grid, kind, r.smooth);
             const std::vector<double> tilt = dsp::house_curve(grid, kind);
+            r.target_base = base;
+            r.tilt = tilt;
             r.target = base;
             for (std::size_t i = 0; i < r.target.size() && i < tilt.size(); ++i)
                 r.target[i] += tilt[i];
@@ -435,6 +442,8 @@ void finish_job()
     g_meas = r.meas;
     g_smooth = r.smooth;
     g_target = r.target;
+    g_target_base = r.target_base;
+    g_tilt = r.tilt;
     g_corrected = r.corrected;
     g_design = r.design;
     g_before_db = r.before_db;
@@ -640,6 +649,7 @@ bool start_phone(AppState &state, std::string &error)
     g_grid = default_grid();
     g_mic = state.settings.room_eq_mic;
     g_strength = state.settings.room_eq_strength;
+    g_max_bands = state.settings.room_eq_max_bands;
     g_target_kind = target_kind_of(state.settings.room_eq_target);
     g_cal = load_cal(g_mic, error);
     if (!error.empty())
@@ -684,6 +694,7 @@ bool start_pc_mic(AppState &state, const std::string &device, std::string &error
     g_grid = default_grid();
     g_mic = state.settings.room_eq_mic;
     g_strength = state.settings.room_eq_strength;
+    g_max_bands = state.settings.room_eq_max_bands;
     g_target_kind = target_kind_of(state.settings.room_eq_target);
     g_cal = load_cal(g_mic, error);
     if (!error.empty())
@@ -767,6 +778,7 @@ Status status()
     s.sample_rate = g_spec.sample_rate;
     s.residual_before_db = g_before_db;
     s.residual_after_db = g_design.residual_rms_db;
+    s.max_bands = g_max_bands;
     s.correct_lo_hz = g_correct_lo_hz;
     s.correct_hi_hz = g_correct_hi_hz;
     s.content_hi_hz = g_meas.content_hi_hz;
@@ -781,6 +793,42 @@ Status status()
         s.mic = g_effective_mic;
     }
     return s;
+}
+
+bool redesign(AppState &state)
+{
+    if (!g_has_result || g_smooth.size() != g_grid.hz.size())
+        return false;
+    const std::string eff = g_effective_mic.empty() ? resolve_mic(g_mic) : g_effective_mic;
+    const dsp::TargetKind kind = target_kind_of(state.settings.room_eq_target);
+    const std::vector<double> base = dsp::target_curve(g_grid, kind, g_smooth);
+    const std::vector<double> tilt = dsp::house_curve(g_grid, kind);
+    g_target_base = base;
+    g_tilt = tilt;
+    g_target = base;
+    for (std::size_t i = 0; i < g_target.size() && i < tilt.size(); ++i)
+        g_target[i] += tilt[i];
+
+    g_strength = state.settings.room_eq_strength;
+    g_target_kind = kind;
+    dsp::DesignLimits limits = limits_for(eff, g_strength, state.settings.room_eq_max_bands);
+    g_design = dsp::design(g_grid, g_smooth, g_target_base, limits, g_spec.sample_rate,
+                           g_meas.valid, g_tilt);
+    g_corrected = g_design.corrected_db;
+    g_max_bands = limits.max_bands;
+
+    double sse = 0.0;
+    int n = 0;
+    for (std::size_t i = 0; i < g_grid.hz.size(); ++i)
+        if (g_grid.hz[i] >= limits.lo_hz && g_grid.hz[i] <= limits.hi_hz &&
+            (g_meas.valid.empty() || g_meas.valid[i]))
+        {
+            const double e = g_target[i] - g_smooth[i];
+            sse += e * e;
+            ++n;
+        }
+    g_before_db = n ? std::sqrt(sse / n) : 0.0;
+    return true;
 }
 
 void close_page()
@@ -823,6 +871,8 @@ void reset_result()
 {
     g_has_result = false;
     g_effective_mic.clear();
+    g_target_base.clear();
+    g_tilt.clear();
     g_correct_lo_hz = 0.0;
     g_correct_hi_hz = 0.0;
     g_design = dsp::Design{};

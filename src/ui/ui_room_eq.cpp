@@ -458,6 +458,8 @@ void draw_room_eq_panel(AppState &state)
     {
         st.room_eq_target = kTargetIds[target];
         save_settings(st);
+        if (status.has_result)
+            roomeq::redesign(state);
     }
     room_help(target == 3
                   ? "Flat flattens the whole band. It removes the room's bass gain and usually "
@@ -476,7 +478,25 @@ void draw_room_eq_panel(AppState &state)
     {
         st.room_eq_strength = strength == 0 ? 0.6f : (strength == 2 ? 1.3f : 1.0f);
         save_settings(st);
+        if (status.has_result)
+            roomeq::redesign(state);
     }
+
+    ImGui::TextUnformatted("Filter detail");
+    static const char *kDetailLabels[] = {"12 filters (default)", "20 filters", "32 filters"};
+    static const int kDetailValues[] = {12, 20, 32};
+    int detail = st.room_eq_max_bands == 20 ? 1 : (st.room_eq_max_bands == 32 ? 2 : 0);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo("##rq_detail", &detail, kDetailLabels, 3))
+    {
+        st.room_eq_max_bands = kDetailValues[detail];
+        save_settings(st);
+        if (status.has_result)
+            roomeq::redesign(state);
+    }
+    room_help("How many filters the fit may use. More is a closer fit to the same target, not a "
+              "stronger correction. Changing it re-fits the result above instantly; press Apply "
+              "again to hear it.");
 
     ImGui::TextUnformatted("Tone (live)");
     ImGui::SetNextItemWidth(-1.0f);
@@ -532,8 +552,13 @@ void draw_room_eq_panel(AppState &state)
             ImGui::SeparatorText("Result");
             draw_response_graph(status);
             const int bands = (int)status.bands.size();
-            ImGui::Text("%d filters · %.1f dB RMS -> %.1f dB RMS", bands, status.residual_before_db,
-                        status.residual_after_db);
+            if (status.max_bands > 0 && bands >= status.max_bands)
+                ImGui::Text("%d filters (limit %d) · %.1f dB RMS -> %.1f dB RMS", bands,
+                            status.max_bands, status.residual_before_db,
+                            status.residual_after_db);
+            else
+                ImGui::Text("%d filters (converged) · %.1f dB RMS -> %.1f dB RMS", bands,
+                            status.residual_before_db, status.residual_after_db);
             if (!status.mic.empty())
                 ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y,
                                           ui_c().text_muted.z, 1.0f),

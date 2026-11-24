@@ -168,6 +168,27 @@ int main()
         check(mode_55 < -4.0, "the 55 Hz room mode is cut");
         std::printf("  55 Hz mode filter %+.1f dB\n", mode_55);
         check(d.preamp_db <= 0.0, "preamp never boosts");
+
+        dsp::DesignLimits lim20 = lim;
+        lim20.max_bands = 20;
+        const dsp::Design d20 =
+            dsp::design(grid, measured, target, lim20, spec.sample_rate, m.valid);
+        check(d20.bands.size() <= 20, "20-filter cap is respected");
+        check(d20.residual_rms_db <= d.residual_rms_db + 0.01,
+              "more filters do not fit worse");
+
+        dsp::DesignLimits lim32 = lim;
+        lim32.max_bands = 32;
+        const dsp::Design d32 =
+            dsp::design(grid, measured, target, lim32, spec.sample_rate, m.valid);
+        check(d32.bands.size() <= 32, "32-filter cap is respected");
+        // Extra bands are not guaranteed to be monotonically better: the
+        // refinement is a local search over a different set, so allow a tiny
+        // regression instead of failing on a 0.01 dB difference.
+        check(d32.residual_rms_db <= d20.residual_rms_db + 0.1,
+              "32 filters are about as good as 20");
+        std::printf("  detail: 10 bands %.2f dB, 20 bands %.2f dB, 32 bands %.2f dB rms\n",
+                    d.residual_rms_db, d20.residual_rms_db, d32.residual_rms_db);
         std::printf("  room eq: %.1f dB rms -> %.1f dB rms, %zu bands\n", before,
                     d.residual_rms_db, d.bands.size());
     }

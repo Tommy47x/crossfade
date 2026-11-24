@@ -46,6 +46,8 @@ struct Status
     std::vector<char> valid;
     // Microphone profile actually used for the result.
     std::string mic;
+    // Filter ceiling the last design was fitted with.
+    int max_bands = 12;
     // The phone page is still being served (so it can measure again).
     bool page_open = false;
     // Range that was actually corrected: the trusted part of the measurement
@@ -80,6 +82,9 @@ bool apply(AppState &state);
 void forget(AppState &state);
 // Drops the pending (unapplied) measurement so a new one can start cleanly.
 void reset_result();
+// Re-fits the current measurement with the settings' filter ceiling. No new
+// measurement needed; cheap enough for the main thread.
+bool redesign(AppState &state);
 // Closes the phone page but keeps the current result on screen.
 void close_page();
 // Persists a REW-style .cal file and selects it as the microphone profile.

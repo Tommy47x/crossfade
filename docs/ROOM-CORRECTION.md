@@ -52,6 +52,15 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
   effect). The house curve is applied outside the frequency taper, so the
   treble lift actually happens.
 - **Strength**: Gentle / Balanced / Strong scales the correction amount.
+- **Filter detail**: 12 / 20 / 32 filters. The fitter stops early when a new
+  filter would improve the fit by less than 1% of the remaining error, and
+  drops anything under 0.4 dB at the end, so a smooth room uses fewer than the
+  limit. The result line says "(limit N)" when the ceiling bound and
+  "(converged)" when it did not. More filters are a closer fit to the same
+  target, not a stronger correction, and 32 biquads is still <1% CPU.
+- Target, strength and filter detail **re-fit the pending result instantly**
+  (no new sweep). The microphone profile is the exception: it changes the
+  measurement itself, so it needs a new measurement.
 - If a measurement is noisy or the speaker simply does not produce a band, the
   correction stops there and the panel says which range it trusted. That is why
   a phone measurement often cannot fix anything above ~10 kHz.

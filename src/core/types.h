@@ -322,6 +322,9 @@ struct Settings
     // new measurement; -6..+6 dB.
     float room_eq_bass_db = 0.0f;
     float room_eq_treble_db = 0.0f;
+    // Filter ceiling for the fit: 12, 20 or 32. More bands fit a lumpy curve
+    // more closely; they do not make the correction more aggressive.
+    int room_eq_max_bands = 12;
     // Microphone profile: "" (flat), "phone_generic", "custom".
     std::string room_eq_mic;
     // Correction target: "balanced" (default), "warm" or "flat".
@@ -392,6 +395,7 @@ struct Settings
                room_eq_preamp == o.room_eq_preamp && room_eq_mic == o.room_eq_mic &&
                room_eq_bass_db == o.room_eq_bass_db &&
                room_eq_treble_db == o.room_eq_treble_db &&
+               room_eq_max_bands == o.room_eq_max_bands &&
                room_eq_target == o.room_eq_target &&
                room_eq_strength == o.room_eq_strength &&
                room_eq_label == o.room_eq_label &&
