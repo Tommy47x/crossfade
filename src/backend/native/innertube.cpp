@@ -43,6 +43,33 @@ std::vector<ResolveTrace> g_traces;
 constexpr long long kSessionTtlSec = 3 * 60 * 60;
 constexpr std::size_t kTraceMax = 64;
 
+std::string json_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20)
+            {
+                char b[8];
+                std::snprintf(b, sizeof(b), "\\u%04x", c);
+                out += b;
+            }
+            else
+                out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
 long long age_seconds(const Session &s)
 {
     if (!s.valid)
@@ -209,9 +236,9 @@ bool pick_format(const jsonv::Value &root, StreamResult &out, ResolveTrace &trac
     return false;
 }
 
-bool attempt(const std::string &video_id, StreamResult &out, bool refresh)
+bool player_call(const std::string &video_id, bool refresh, jsonv::Value &root,
+                 ResolveTrace &trace)
 {
-    ResolveTrace &trace = out.trace;
     trace.video_id = video_id;
     trace.epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -258,7 +285,6 @@ bool attempt(const std::string &video_id, StreamResult &out, bool refresh)
         return false;
     }
 
-    jsonv::Value root;
     std::string parse_error;
     if (!jsonv::Value::parse(res.body, root, parse_error))
     {
@@ -267,6 +293,15 @@ bool attempt(const std::string &video_id, StreamResult &out, bool refresh)
     }
     trace.status = root["playabilityStatus"].str("status");
     trace.reason = root["playabilityStatus"].str("reason");
+    return true;
+}
+
+bool attempt(const std::string &video_id, StreamResult &out, bool refresh)
+{
+    ResolveTrace &trace = out.trace;
+    jsonv::Value root;
+    if (!player_call(video_id, refresh, root, trace))
+        return false;
     if (trace.status != "OK")
     {
         trace.error = trace.reason.empty() ? ("playability " + trace.status)
@@ -329,6 +364,70 @@ StreamResult resolve_audio(const std::string &video_id)
         out.error = out.trace.error;
     record(out.trace);
     return out;
+}
+
+bool fetch_meta(const std::string &video_id, std::string &json, std::string &error)
+{
+    if (video_id.size() != 11)
+    {
+        error = "Invalid video id";
+        return false;
+    }
+    if (!http_available())
+    {
+        error = "native backend needs TLS (OpenSSL)";
+        return false;
+    }
+    ResolveTrace trace;
+    jsonv::Value root;
+    if (!player_call(video_id, false, root, trace))
+    {
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+    const jsonv::Value &vd = root["videoDetails"];
+    if (vd.is_null())
+    {
+        error = "Video not found";
+        record(trace);
+        return false;
+    }
+    const std::string title = vd.str("title");
+    if (title.empty())
+    {
+        error = "Video not found";
+        record(trace);
+        return false;
+    }
+    if (vd.boolean("isLive"))
+    {
+        error = "Live streams are not supported";
+        record(trace);
+        return false;
+    }
+    const std::string author = vd.str("author");
+    const long long length = vd["lengthSeconds"].as_int();
+    std::string thumb;
+    const jsonv::Value &thumbs = vd["thumbnail"]["thumbnails"];
+    if (thumbs.is_array())
+        for (std::size_t i = 0; i < thumbs.size(); ++i)
+        {
+            const std::string u = thumbs.at(i).str("url");
+            if (!u.empty())
+                thumb = u;
+        }
+    if (thumb.empty())
+        thumb = "https://i.ytimg.com/vi/" + video_id + "/hqdefault.jpg";
+
+    json = "{\"ok\":true,\"id\":\"" + json_escape(video_id) +
+           "\",\"title\":\"" + json_escape(title) +
+           "\",\"artist\":\"" + json_escape(author) +
+           "\",\"durationSec\":" + std::to_string(length) +
+           ",\"videoType\":\"" + json_escape(vd.str("musicVideoType")) +
+           "\",\"thumbUrl\":\"" + json_escape(thumb) + "\"}";
+    record(trace);
+    return true;
 }
 
 SessionInfo session_info()

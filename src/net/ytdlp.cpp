@@ -1894,8 +1894,16 @@ static std::string send_command_job(BackendChannel &ch, const std::string &cmd)
     return response;
 }
 
+// Handled entirely in C++ when it succeeds; false means "ask Python".
+static bool native_handle_command(const std::string &cmd, std::string &out);
+
 static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
 {
+    {
+        std::string native_out;
+        if (native_handle_command(cmd, native_out))
+            return native_out;
+    }
     // A command can arrive while the main worker is still importing Python
     // (session restore does exactly this). Wait on the caller's thread rather
     // than making the UI wait during startup. Optional channels are only
@@ -3645,6 +3653,23 @@ bool native_backend_enabled()
     if (env && *env)
         return std::string(env) != "python";
     return g_native_backend.load() != 0;
+}
+
+static bool native_handle_command(const std::string &cmd, std::string &out)
+{
+    if (!native_backend_enabled() || !native::http_available())
+        return false;
+    const std::size_t sp = cmd.find(' ');
+    const std::string word = cmd.substr(0, sp);
+    const std::string arg =
+        sp == std::string::npos ? std::string() : cmd.substr(sp + 1);
+    if (word == "meta" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::fetch_meta(arg, out, error))
+            return true;
+    }
+    return false;
 }
 
 static std::string try_native_stream(const std::string &video_id)

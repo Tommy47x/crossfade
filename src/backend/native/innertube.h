@@ -57,6 +57,11 @@ struct SessionInfo
 // prefetch pool.
 StreamResult resolve_audio(const std::string &video_id);
 
+// Metadata-only lookup (title/artist/duration/thumbnail) from the same player
+// response, no stream selection. Produces the Python backend's "meta" JSON
+// shape. Returns false when the caller should fall back to Python.
+bool fetch_meta(const std::string &video_id, std::string &json, std::string &error);
+
 SessionInfo session_info();
 void reset_session();
 
