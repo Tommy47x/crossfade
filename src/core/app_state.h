@@ -17,6 +17,9 @@ struct AppState
     // Current tab
     Tab current_tab = Tab::Home;
     bool sidebar_collapsed = false;
+    // True when the window's bottom edge sits at the screen bottom. Used to
+    // keep interactive controls out of shell/dock autohide input zones.
+    bool window_at_screen_bottom = false;
     // Network-fed toggles / list source. Atomic: backend search threads
     // (and radio completion) set this from worker threads.
     std::atomic<PlaylistSource> current_playlist_source{PlaylistSource::HOME};
@@ -251,6 +254,9 @@ struct AppState
     bool show_backend_debug = false;
     // Party view: fullscreen QR takeover. Session-only; never persisted.
     bool party_fullscreen = false;
+    // Lyrics immersive view: full-window, effects-driven lyrics takeover.
+    // Session-only; never persisted.
+    bool lyrics_immersive = false;
     // Set by the Party tab's "Party settings" shortcut so the Settings page
     // scrolls straight to the Party section on the next frame.
     bool settings_focus_party = false;
@@ -350,6 +356,7 @@ struct AppState
     std::string pending_play_title;
     std::string pending_play_artist;
     std::string pending_play_thumbnail_url;
+    int pending_play_duration_sec = 0; // metadata duration, used to validate recorded audio
     std::string pending_video_id;
     std::string pending_video_url;
     std::atomic<bool> pending_manual_play{false};

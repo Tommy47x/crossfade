@@ -57,6 +57,7 @@ static void play_album_track(AppState &state, int index)
     state.pending_play_title = t.title;
     state.pending_play_artist = t.artist;
     state.pending_play_thumbnail_url = state.current_thumbnail_url;
+    state.pending_play_duration_sec = t.duration_sec;
     state.pending_video_id = t.id;
     state.pending_video_url = playable_track_url(t.id, t.url);
     state.pending_manual_play = true;

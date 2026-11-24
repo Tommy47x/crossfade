@@ -233,6 +233,10 @@ const std::vector<TunableDef> &build_defs()
              68.0f, 40.0f, 200.0f),
         TUNE("layout.bottom_h", "Layout", "Bottom bar height", "Player bar height.",
              92.0f, 60.0f, 260.0f),
+        TUNE("layout.bottom_safe_area", "Layout", "Bottom safe area",
+             "Inactive band at the screen bottom when the window touches it "
+             "(for dock autohide hot zones). Set to 0 if not needed.",
+             96.0f, 0.0f, 220.0f),
         TUNE("layout.content_pad", "Layout", "Content padding",
              "Horizontal padding of list pages.", 24.0f, 0.0f, 120.0f),
         TUNE("layout.lyrics_min", "Layout", "Lyrics min width",

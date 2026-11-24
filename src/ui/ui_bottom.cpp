@@ -8,6 +8,7 @@
 #include "mpvplayer.h"
 #include "texture.h"
 #include "power.h"
+#include "shortcuts.h"
 
 #include <algorithm>
 #include <chrono>
@@ -113,6 +114,38 @@ static void draw_round_control(AppState &state, const char *id, UiIcon icon, flo
     }
 }
 
+void ui_toggle_immersive_lyrics(AppState &state)
+{
+    if (state.lyrics_immersive)
+    {
+        state.lyrics_immersive = false;
+    }
+    else
+    {
+        const Track display = lyrics_display_track(state);
+        auto snap = std::atomic_load(&state.lyrics);
+        const bool usable = !display.id.empty() && snap &&
+                            snap->track_id == display.id &&
+                            snap->lyrics.ok && !snap->lyrics.none &&
+                            !snap->lyrics.lines.empty();
+        if (usable)
+        {
+            state.lyrics_immersive = true;
+            state.settings.lyrics_panel_open = true;
+            save_settings(state.settings);
+        }
+        else
+        {
+            // Let the docked panel show loading / retry / "no lyrics".
+            state.settings.lyrics_panel_open = true;
+            save_settings(state.settings);
+            state.lyrics_requested_id = state.current_track_id;
+            state.lyrics_refresh_requested = true;
+        }
+    }
+    state.repaint_requested = true;
+}
+
 void draw_bottom_bar(AppState &state, MpvPlayer &player)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -120,11 +153,10 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const UiMetrics &m = ui_m();
     const float bar_h = l.bottom_h;
     const float bar_w = io.DisplaySize.x;
-    const float bar_y = io.DisplaySize.y - bar_h;
 
     ScopedNoMinSize no_min_size;
-    ImGui::SetNextWindowPos(ImVec2(0, bar_y));
-    ImGui::SetNextWindowSize(ImVec2(bar_w, bar_h));
+    ImGui::SetNextWindowPos(l.bottom_pos);
+    ImGui::SetNextWindowSize(l.bottom_size);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_backdrop_window_bg());
@@ -152,6 +184,9 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     {
         const bool fading = state.crossfade_active;
         const bool show_incoming = fading && state.crossfade_progress >= 0.5f;
+        // The immersive takeover covers the bar; its foreground-draw-list knob
+        // and hover wave would otherwise render on top of the lyrics.
+        const bool bar_hidden = state.lyrics_immersive;
         float edge_pos = show_incoming ? (float)state.crossfade_position
                                        : (float)player.cached_time_pos();
         float edge_dur = show_incoming ? (float)state.crossfade_duration
@@ -171,14 +206,16 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
         static double s_hold_until = 0.0;   // after a seek: trust the seeked frac until mpv catches up
         static float s_hold_frac = 0.0f;
 
-        if (!seekable)
+        if (!seekable || bar_hidden)
         {
             s_edge_seeking = false;
             s_hold_until = 0.0;
         }
         const float edge_hover_h = 12.0f * m.layout_scale;
-        const bool edge_hover = have_dur && seekable && ImGui::IsMouseHoveringRect(
-            ImVec2(wp.x, wp.y), ImVec2(wp.x + ws.x, wp.y + edge_hover_h));
+        const bool edge_hover = have_dur && seekable && !bar_hidden &&
+                                ImGui::IsMouseHoveringRect(
+                                    ImVec2(wp.x, wp.y),
+                                    ImVec2(wp.x + ws.x, wp.y + edge_hover_h));
         if (edge_hover)
         {
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -300,7 +337,7 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
         // rather than a single wobbly line. ~5 sampled curves of 48 segments
         // -- a few hundred vertices, all stateless.
         const float wave_amp = 3.0f * m.layout_scale * s_hover_amt;
-        if (wave_amp > 0.15f)
+        if (!bar_hidden && wave_amp > 0.15f)
         {
             const float tt = (float)now;
             const float mid_y = wp.y + edge_h * 0.5f;
@@ -369,7 +406,7 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
             }
         }
 
-        if (s_knob_r > 0.25f)
+        if (!bar_hidden && s_knob_r > 0.25f)
         {
             const ImVec2 knob_c(wp.x + ws.x * display_frac, wp.y + edge_h * 0.5f);
             // Halo fades in as the knob grows past its resting size.
@@ -764,7 +801,7 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     // transport controls at every size.
     const float right_edge = bar_w - side_pad;
     const float icon_gap = m.space_2;
-    constexpr int kUtilityIcons = 4;
+    constexpr int kUtilityIcons = 5;
     float icon_size = std::min(m.control_h * ctrl_scale, bar_h * 0.52f);
     float icons_w = icon_size * kUtilityIcons + icon_gap * (kUtilityIcons - 1);
     const float right_min_x = center_x + center_w + m.space_3;
@@ -822,7 +859,8 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
     const float queue_x = sleep_x + icon_size + icon_gap;
     const float video_x = queue_x + icon_size + icon_gap;
     const float lyrics_x = video_x + icon_size + icon_gap;
-    const float vol_x = lyrics_x + icon_size + icon_gap;
+    const float immersive_x = lyrics_x + icon_size + icon_gap;
+    const float vol_x = immersive_x + icon_size + icon_gap;
     const float vol_y = wp.y + (bar_h - seek_h) * 0.5f;
 
     // Sleep timer (Moon icon): click opens the arm/disarm popup. Accent-tinted
@@ -919,6 +957,17 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
             state.lyrics_refresh_requested = true;
         }
     }
+
+    // Full-screen, effects-driven lyrics. Always visible; when the current
+    // (or outgoing, mid-crossfade) track has no usable lyrics yet, open the
+    // normal panel so its loading / none / error state explains why.
+    ImGui::SetCursorScreenPos(ImVec2(immersive_x, wp.y + (bar_h - icon_size) * 0.5f));
+    const std::string immersive_tip =
+        state.lyrics_immersive ? "Exit full-screen lyrics (" + shortcut_label("immersive_lyrics") + ")"
+                               : "Full-screen lyrics (" + shortcut_label("immersive_lyrics") + ")";
+    if (ui_icon_button("##lyrics_immersive", UiIcon::Expand, icon_size,
+                       state.lyrics_immersive, 0, immersive_tip.c_str()))
+        ui_toggle_immersive_lyrics(state);
 
     const int vol = state.crossfade_active
                         ? state.crossfade_user_volume

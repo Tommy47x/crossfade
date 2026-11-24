@@ -48,6 +48,7 @@ const std::vector<ShortcutDef> &build_defs()
 
         // ---- Panels --------------------------------------------------
         SC("toggle_lyrics", "Panels", "Toggle lyrics", SDLK_l, 0),
+        SC("immersive_lyrics", "Panels", "Full-screen lyrics", SDLK_RETURN, 0),
         SC("toggle_video", "Panels", "Toggle music video", SDLK_v, 0),
         SC("video_theater", "Panels", "Video theater mode", SDLK_f, 0),
         SC("toggle_sidebar", "Panels", "Toggle sidebar", SDLK_s, 0),
