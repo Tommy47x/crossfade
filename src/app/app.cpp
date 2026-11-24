@@ -1469,6 +1469,11 @@ int app_run(int argc, char **argv)
                         g_state.show_backend_debug = !g_state.show_backend_debug;
                         g_state.repaint_requested = true;
                     }
+                    else if (hit("native_backend_debug"))
+                    {
+                        g_state.show_native_backend_debug = !g_state.show_native_backend_debug;
+                        g_state.repaint_requested = true;
+                    }
                     else if (hit("settings"))
                     {
                         ui_invalidate_forward(g_state);
@@ -2772,6 +2777,7 @@ int app_run(int argc, char **argv)
             }
 
             draw_backend_debug(g_state);
+            draw_native_backend_window(g_state);
 
             // Video: the page computed the on-screen size while building the
             // UI; decode/upload the next frame now, before the ImGui draw

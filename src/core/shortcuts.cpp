@@ -58,6 +58,7 @@ const std::vector<ShortcutDef> &build_defs()
 
         // ---- Developer -----------------------------------------------
         SC("backend_debug", "Developer", "Backend debug window", SDLK_F2, 0),
+        SC("native_backend_debug", "Developer", "Native backend debug window", SDLK_F3, 0),
         SC("debug_demo", "Developer", "ImGui demo window", SDLK_d,
            SHORTCUT_MOD_CTRL | SHORTCUT_MOD_SHIFT),
     };

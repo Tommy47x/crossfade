@@ -252,6 +252,8 @@ struct AppState
     int hovered_track_frame = 0;
     // Backend debug window (live command log). Session-only; never persisted.
     bool show_backend_debug = false;
+    // Native (C++) backend: session, timings and per-resolve traces. F3.
+    bool show_native_backend_debug = false;
     // Party view: fullscreen QR takeover. Session-only; never persisted.
     bool party_fullscreen = false;
     // Lyrics immersive view: full-window, effects-driven lyrics takeover.

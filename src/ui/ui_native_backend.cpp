@@ -61,6 +61,17 @@ void small_hint(const char *text)
 }
 } // namespace
 
+void draw_native_backend_window(AppState &state)
+{
+    if (!state.show_native_backend_debug)
+        return;
+    ImGui::SetNextWindowSize(ImVec2(980.0f, 640.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Native backend", &state.show_native_backend_debug,
+                     ImGuiWindowFlags_NoCollapse))
+        draw_native_backend_panel(state);
+    ImGui::End();
+}
+
 void draw_native_backend_panel(AppState &state)
 {
     (void)state;
