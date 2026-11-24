@@ -168,10 +168,24 @@ bool ensure_cert(const std::string &ip, std::string &cert_path, std::string &key
     X509_gmtime_adj(X509_getm_notAfter(x), 60L * 60 * 24 * 3650);
     X509_set_pubkey(x, pkey);
 
-    X509_NAME *name = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               (const unsigned char *)"crossfade.local", -1, -1, 0);
+    // Build the name from scratch: X509_get_subject_name() returns a const
+    // pointer on newer OpenSSL (MSYS2 ships one), which does not compile here.
+    X509_NAME *name = X509_NAME_new();
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   (const unsigned char *)"crossfade.local", -1, -1,
+                                   0) != 1)
+    {
+        if (name)
+            X509_NAME_free(name);
+        X509_free(x);
+        EVP_PKEY_free(pkey);
+        error = "openssl: could not set the certificate name";
+        return false;
+    }
+    X509_set_subject_name(x, name);
     X509_set_issuer_name(x, name);
+    X509_NAME_free(name);
 
     X509V3_CTX v3;
     X509V3_set_ctx_nodb(&v3);
