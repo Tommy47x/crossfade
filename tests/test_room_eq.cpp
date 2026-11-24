@@ -196,6 +196,24 @@ int main()
         std::printf("  shelf: balanced %+.1f dB, flat %+.1f dB at 60 Hz\n", total_60, flat_60);
     }
 
+    // ---- dynamic target -------------------------------------------------
+    // The house curve is applied outside the frequency taper, so the treble
+    // lift survives even though measured-deviation corrections are tapered.
+    {
+        std::vector<double> flat_measure(grid.hz.size(), 0.0);
+        dsp::DesignLimits lim;
+        lim.lo_hz = 40.0;
+        lim.hi_hz = 16000.0;
+        const auto base = dsp::target_curve(grid, dsp::TargetKind::Balanced, flat_measure);
+        const auto tilt = dsp::house_curve(grid, dsp::TargetKind::Dynamic);
+        const dsp::Design d = dsp::design(grid, flat_measure, base, lim, 48000, {}, tilt);
+        const double high = grid_value(grid, d.predicted_db, 8000.0);
+        const double low = grid_value(grid, d.predicted_db, 60.0);
+        check(high > 2.0, "dynamic lifts the treble outside the taper");
+        check(low > 2.0, "dynamic lifts the bass");
+        std::printf("  dynamic: %+.1f dB at 60 Hz, %+.1f dB at 8 kHz\n", low, high);
+    }
+
     // ---- untrusted regions ---------------------------------------------
     // An impossible-looking bass peak in a region the recording cannot
     // resolve must not produce a filter there.
@@ -263,10 +281,11 @@ int main()
         check(std::fabs(grid_value(grid, curve, 1000.0)) < 0.1, "cal at mid");
         check(grid_value(grid, curve, 10.0) == 0.0, "cal is zero outside its range");
 
-        const auto s24 = dsp::builtin_mic_cal("galaxy_s24");
-        check(s24.size() > 4, "galaxy s24 profile exists");
-        check(dsp::builtin_mic_is_approximate("galaxy_s24"),
-              "galaxy s24 profile is marked approximate");
+        check(dsp::builtin_mic_cal("galaxy_s24").empty(), "the S24 profile is gone");
+        const auto phone = dsp::builtin_mic_cal("phone_generic");
+        check(phone.size() > 4, "generic phone profile exists");
+        check(dsp::builtin_mic_is_approximate("phone_generic"),
+              "generic phone profile is marked approximate");
         check(dsp::builtin_mic_cal("").empty(), "flat profile has no calibration");
     }
 

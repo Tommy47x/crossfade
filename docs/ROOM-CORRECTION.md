@@ -13,15 +13,17 @@ Settings → **Room correction**.
 2. Press **Calibrate with your phone** and scan the QR code, **or** press
    **Record with this microphone** (Linux: PulseAudio/PipeWire), **or** play the
    sweep once and upload a recording from the phone page.
-3. Review the curve: gray is what the mic heard, the thin line is the target,
-   green is the predicted result. Apply or discard.
+3. Review the curve: **orange** is what the mic heard, the **dashed blue** line
+   is the target, and the **accent-coloured** line is the predicted result.
+   Apply or discard.
 
 The page stays open after a measurement, so **Measure again** on the phone
 works without scanning a new code (it closes on cancel, "Close phone page", or
 after 30 idle minutes).
 
-The sweep pauses whatever is playing, plays three calibration sweeps at the
-current volume, and resumes playback afterwards. The three responses are
+Calibrating pauses the app's playback immediately (so you are not listening to
+music while placing the phone), plays three sweeps at the current volume, and
+resumes playback afterwards. The three responses are
 averaged, which is what makes the estimate stable and lets the app tell signal
 from noise.
 
@@ -42,13 +44,16 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
   and only corrects deviations from it. This is the important part: flattening
   the whole in-room curve (*Flat*) removes the room's bass gain and makes a good
   speaker sound thin, which is why Flat is labelled "reference" and is not the
-  default. *Warm* adds a gentle bass lift on top of Balanced.
+  default. *Warm* adds a gentle bass lift on top; *Dynamic* adds both bass and
+  a real treble lift (a pure-EQ approximation of a loudness/crystalizer
+  effect). The house curve is applied outside the frequency taper, so the
+  treble lift actually happens.
 - **Strength**: Gentle / Balanced / Strong scales the correction amount.
 - Designs up to 12 peaking filters inside a correction window (40 Hz–16 kHz for
   a calibrated mic, 90 Hz–12 kHz for a phone), with at most +3 dB of boost and
   −12 dB of cut.
-- Correction strength tapers with frequency: full below 400 Hz, ~55% at 2 kHz,
-  ~20% at 10 kHz. Above the room's transition region a single-point measurement
+- Correction strength tapers with frequency: full below 400 Hz, ~65% at 2 kHz,
+  ~30% at 10 kHz. Above the room's transition region a single-point measurement
   is dominated by comb filtering, so correcting it makes things worse.
 - Never fills a narrow null: positive corrections are capped by the 1-octave
   trend, and the fitter can only place filters where the measurement is trusted.
@@ -81,14 +86,12 @@ without the EQ trying to "fix" it.
   may apply voice processing. The page asks the browser to disable echo
   cancellation, noise suppression and AGC, but that is a request, not a
   guarantee. If no profile is selected and the measurement comes from a phone,
-  the host reads the browser's user agent and picks the matching profile (S24)
-  or the generic consumer-mic curve — it never silently assumes "flat".
-- **No S24 calibration data exists publicly.** The built-in "Galaxy S24
-  (approximate)" curve is a generic modern-flagship shape (bass roll-off,
-  presence lift, air roll-off), labelled approximate in the UI. It is there so
-  the app does not trust a phone below ~90 Hz, not because it is measured. If
-  you can measure your phone against a reference mic, export a `.cal` file and
-  import it — that always wins.
+  the generic consumer-mic curve is used — it never silently assumes "flat".
+- **No per-model phone calibration data exists publicly**, so the only built-in
+  phone curve is a generic modern-flagship shape (bass roll-off, presence lift,
+  air roll-off), labelled approximate in the UI. If you can measure your phone
+  against a reference mic, export a `.cal` file and import it — that always
+  wins.
 - **Relative, not absolute.** No SPL calibration; the curve is normalised around
   250 Hz–2 kHz.
 - **One listening position, magnitude only.** No multi-seat averaging, no phase

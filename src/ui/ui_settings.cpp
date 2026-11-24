@@ -426,11 +426,14 @@ Settings load_settings()
             s.room_eq_enabled = get_bool("rq_enabled");
         s.room_eq_preamp = std::max(-24.0f, std::min(0.0f, get_float("rq_preamp")));
         s.room_eq_mic = get_str("rq_mic");
+        if (s.room_eq_mic == "galaxy_s24") // profile removed
+            s.room_eq_mic = "phone_generic";
         // Renamed from "rq_target": pre-release builds defaulted to a flat
         // target that gutted the bass, and the old value is deliberately
         // ignored so those installs start from the safer default.
         s.room_eq_target = get_str("rq_target2");
-        if (s.room_eq_target != "warm" && s.room_eq_target != "flat")
+        if (s.room_eq_target != "warm" && s.room_eq_target != "dynamic" &&
+            s.room_eq_target != "flat")
             s.room_eq_target = "balanced";
         s.room_eq_strength = get_float("rq_strength");
         if (s.room_eq_strength <= 0.05f)

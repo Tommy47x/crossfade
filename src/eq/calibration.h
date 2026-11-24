@@ -63,7 +63,9 @@ bool start_pc_mic(AppState &state, const std::string &device, std::string &error
 // Plays the sweep once so an external recorder can capture it.
 bool play_sweep(AppState &state, std::string &error);
 
-void cancel();
+// Stops the session. Pass the state so playback paused for the measurement is
+// resumed; nullptr (shutdown) leaves playback alone.
+void cancel(AppState *state = nullptr);
 Status status();
 
 bool apply(AppState &state);

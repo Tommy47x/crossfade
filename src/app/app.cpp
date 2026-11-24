@@ -2740,7 +2740,7 @@ int app_run(int argc, char **argv)
     DLOG("shutdown: party stop");
     warm_start::stop_server();
     party_stop();
-    roomeq::cancel();
+    roomeq::cancel(nullptr);
     DLOG("shutdown: backend stop");
     cancel_backend_startup();
     if (backend_boot_thread.joinable())

@@ -318,7 +318,7 @@ struct Settings
     std::vector<EqBand> room_eq_bands;
     // Headroom for boosted bands; <= 0 dB. Applied as a volume trim.
     float room_eq_preamp = 0.0f;
-    // Microphone profile: "" (flat), "phone_generic", "galaxy_s24", "custom".
+    // Microphone profile: "" (flat), "phone_generic", "custom".
     std::string room_eq_mic;
     // Correction target: "balanced" (default), "warm" or "flat".
     std::string room_eq_target = "balanced";

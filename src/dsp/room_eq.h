@@ -110,15 +110,25 @@ enum class TargetKind
     Balanced = 0,
     // Balanced plus a gentle bass lift / treble tilt.
     Warm = 1,
+    // A stronger V-shape: bass lift and a real treble lift on top of the
+    // deviations. The house curve is applied outside the frequency taper, so
+    // the highs actually move.
+    Dynamic = 2,
     // Flatten everything in the window to 0 dB. Aggressive: it removes the
     // room's own bass gain and can sound thin.
-    Flat = 2,
+    Flat = 3,
 };
 
-// `measured_db` is required for Balanced/Warm (the target is derived from it)
-// and ignored for Flat. Pass an empty vector to fall back to Flat.
+// The base the correction aims at: the measurement's broadband trend for
+// Balanced/Warm/Dynamic, and 0 dB for Flat. Does not include the house curve.
+// `measured_db` is ignored for Flat.
 std::vector<double> target_curve(const Grid &grid, TargetKind kind,
                                  const std::vector<double> &measured_db = {});
+
+// Deliberate tonal offset on top of the base target. Zero for Balanced/Flat.
+// Unlike the measured-deviation correction this is not tapered with frequency,
+// so a treble lift really is a treble lift.
+std::vector<double> house_curve(const Grid &grid, TargetKind kind);
 
 // ---------------------------------------------------------------- design ----
 
@@ -133,7 +143,8 @@ struct DesignLimits
 {
     double lo_hz = 40.0;       // correction window
     double hi_hz = 16000.0;
-    double max_boost_db = 3.0;
+    double max_boost_db = 3.0; // boost allowed for measured deviations
+    double max_band_boost_db = 6.0; // absolute per-band cap (house curve included)
     double max_cut_db = -12.0;
     int max_bands = 12;
     // User "amount": scales every correction after the frequency taper.
@@ -154,10 +165,12 @@ struct Design
 
 // Designs parametric peaking filters that move `measured_db` toward
 // `target_db` inside the correction window. `valid` (optional, one entry per
-// grid point) marks points that are worth correcting at all.
+// grid point) marks points that are worth correcting at all. `tilt` (optional)
+// is the deliberate house curve added on top, at full strength.
 Design design(const Grid &grid, const std::vector<double> &measured_db,
               const std::vector<double> &target_db, const DesignLimits &limits,
-              int sample_rate, const std::vector<char> &valid = {});
+              int sample_rate, const std::vector<char> &valid = {},
+              const std::vector<double> &tilt = {});
 
 // |H| in dB of one peaking biquad at `f` (Audio EQ Cookbook, as implemented by
 // ffmpeg's `equalizer` filter and therefore by mpv's audio filter chain).

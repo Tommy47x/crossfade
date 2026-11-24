@@ -376,8 +376,8 @@ $("retry").addEventListener("click", () => { show("intro"); setSteps(1); $("star
 $("pick").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => uploadFile(e.target.files && e.target.files[0]));
 
-// Lets the host pick the right microphone profile (e.g. a Galaxy S24) when the
-// user has not chosen one. Body, not a query string: UAs contain spaces.
+// Lets the host pick a microphone profile when the user has not chosen one.
+// Body, not a query string: UAs contain spaces.
 fetch(base + "/hello", {
   method: "POST",
   headers: { "Content-Type": "text/plain" },

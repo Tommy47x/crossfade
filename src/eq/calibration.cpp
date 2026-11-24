@@ -91,6 +91,7 @@ std::vector<dsp::CalPoint> g_cal;
 std::unique_ptr<MpvPlayer> g_probe;
 std::string g_sweep_path;
 double g_play_at = 0.0;
+int g_play_retries = 0;
 double g_measure_until = 0.0;
 double g_upload_deadline = 0.0;
 double g_server_stop_at = 0.0;
@@ -189,7 +190,7 @@ std::vector<dsp::CalPoint> load_cal(const std::string &mic, std::string &error)
 dsp::DesignLimits limits_for(const std::string &mic, float strength)
 {
     dsp::DesignLimits l;
-    const bool phone = (mic == "galaxy_s24" || mic == "phone_generic");
+    const bool phone = (mic == "phone_generic");
     // A phone below ~90 Hz is guesswork even with the built-in profile, and
     // its top octave is mostly mic roll-off.
     l.lo_hz = phone ? 90.0 : 40.0;
@@ -205,6 +206,8 @@ dsp::TargetKind target_kind_of(const std::string &id)
 {
     if (id == "warm")
         return dsp::TargetKind::Warm;
+    if (id == "dynamic")
+        return dsp::TargetKind::Dynamic;
     if (id == "flat")
         return dsp::TargetKind::Flat;
     return dsp::TargetKind::Balanced;
@@ -216,11 +219,6 @@ std::string resolve_mic(const std::string &chosen)
 {
     if (!chosen.empty() || g_mode != Mode::Phone)
         return chosen;
-    std::string ua = eqserver::phone_user_agent();
-    for (char &c : ua)
-        c = (char)std::tolower((unsigned char)c);
-    if (ua.find("sm-s92") != std::string::npos) // Galaxy S24 / S24+ / S24 Ultra
-        return "galaxy_s24";
     return "phone_generic";
 }
 
@@ -365,9 +363,13 @@ void start_job(std::vector<float> samples, int rate)
             for (std::size_t i = 0; i < r.meas.db.size(); ++i)
                 r.meas.db[i] -= correction[i];
             r.smooth = dsp::smooth_octave(grid, r.meas.db, 1.0 / 6.0);
-            r.target = dsp::target_curve(grid, kind, r.smooth);
-            r.design = dsp::design(grid, r.smooth, r.target, limits, spec.sample_rate,
-                                   r.meas.valid);
+            const std::vector<double> base = dsp::target_curve(grid, kind, r.smooth);
+            const std::vector<double> tilt = dsp::house_curve(grid, kind);
+            r.target = base;
+            for (std::size_t i = 0; i < r.target.size() && i < tilt.size(); ++i)
+                r.target[i] += tilt[i];
+            r.design = dsp::design(grid, r.smooth, base, limits, spec.sample_rate,
+                                   r.meas.valid, tilt);
             r.corrected = r.design.corrected_db;
 
             double sse = 0.0;
@@ -449,7 +451,18 @@ bool take_and_start_job()
 void arm_playback()
 {
     g_play_at = now_sec() + 0.35;
+    g_play_retries = 0;
     g_message = "Starting the sweep…";
+}
+
+// Silence the app as soon as calibration starts, not just when the sweep is
+// due: the user is placing the phone and should not hear music meanwhile.
+void pause_for_measurement(AppState &state)
+{
+    if (g_paused_main)
+        return;
+    g_paused_main = state.playing.load();
+    state.user_pause_requested = true;
 }
 
 void play_probe(AppState &state, const MpvPlayer &player)
@@ -457,13 +470,16 @@ void play_probe(AppState &state, const MpvPlayer &player)
     ensure_probe(state);
     if (!g_probe)
         return;
-    // Pause whatever is playing first: the sweep must be the only sound.
-    if (state.playing.load() && !state.user_pause_requested && !g_paused_main)
+    // The sweep must be the only sound. Pausing at session start normally
+    // takes care of this; the retry covers starting mid-crossfade or a pause
+    // request that has not been drained yet.
+    if (state.playing.load())
     {
         state.user_pause_requested = true;
         g_paused_main = true;
-        g_play_at = now_sec() + 0.30;
-        return;
+        g_play_at = now_sec() + 0.25;
+        if (++g_play_retries < 20)
+            return;
     }
     double vol = player.cached_volume();
     if (vol < 1.0)
@@ -583,7 +599,7 @@ void tick(AppState &state, const MpvPlayer &player)
 
 bool start_phone(AppState &state, std::string &error)
 {
-    cancel();
+    cancel(&state);
     g_session++;
     g_job_done = false;
     g_spec = default_spec();
@@ -620,12 +636,13 @@ bool start_phone(AppState &state, std::string &error)
     g_mode = Mode::Phone;
     g_stage = Stage::Waiting;
     g_message = "Scan the QR code with your phone.";
+    pause_for_measurement(state);
     return true;
 }
 
 bool start_pc_mic(AppState &state, const std::string &device, std::string &error)
 {
-    cancel();
+    cancel(&state);
 #ifndef P100_WINDOWS
     g_session++;
     g_job_done = false;
@@ -645,6 +662,7 @@ bool start_pc_mic(AppState &state, const std::string &device, std::string &error
     g_mode = Mode::PcMic;
     g_stage = Stage::Waiting;
     g_message = "Recording with the computer microphone…";
+    pause_for_measurement(state);
     arm_playback();
     return true;
 #else
@@ -671,17 +689,21 @@ bool play_sweep(AppState &state, std::string &error)
     if (!ensure_sweep_wav(error))
         return false;
     g_stage = Stage::Waiting;
+    pause_for_measurement(state);
     arm_playback();
     return true;
 }
 
-void cancel()
+void cancel(AppState *state)
 {
+    if (g_paused_main && state)
+        state->user_play_requested = true;
     g_session++;
     g_play_at = 0.0;
     g_measure_until = 0.0;
     g_upload_deadline = 0.0;
     g_server_stop_at = 0.0;
+    g_play_retries = 0;
     if (g_probe && g_probe_playing)
         g_probe->stop();
     g_probe_playing = false;

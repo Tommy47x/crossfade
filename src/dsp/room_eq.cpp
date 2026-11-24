@@ -534,20 +534,25 @@ std::vector<double> target_curve(const Grid &g, TargetKind kind,
     std::vector<double> t(g.hz.size(), 0.0);
     if (kind == TargetKind::Flat || measured_db.size() != g.hz.size())
         return t;
-
     // Broadband trend of the measurement (1 octave). Correcting the difference
     // between this and the 1/6-octave curve leaves the speaker's voicing and
     // the room's bass gain alone while still taming modes and comb peaks.
-    t = smooth_octave(g, measured_db, 1.0);
-    if (kind == TargetKind::Warm)
+    return smooth_octave(g, measured_db, 1.0);
+}
+
+std::vector<double> house_curve(const Grid &g, TargetKind kind)
+{
+    std::vector<double> t(g.hz.size(), 0.0);
+    if (kind != TargetKind::Warm && kind != TargetKind::Dynamic)
+        return t;
+    const bool dynamic = kind == TargetKind::Dynamic;
+    for (std::size_t i = 0; i < g.hz.size(); ++i)
     {
-        for (std::size_t i = 0; i < g.hz.size(); ++i)
-        {
-            const double f = g.hz[i];
-            const double bass = 2.5 / (1.0 + std::pow(f / 70.0, 2.0));
-            const double treble = -1.0 / (1.0 + std::pow(4000.0 / f, 2.0));
-            t[i] += bass + treble;
-        }
+        const double f = g.hz[i];
+        const double bass = (dynamic ? 4.5 : 2.5) / (1.0 + std::pow(f / (dynamic ? 65.0 : 70.0), 2.0));
+        const double treble =
+            (dynamic ? 3.5 : -1.0) / (1.0 + std::pow((dynamic ? 4500.0 : 4000.0) / f, 2.0));
+        t[i] = bass + treble;
     }
     return t;
 }
@@ -622,18 +627,19 @@ double correction_taper(double f)
     if (f <= 400.0)
         return 1.0;
     if (f <= 2000.0)
-        return 1.0 - 0.45 * std::log2(f / 400.0) / std::log2(5.0);
+        return 1.0 - 0.35 * std::log2(f / 400.0) / std::log2(5.0);
     if (f <= 10000.0)
-        return 0.55 - 0.35 * std::log2(f / 2000.0) / std::log2(5.0);
+        return 0.65 - 0.35 * std::log2(f / 2000.0) / std::log2(5.0);
     if (f <= 20000.0)
-        return 0.20 - 0.20 * std::log2(f / 10000.0);
+        return 0.30 - 0.30 * std::log2(f / 10000.0);
     return 0.0;
 }
 } // namespace
 
 Design design(const Grid &g, const std::vector<double> &measured_db,
               const std::vector<double> &target_db, const DesignLimits &limits,
-              int sample_rate, const std::vector<char> &valid)
+              int sample_rate, const std::vector<char> &valid,
+              const std::vector<double> &tilt)
 {
     Design out;
     const std::size_t n = g.hz.size();
@@ -642,6 +648,7 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
     if (limits.hi_hz <= limits.lo_hz * 1.01 || limits.max_bands <= 0)
         return out;
     const bool use_valid = valid.size() == n;
+    const bool use_tilt = tilt.size() == n;
 
     // 1. Raw correction, faded out at the window edges, tapered with
     //    frequency and scaled by the user's strength, then clamped.
@@ -663,6 +670,13 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
         if (corr[i] > 0.0)
             corr[i] = std::min(corr[i],
                                std::max(0.0, trend[i] + limits.boost_margin_db));
+
+    // 2b. The deliberate house curve is added *after* the taper and the null
+    //     guard, so a requested treble lift is not treated like a suspicious
+    //     measurement peak.
+    if (use_tilt)
+        for (std::size_t i = 0; i < n; ++i)
+            corr[i] += tilt[i] * weight[i] * strength;
 
     // 3. Greedy band placement. For a fixed centre and Q the optimal gain has
     //    a closed form (least squares against the 1 dB response), so only the
@@ -714,7 +728,7 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
                     continue;
                 const double num = dot(residual, h1);
                 const double gain = clampd(num / den, limits.max_cut_db,
-                                           limits.max_boost_db);
+                                           limits.max_band_boost_db);
                 const double sse = std::max(0.0, best_sse - (num * num) / den);
                 if (sse < best_shape_sse)
                 {
@@ -766,7 +780,8 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
             for (double dg : kGainSteps)
             {
                 Band cand = base;
-                cand.gain = clampd(base.gain + dg, limits.max_cut_db, limits.max_boost_db);
+                cand.gain = clampd(base.gain + dg, limits.max_cut_db,
+                                   limits.max_band_boost_db);
                 try_candidate(cand);
             }
             for (double dq : kQSteps)
@@ -794,7 +809,8 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
         out.corrected_db[i] = measured_db[i] + out.predicted_db[i];
         if (weight[i] > 0.5)
         {
-            const double e = target_db[i] - out.corrected_db[i];
+            const double e = target_db[i] + (use_tilt ? tilt[i] : 0.0) -
+                             out.corrected_db[i];
             sse += e * e;
             ++counted;
         }
@@ -886,23 +902,11 @@ std::vector<CalPoint> builtin_mic_cal(const std::string &profile_id)
             {10000, 0}, {12000, -1.5}, {14000, -3.5}, {16000, -6},
             {18000, -10}, {20000, -15},
         };
-    if (profile_id == "galaxy_s24")
-        return {
-            // APPROXIMATE. No per-unit calibration data exists for the S24
-            // microphone; this is a generic modern-flagship shape (bass
-            // roll-off, presence lift, air roll-off) and is only good enough
-            // to stop the app from trusting the phone below ~100 Hz.
-            {20, -24}, {40, -15}, {60, -9}, {80, -5}, {100, -3}, {130, -1.5},
-            {200, 0}, {500, 0}, {1000, 0}, {2000, 0.5}, {3000, 2.0},
-            {4000, 2.8}, {5000, 2.2}, {6000, 1.2}, {8000, 0.5}, {10000, -0.5},
-            {12000, -1.5}, {14000, -3.0}, {16000, -5.0}, {18000, -9.0},
-            {20000, -14.0},
-        };
     return {};
 }
 
 bool builtin_mic_is_approximate(const std::string &profile_id)
 {
-    return profile_id == "phone_generic" || profile_id == "galaxy_s24";
+    return profile_id == "phone_generic";
 }
 } // namespace dsp

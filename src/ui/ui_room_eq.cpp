@@ -86,7 +86,8 @@ float plot_x(const ImVec2 &tl, const ImVec2 &br, double hz)
 
 void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
                  const std::vector<double> &hz, const std::vector<double> &db, double floor_db,
-                 double ceil_db, ImU32 col, float thickness, const std::vector<char> *mask)
+                 double ceil_db, ImU32 col, float thickness, const std::vector<char> *mask,
+                 bool dashed = false)
 {
     if (hz.size() < 2 || db.size() != hz.size())
         return;
@@ -95,6 +96,11 @@ void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
     for (std::size_t i = 0; i < hz.size(); ++i)
     {
         if (mask && i < mask->size() && !(*mask)[i])
+        {
+            have = false;
+            continue;
+        }
+        if (dashed && (i / 5) % 2 == 1)
         {
             have = false;
             continue;
@@ -108,6 +114,11 @@ void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
         have = true;
     }
 }
+
+// Fixed colours instead of theme alpha: "which line is which" must survive any
+// accent colour and both day and night themes.
+const ImU32 kMeasuredCol = IM_COL32(236, 152, 74, 220); // orange
+const ImU32 kTargetCol = IM_COL32(118, 188, 240, 235);  // sky blue
 
 void draw_response_graph(const roomeq::Status &st)
 {
@@ -158,27 +169,38 @@ void draw_response_graph(const roomeq::Status &st)
                     ui_text_muted_u32(), label);
     }
 
-    plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, ui_overlay_u32(0.42f),
-                1.3f * m.layout_scale, &st.valid);
-    plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, ui_text_dim_u32(), 1.0f,
-                nullptr);
+    plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, kMeasuredCol,
+                1.4f * m.layout_scale, &st.valid);
+    plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, kTargetCol,
+                1.2f * m.layout_scale, nullptr, true);
     plot_series(dl, tl, br, st.hz, st.corrected_db, floor_db, ceil_db, ui_accent_u32(0.95f),
-                1.9f * m.layout_scale, &st.valid);
+                2.1f * m.layout_scale, &st.valid);
 
     ImGui::Dummy(size);
-    // Legend
-    const float dot = 4.0f * m.layout_scale;
+    // Legend: line swatches in the same style as the graph.
     const float line_h = ImGui::GetTextLineHeight();
+    const float sample_w = 24.0f * m.layout_scale;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    auto legend = [&](const char *label, ImU32 col) {
-        dl->AddCircleFilled(ImVec2(p.x + dot, p.y + line_h * 0.5f), dot, col, 12);
-        dl->AddText(ImVec2(p.x + dot * 2.0f + 6.0f * m.layout_scale, p.y), ui_text_muted_u32(), label);
-        p.x += dot * 2.0f + 6.0f * m.layout_scale + ImGui::CalcTextSize(label).x +
+    auto legend = [&](const char *label, ImU32 col, bool dashed) {
+        const float y = p.y + line_h * 0.5f;
+        if (dashed)
+        {
+            for (float k = 0.0f; k < sample_w; k += 8.0f)
+                dl->AddLine(ImVec2(p.x + k, y), ImVec2(p.x + std::min(k + 4.5f, sample_w), y),
+                            col, 2.0f);
+        }
+        else
+        {
+            dl->AddLine(ImVec2(p.x, y), ImVec2(p.x + sample_w, y), col, 2.0f);
+        }
+        dl->AddText(ImVec2(p.x + sample_w + 6.0f * m.layout_scale, p.y), ui_text_muted_u32(),
+                    label);
+        p.x += sample_w + 6.0f * m.layout_scale + ImGui::CalcTextSize(label).x +
                18.0f * m.layout_scale;
     };
-    legend("measured", ui_overlay_u32(0.42f));
-    legend("target", ui_text_dim_u32());
-    legend("corrected", ui_accent_u32(0.95f));
+    legend("measured", kMeasuredCol, false);
+    legend("target", kTargetCol, true);
+    legend("corrected", ui_accent_u32(0.95f), false);
     ImGui::Dummy(ImVec2(0.0f, line_h));
 }
 
@@ -198,8 +220,6 @@ void start_pc_or_notify(AppState &state, const std::string &device)
 
 const char *mic_name(const std::string &id)
 {
-    if (id == "galaxy_s24")
-        return "Galaxy S24 (approximate)";
     if (id == "phone_generic")
         return "phone / consumer mic (approximate)";
     if (id == "custom")
@@ -241,19 +261,19 @@ void draw_room_eq_panel(AppState &state)
     ImGui::TextUnformatted("Microphone");
     static const char *kMicLabels[] = {
         "Flat — calibrated mic only", "Phone / consumer mic (approximate)",
-        "Galaxy S24 (approximate)", "Imported .cal file"};
-    static const char *kMicIds[] = {"", "phone_generic", "galaxy_s24", "custom"};
+        "Imported .cal file"};
+    static const char *kMicIds[] = {"", "phone_generic", "custom"};
     int mic_index = 0;
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 3; ++i)
         if (st.room_eq_mic == kMicIds[i])
             mic_index = i;
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::Combo("##rq_mic", &mic_index, kMicLabels, 4))
+    if (ImGui::Combo("##rq_mic", &mic_index, kMicLabels, 3))
     {
         st.room_eq_mic = kMicIds[mic_index];
         save_settings(st);
     }
-    if (st.room_eq_mic == "galaxy_s24" || st.room_eq_mic == "phone_generic")
+    if (st.room_eq_mic == "phone_generic")
         room_help("No per-unit calibration data exists for phone mics, so this is a generic "
                   "shape. Corrections start at 90 Hz and stop at 12 kHz; treat the bass as "
                   "approximate. A measured .cal file always wins.");
@@ -277,23 +297,27 @@ void draw_room_eq_panel(AppState &state)
     }
 
     ImGui::TextUnformatted("Target");
-    static const char *kTargetLabels[] = {"Balanced (recommended)", "Warm", "Flat (reference)"};
-    static const char *kTargetIds[] = {"balanced", "warm", "flat"};
+    static const char *kTargetLabels[] = {"Balanced (recommended)", "Warm", "Dynamic",
+                                          "Flat (reference)"};
+    static const char *kTargetIds[] = {"balanced", "warm", "dynamic", "flat"};
     int target = 0;
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
         if (st.room_eq_target == kTargetIds[i])
             target = i;
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::Combo("##rq_target", &target, kTargetLabels, 3))
+    if (ImGui::Combo("##rq_target", &target, kTargetLabels, 4))
     {
         st.room_eq_target = kTargetIds[target];
         save_settings(st);
     }
-    room_help(target == 2
+    room_help(target == 3
                   ? "Flat flattens the whole band. It removes the room's bass gain and usually "
                     "sounds thin; use it for reference, not for listening."
-                  : "Balanced keeps the speaker's own balance and only tames deviations from it. "
-                    "Warm adds a gentle bass lift on top.");
+                  : target == 2
+                        ? "Dynamic keeps the balance, then adds bass and a real treble lift on "
+                          "top (the closest pure-EQ thing to a loudness/crystalizer effect)."
+                        : "Balanced keeps the speaker's own balance and only tames deviations "
+                          "from it. Warm adds a gentle bass lift on top.");
 
     ImGui::TextUnformatted("Strength");
     static const char *kStrengthLabels[] = {"Gentle", "Balanced", "Strong"};
@@ -329,7 +353,7 @@ void draw_room_eq_panel(AppState &state)
         }
         room_help(status.message.c_str());
         if (ImGui::Button("Cancel measurement", ImVec2(190.0f * m.layout_scale, 0.0f)))
-            roomeq::cancel();
+            roomeq::cancel(&state);
         if (status.stage == roomeq::Stage::Waiting && !status.url.empty() &&
             ImGui::Button("Play the sweep once", ImVec2(190.0f * m.layout_scale, 0.0f)))
         {
@@ -352,6 +376,10 @@ void draw_room_eq_panel(AppState &state)
                 ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y,
                                           ui_c().text_muted.z, 1.0f),
                                    "Microphone: %s", mic_name(status.mic));
+            room_help("Above ~2 kHz the correction is deliberately gentle and narrow dips are "
+                      "never filled — boosting them sounds worse than leaving them. If the top "
+                      "end sounds dull, try the Dynamic target rather than expecting a sharp "
+                      "dip to be filled.");
             bool any_invalid = false;
             for (char v : status.valid)
                 any_invalid = any_invalid || !v;
@@ -376,7 +404,7 @@ void draw_room_eq_panel(AppState &state)
             if (ui_ghost_button("Measure again", ImVec2(150.0f * m.layout_scale, 0.0f)))
             {
                 roomeq::reset_result();
-                roomeq::cancel();
+                roomeq::cancel(&state);
                 start_phone_or_notify(state);
             }
             if (status.page_open)
