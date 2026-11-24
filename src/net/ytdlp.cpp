@@ -2210,8 +2210,24 @@ static void log_download_failure(const std::string &video_id, const char *attemp
             << "cmd: " << command << "\n"
             << tail << "\n\n";
     }
-    fprintf(stderr, "[yt-dlp] %s attempt %s failed (rc=%d): %s\n",
-            video_id.c_str(), attempt, rc, tail.c_str());
+    // Console: one actionable line. The full yt-dlp output (including the
+    // Python traceback from a failed JS challenge) goes to downloads.log.
+    std::string summary;
+    const size_t err_at = tail.rfind("ERROR:");
+    if (err_at != std::string::npos)
+    {
+        const size_t eol = tail.find('\n', err_at);
+        summary = tail.substr(err_at, eol == std::string::npos ? std::string::npos
+                                                               : eol - err_at);
+    }
+    else
+    {
+        summary = "rc=" + std::to_string(rc);
+    }
+    if (summary.size() > 220)
+        summary = summary.substr(0, 217) + "...";
+    fprintf(stderr, "[yt-dlp] %s (%s) failed: %s\n", video_id.c_str(), attempt,
+            summary.c_str());
 }
 
 static Track fetch_track_metadata(const std::string &video_id)
@@ -3582,9 +3598,12 @@ std::string get_cached_audio_path(const std::string &video_id)
         const char *name;
         std::string command;
     };
+    // Anonymous first: a signed-in account can be in YouTube's SABR-only
+    // experiment, where cookie requests fail the JS challenge while the
+    // anonymous one resolves (and downloads) normally.
     const Attempt attempts[] = {
-        {"cookies", base + cookie_arg() + output + url},
         {"public", base + output + url},
+        {"cookies", base + cookie_arg() + output + url},
         {"visionos", base + " --extractor-args \"youtube:player_client=visionos\"" + output + url},
     };
 
@@ -3964,9 +3983,12 @@ std::string get_cached_video_path(const std::string &video_id, int max_height)
         const char *name;
         std::string command;
     };
+    // Anonymous first: a signed-in account can be in YouTube's SABR-only
+    // experiment, where cookie requests fail the JS challenge while the
+    // anonymous one resolves (and downloads) normally.
     const Attempt attempts[] = {
-        {"cookies", base + cookie_arg() + output + url},
         {"public", base + output + url},
+        {"cookies", base + cookie_arg() + output + url},
         {"visionos", base + " --extractor-args \"youtube:player_client=visionos\"" + output + url},
     };
     for (const Attempt &attempt : attempts)
