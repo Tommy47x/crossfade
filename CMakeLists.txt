@@ -15,6 +15,10 @@ configure_file(
 find_package(SDL2 REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
+# Optional TLS. Used by the room-correction HTTPS page and by the native
+# backend's HTTP client; without it the native path reports unavailable and
+# the Python backend stays in use.
+find_package(OpenSSL QUIET)
 
 if(WIN32)
     # No glib / libnotify on Windows: the Linux desktop-integration code is
@@ -49,6 +53,27 @@ add_library(imgui STATIC
 )
 target_include_directories(imgui PUBLIC external/imgui external/imgui/backends)
 target_link_libraries(imgui PUBLIC SDL2::SDL2 OpenGL::GL)
+
+# ---- Native backend core ----
+# Shared by the app and by the tests that link the backend. PUBLIC so the TLS
+# definitions reach ytdlp.cpp and the room-correction server too.
+add_library(crossfade_native STATIC
+    src/core/json_value.cpp
+    src/backend/native/http.cpp
+    src/backend/native/innertube.cpp
+)
+target_include_directories(crossfade_native PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+)
+target_link_libraries(crossfade_native PUBLIC Threads::Threads)
+if(OpenSSL_FOUND)
+    target_compile_definitions(crossfade_native PUBLIC
+        P100_HAVE_OPENSSL
+        CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(crossfade_native PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # ---- crossfade sources ----
 set(SOURCES
@@ -188,6 +213,7 @@ if(P100_WIN)
         ${CMAKE_CURRENT_SOURCE_DIR}/win32)
     target_link_libraries(crossfade
         imgui
+        crossfade_native
         SDL2::SDL2main
         ${MPV_LIBRARY}
         Threads::Threads
@@ -213,24 +239,12 @@ else()
     )
     target_link_libraries(crossfade
         imgui
+        crossfade_native
         ${MPV_LIBRARIES}
         ${NOTIFY_LIBRARIES}
         ${GLIB_LIBRARIES}
         Threads::Threads
     )
-endif()
-
-# ---- Optional TLS for room correction ----
-# Browsers only expose the microphone on a secure origin, so the measurement
-# page is served over HTTPS with a throwaway self-signed certificate when
-# OpenSSL is available. Without it the page still loads over HTTP and the
-# feature remains usable through the PC microphone or an imported recording.
-find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
-    target_compile_definitions(crossfade PRIVATE
-        P100_HAVE_OPENSSL
-        CPPHTTPLIB_OPENSSL_SUPPORT)
-    target_link_libraries(crossfade OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ---- Install ----
@@ -285,7 +299,7 @@ if(CROSSFADE_BUILD_TESTS)
             SQLITE_ENABLE_FTS5=1
             SQLITE_OMIT_LOAD_EXTENSION=1
             SQLITE_THREADSAFE=1)
-        target_link_libraries(${target} Threads::Threads)
+        target_link_libraries(${target} Threads::Threads crossfade_native)
     endfunction()
 
     foreach(party_test party_link party_queue party_util party_tunnel)

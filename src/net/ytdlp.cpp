@@ -1,4 +1,6 @@
 #include "ytdlp.h"
+#include "backend/native/innertube.h"
+#include "backend/native/http.h"
 #include "tunables.h"
 #include "json_util.h"
 #include "paths.h"
@@ -3629,10 +3631,30 @@ std::string get_cached_audio_path(const std::string &video_id)
 
 // Resolve a direct streaming URL (yt-dlp -g) so playback can start
 // almost immediately instead of waiting for a full file download.
+static bool native_backend_preferred()
+{
+    // P100_BACKEND=python forces the old path; anything else tries native
+    // first and silently falls back if it cannot resolve.
+    const char *env = getenv("P100_BACKEND");
+    if (env && *env)
+        return std::string(env) != "python";
+    return true;
+}
+
+static std::string try_native_stream(const std::string &video_id)
+{
+    if (!native_backend_preferred() || !native::http_available())
+        return "";
+    native::StreamResult r = native::resolve_audio(video_id);
+    return r.ok ? r.url : "";
+}
+
 std::string fetch_stream_url(const std::string &video_id)
 {
     if (is_local_media_id(video_id))
         return ""; // a file, not a stream
+    if (std::string native_url = try_native_stream(video_id); !native_url.empty())
+        return native_url;
     std::string response = send_play_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
@@ -3665,6 +3687,8 @@ std::string fetch_stream_url_fresh(const std::string &video_id)
 {
     if (is_local_media_id(video_id))
         return "";
+    if (std::string native_url = try_native_stream(video_id); !native_url.empty())
+        return native_url;
     std::string response = send_play_command("play_fresh " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
