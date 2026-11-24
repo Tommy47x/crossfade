@@ -1033,12 +1033,24 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     // "coming into focus" as the scroll passes it.
                     const float focus = clampf(1.0f - std::fabs(d) * 0.55f, 0.0f, 1.0f);
                     const float f2 = focus * focus;
-                    const float size = up_floor + (active_pref - up_floor) * f2;
                     const float alpha =
                         (preview ? 0.60f : 1.0f) * (0.08f + 0.92f * f2) * view_a;
                     const bool is_active = (!preview && i == center_idx);
-                    TextLayout lay = layout_text(font, lx->lines[i], max_text_w, size,
-                                                 std::max(13.0f, size * 0.5f));
+                    // The size cap is measured once at the focal font size and
+                    // does not depend on the current focus. Fitting against a
+                    // moving preferred size made a long line shrink and regrow
+                    // on every frame (the visible jitter), and letting the
+                    // animation aim at active_pref overshot the fitted size.
+                    TextLayout cap_lay = layout_text(font, lx->lines[i], max_text_w,
+                                                     active_pref,
+                                                     std::max(13.0f, active_pref * 0.5f));
+                    const float cap = cap_lay.size;
+                    float size = up_floor + (cap - up_floor) * f2;
+                    size = std::round(size * 2.0f) * 0.5f; // stable half-pixel steps
+                    TextLayout lay = (size >= cap - 0.01f)
+                                         ? cap_lay
+                                         : layout_text(font, lx->lines[i], max_text_w, size,
+                                                       std::max(13.0f, size * 0.5f));
                     draw_rows(dl, font, lay, ImVec2(focal.x, focal.y + d * pitch),
                               is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
                               alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
