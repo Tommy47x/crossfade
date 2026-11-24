@@ -2056,7 +2056,15 @@ def _thread_ydl(client_arg, browser, opts):
 
 
 def _in_process_extract(video_id, client_arg, browser):
-    """One in-process yt-dlp extraction; returns (url, error)."""
+    """One in-process yt-dlp extraction; returns (url, error).
+
+    Cookies are tried *second*. A signed-in account can be enrolled in
+    YouTube's SABR-only / "page needs to be reloaded" experiment, where every
+    extraction that sends the account cookies fails the n-challenge while the
+    anonymous one resolves normally. The subprocess path always had this
+    order; the warm path used to send cookies unconditionally, so every
+    uncached resolve failed and then skipped the fallback.
+    """
     global _ydl_cls, _ydl_tried
     if not _ydl_tried:
         _ydl_tried = True
@@ -2067,53 +2075,61 @@ def _in_process_extract(video_id, client_arg, browser):
             _ydl_cls = None
     if _ydl_cls is None:
         return None, 'yt_dlp module unavailable'
-    opts = {
+    base = {
         'format': 'bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'noplaylist': True,
-        # Bound the network work: this runs on the single command thread.
+        # Bound the network work: this runs on the command thread.
         'socket_timeout': _tune('backend.resolve_socket_timeout_sec', 10),
         'retries': 1,
     }
-    opts.update(_js_runtime_opts())
+    base.update(_js_runtime_opts())
     if client_arg:
-        opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
-    if browser:
-        # yt-dlp expects (browser, profile, keyring, container); a bare string
-        # is unpacked character-by-character ("firefox" -> 7 args).
-        opts['cookiesfrombrowser'] = (browser,)
-    # The primary client instance is kept per thread: yt-dlp caches the player
-    # JS and its signature solver on the instance, which is worth ~1 s per
-    # subsequent resolve. Fallback clients stay ephemeral (they are rare and
-    # each instance carries its own player-JS cache).
-    persistent = client_arg in (None, 'web_music', 'visionos')
-    try:
-        ydl = _thread_ydl(client_arg, browser, opts) if persistent else _ydl_cls(opts)
+        base['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
+
+    def attempt(with_cookies):
+        opts = dict(base)
+        if with_cookies and browser:
+            # yt-dlp expects (browser, profile, keyring, container); a bare
+            # string is unpacked character by character.
+            opts['cookiesfrombrowser'] = (browser,)
+        # The primary client instance is kept per thread: yt-dlp caches the
+        # player JS and its signature solver on the instance (~1 s per next
+        # resolve). Cookie and fallback-client variants stay ephemeral.
+        persistent = client_arg in (None, 'web_music', 'visionos')
         try:
-            info = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}', download=False)
-        finally:
-            if not persistent:
-                ydl.close()
-    except Exception as e:
-        return None, str(e)
-    if not info:
-        return None, 'yt-dlp module returned no info'
-    url = info.get('url')
-    if not url:
-        # The requested format lives in the formats list; prefer audio-only.
-        best = None
-        for f in info.get('formats') or []:
-            if not f.get('url') or f.get('vcodec') not in (None, 'none'):
-                continue
-            if best is None or (f.get('abr') or 0) > (best.get('abr') or 0):
-                best = f
-        url = best.get('url') if best else None
-    if not url:
-        return None, 'yt-dlp module returned no URL'
-    return url, None
+            ydl = (_thread_ydl(client_arg, browser if with_cookies else None, opts)
+                   if persistent else _ydl_cls(opts))
+            try:
+                info = ydl.extract_info(
+                    f'https://www.youtube.com/watch?v={video_id}', download=False)
+            finally:
+                if not persistent:
+                    ydl.close()
+        except Exception as e:
+            return None, str(e)
+        if not info:
+            return None, 'yt-dlp module returned no info'
+        url = info.get('url')
+        if not url:
+            # The requested format lives in the formats list; prefer audio.
+            best = None
+            for f in info.get('formats') or []:
+                if not f.get('url') or f.get('vcodec') not in (None, 'none'):
+                    continue
+                if best is None or (f.get('abr') or 0) > (best.get('abr') or 0):
+                    best = f
+            url = best.get('url') if best else None
+        if not url:
+            return None, 'yt-dlp module returned no URL'
+        return url, None
+
+    url, err = attempt(False)
+    if url or not browser:
+        return url, err
+    return attempt(True)
 
 
 def _extract_stream_url(video_id, client_arg, browser, deadline=None):
@@ -2633,7 +2649,10 @@ def _pick_pair(formats):
 
 
 def _in_process_extract_video(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
-    """In-process video resolve; returns (video_url, audio_url, error)."""
+    """In-process video resolve; returns (video_url, audio_url, error).
+
+    Same anonymous-first cookie order as the audio path (see above).
+    """
     global _ydl_cls, _ydl_tried
     if not _ydl_tried:
         _ydl_tried = True
@@ -2644,7 +2663,7 @@ def _in_process_extract_video(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
             _ydl_cls = None
     if _ydl_cls is None:
         return None, None, 'yt_dlp module unavailable'
-    opts = {
+    base = {
         'format': fmt,
         'quiet': True,
         'no_warnings': True,
@@ -2653,30 +2672,39 @@ def _in_process_extract_video(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
         'socket_timeout': _tune('backend.resolve_socket_timeout_sec', 10),
         'retries': 1,
     }
-    opts.update(_js_runtime_opts())
+    base.update(_js_runtime_opts())
     if client_arg:
-        opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
-    if browser:
-        opts['cookiesfrombrowser'] = (browser,)
-    persistent = client_arg in (None, 'web_music', 'visionos')
-    try:
-        ydl = _thread_ydl(client_arg, browser, opts) if persistent else _ydl_cls(opts)
+        base['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
+
+    def attempt(with_cookies):
+        opts = dict(base)
+        if with_cookies and browser:
+            opts['cookiesfrombrowser'] = (browser,)
+        persistent = client_arg in (None, 'web_music', 'visionos')
         try:
-            info = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}', download=False)
-        finally:
-            if not persistent:
-                ydl.close()
-    except Exception as e:
-        return None, None, str(e)
-    if not info:
-        return None, None, 'yt-dlp module returned no info'
-    video, audio, _ = _pick_pair(info.get('requested_formats'))
-    if not video and info.get('url') and info.get('vcodec') not in (None, 'none'):
-        video = info['url']  # progressive single file
-    if not video:
-        return None, None, 'yt-dlp module returned no video URL'
-    return video, audio, None
+            ydl = (_thread_ydl(client_arg, browser if with_cookies else None, opts)
+                   if persistent else _ydl_cls(opts))
+            try:
+                info = ydl.extract_info(
+                    f'https://www.youtube.com/watch?v={video_id}', download=False)
+            finally:
+                if not persistent:
+                    ydl.close()
+        except Exception as e:
+            return None, None, str(e)
+        if not info:
+            return None, None, 'yt-dlp module returned no info'
+        video, audio, _ = _pick_pair(info.get('requested_formats'))
+        if not video and info.get('url') and info.get('vcodec') not in (None, 'none'):
+            video = info['url']  # progressive single file
+        if not video:
+            return None, None, 'yt-dlp module returned no video URL'
+        return video, audio, None
+
+    video, audio, err = attempt(False)
+    if video or not browser:
+        return video, audio, err
+    return attempt(True)
 
 
 def _extract_video_urls(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
