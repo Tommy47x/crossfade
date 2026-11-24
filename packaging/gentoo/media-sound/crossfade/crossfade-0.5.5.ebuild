@@ -9,7 +9,7 @@ DESCRIPTION="Native YouTube Music desktop player with real crossfade"
 HOMEPAGE="https://github.com/XBoom31/crossfade"
 SRC_URI="https://github.com/XBoom31/crossfade/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz"
 
-LICENSE="MIT"
+LICENSE="GPL-3"
 SLOT="0"
 KEYWORDS="~amd64"
 IUSE="webkit"

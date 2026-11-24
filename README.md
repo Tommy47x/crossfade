@@ -14,7 +14,7 @@ C++17 · SDL2 + OpenGL + Dear ImGui · playback by `mpv` · music data by a Pyth
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue)](#platform-support)
 [![Build](https://img.shields.io/badge/build-CMake%20%2B%20Make-green)](#install-linux)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue)](https://isocpp.org/)
-[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 </div>
 
@@ -138,7 +138,7 @@ is available as an alternative.
 
 **Is this allowed?**
 It uses your own account through `ytmusicapi`/`yt-dlp`, the same tools other clients
-use. Not affiliated with or endorsed by Google. MIT licensed. No telemetry, no server;
+use. Not affiliated with or endorsed by Google. GPL-3.0 licensed. No telemetry, no server;
 requests go to YouTube and nowhere else.
 
 **Why not Electron?**
@@ -1208,7 +1208,7 @@ Issues and pull requests are welcome.
 
 ## License
 
-[MIT](LICENSE) — free to use, modify, and share.
+[GPL-3.0](LICENSE) — free to use, modify, and share under the same license.
 
 **Not affiliated with or endorsed by Google/YouTube.** Use your own account and respect
 YouTube's terms of service.
