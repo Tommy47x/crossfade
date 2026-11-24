@@ -230,7 +230,8 @@ void save_settings(const Settings &settings)
         << ",\"rq_enabled\":" << (settings.room_eq_enabled ? "true" : "false")
         << ",\"rq_preamp\":" << settings.room_eq_preamp
         << ",\"rq_mic\":\"" << json_escape(settings.room_eq_mic) << "\""
-        << ",\"rq_target\":\"" << json_escape(settings.room_eq_target) << "\""
+        << ",\"rq_target2\":\"" << json_escape(settings.room_eq_target) << "\""
+        << ",\"rq_strength\":" << settings.room_eq_strength
         << ",\"rq_label\":\"" << json_escape(settings.room_eq_label) << "\""
         << ",\"rq_residual\":" << settings.room_eq_residual_db << ",\"rq_freq\":[";
     for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
@@ -425,9 +426,16 @@ Settings load_settings()
             s.room_eq_enabled = get_bool("rq_enabled");
         s.room_eq_preamp = std::max(-24.0f, std::min(0.0f, get_float("rq_preamp")));
         s.room_eq_mic = get_str("rq_mic");
-        s.room_eq_target = get_str("rq_target");
-        if (s.room_eq_target != "warm")
-            s.room_eq_target = "flat";
+        // Renamed from "rq_target": pre-release builds defaulted to a flat
+        // target that gutted the bass, and the old value is deliberately
+        // ignored so those installs start from the safer default.
+        s.room_eq_target = get_str("rq_target2");
+        if (s.room_eq_target != "warm" && s.room_eq_target != "flat")
+            s.room_eq_target = "balanced";
+        s.room_eq_strength = get_float("rq_strength");
+        if (s.room_eq_strength <= 0.05f)
+            s.room_eq_strength = 1.0f;
+        s.room_eq_strength = std::max(0.3f, std::min(1.5f, s.room_eq_strength));
         s.room_eq_label = get_str("rq_label");
         s.room_eq_residual_db = get_float("rq_residual");
         s.discord_client_id = get_str("discord_client_id");

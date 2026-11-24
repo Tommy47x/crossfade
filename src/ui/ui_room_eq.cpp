@@ -86,7 +86,7 @@ float plot_x(const ImVec2 &tl, const ImVec2 &br, double hz)
 
 void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
                  const std::vector<double> &hz, const std::vector<double> &db, double floor_db,
-                 double ceil_db, ImU32 col, float thickness)
+                 double ceil_db, ImU32 col, float thickness, const std::vector<char> *mask)
 {
     if (hz.size() < 2 || db.size() != hz.size())
         return;
@@ -94,6 +94,11 @@ void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
     bool have = false;
     for (std::size_t i = 0; i < hz.size(); ++i)
     {
+        if (mask && i < mask->size() && !(*mask)[i])
+        {
+            have = false;
+            continue;
+        }
         const double v = std::max(floor_db, std::min(ceil_db, db[i]));
         const double t = (v - floor_db) / (ceil_db - floor_db);
         const ImVec2 p(plot_x(tl, br, hz[i]), br.y - (float)t * (br.y - tl.y));
@@ -154,10 +159,11 @@ void draw_response_graph(const roomeq::Status &st)
     }
 
     plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, ui_overlay_u32(0.42f),
-                1.3f * m.layout_scale);
-    plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, ui_text_dim_u32(), 1.0f);
+                1.3f * m.layout_scale, &st.valid);
+    plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, ui_text_dim_u32(), 1.0f,
+                nullptr);
     plot_series(dl, tl, br, st.hz, st.corrected_db, floor_db, ceil_db, ui_accent_u32(0.95f),
-                1.9f * m.layout_scale);
+                1.9f * m.layout_scale, &st.valid);
 
     ImGui::Dummy(size);
     // Legend
@@ -188,6 +194,17 @@ void start_pc_or_notify(AppState &state, const std::string &device)
     std::string error;
     if (!roomeq::start_pc_mic(state, device, error))
         ui_notify(UiNotifyType::Error, "Room correction", error, 7.0f);
+}
+
+const char *mic_name(const std::string &id)
+{
+    if (id == "galaxy_s24")
+        return "Galaxy S24 (approximate)";
+    if (id == "phone_generic")
+        return "phone / consumer mic (approximate)";
+    if (id == "custom")
+        return "imported .cal file";
+    return "flat (calibrated mic)";
 }
 } // namespace
 
@@ -223,8 +240,8 @@ void draw_room_eq_panel(AppState &state)
     room_gap();
     ImGui::TextUnformatted("Microphone");
     static const char *kMicLabels[] = {
-        "Flat / calibrated mic", "Phone (generic)", "Galaxy S24 (approximate)",
-        "Imported .cal file"};
+        "Flat — calibrated mic only", "Phone / consumer mic (approximate)",
+        "Galaxy S24 (approximate)", "Imported .cal file"};
     static const char *kMicIds[] = {"", "phone_generic", "galaxy_s24", "custom"};
     int mic_index = 0;
     for (int i = 0; i < 4; ++i)
@@ -237,14 +254,15 @@ void draw_room_eq_panel(AppState &state)
         save_settings(st);
     }
     if (st.room_eq_mic == "galaxy_s24" || st.room_eq_mic == "phone_generic")
-        room_help("No per-unit calibration data exists for phone microphones, so this is a "
-                  "generic shape. Corrections start at 90 Hz where the phone is least wrong; "
-                  "treat the bass as approximate.");
+        room_help("No per-unit calibration data exists for phone mics, so this is a generic "
+                  "shape. Corrections start at 90 Hz and stop at 12 kHz; treat the bass as "
+                  "approximate. A measured .cal file always wins.");
     else if (st.room_eq_mic == "custom")
         room_help(roomeq::cal_file_path().c_str());
     else
-        room_help("Use this for a measurement microphone (UMIK-1 and similar) with its .cal "
-                  "file imported, or when the mic is already flat enough.");
+        room_help("\"Flat\" assumes the microphone is already accurate. Never pick it for a "
+                  "phone or laptop mic: their own response would be corrected as if it were "
+                  "the room. Use a measurement mic (UMIK-1 and similar) with its .cal imported.");
 
     static std::string s_cal_path;
     ImGui::SetNextItemWidth(-1.0f);
@@ -259,12 +277,31 @@ void draw_room_eq_panel(AppState &state)
     }
 
     ImGui::TextUnformatted("Target");
-    static const char *kTargetLabels[] = {"Flat", "Warm"};
-    int target = st.room_eq_target == "warm" ? 1 : 0;
+    static const char *kTargetLabels[] = {"Balanced (recommended)", "Warm", "Flat (reference)"};
+    static const char *kTargetIds[] = {"balanced", "warm", "flat"};
+    int target = 0;
+    for (int i = 0; i < 3; ++i)
+        if (st.room_eq_target == kTargetIds[i])
+            target = i;
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::Combo("##rq_target", &target, kTargetLabels, 2))
+    if (ImGui::Combo("##rq_target", &target, kTargetLabels, 3))
     {
-        st.room_eq_target = target == 1 ? "warm" : "flat";
+        st.room_eq_target = kTargetIds[target];
+        save_settings(st);
+    }
+    room_help(target == 2
+                  ? "Flat flattens the whole band. It removes the room's bass gain and usually "
+                    "sounds thin; use it for reference, not for listening."
+                  : "Balanced keeps the speaker's own balance and only tames deviations from it. "
+                    "Warm adds a gentle bass lift on top.");
+
+    ImGui::TextUnformatted("Strength");
+    static const char *kStrengthLabels[] = {"Gentle", "Balanced", "Strong"};
+    int strength = st.room_eq_strength < 0.8f ? 0 : (st.room_eq_strength > 1.15f ? 2 : 1);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo("##rq_strength", &strength, kStrengthLabels, 3))
+    {
+        st.room_eq_strength = strength == 0 ? 0.6f : (strength == 2 ? 1.3f : 1.0f);
         save_settings(st);
     }
 
@@ -311,6 +348,16 @@ void draw_room_eq_panel(AppState &state)
             const int bands = (int)status.bands.size();
             ImGui::Text("%d filters · %.1f dB RMS -> %.1f dB RMS", bands, status.residual_before_db,
                         status.residual_after_db);
+            if (!status.mic.empty())
+                ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y,
+                                          ui_c().text_muted.z, 1.0f),
+                                   "Microphone: %s", mic_name(status.mic));
+            bool any_invalid = false;
+            for (char v : status.valid)
+                any_invalid = any_invalid || !v;
+            if (any_invalid)
+                room_help("The dim part of the curve is below what this recording can resolve "
+                          "(or was not repeatable), so no correction is applied there.");
             room_gap(0.6f);
             ImGui::BeginChild("##rq_bands", ImVec2(0.0f, 118.0f * m.layout_scale), false);
             for (const dsp::Band &b : status.bands)
@@ -331,6 +378,14 @@ void draw_room_eq_panel(AppState &state)
                 roomeq::reset_result();
                 roomeq::cancel();
                 start_phone_or_notify(state);
+            }
+            if (status.page_open)
+            {
+                room_gap(0.4f);
+                room_help("The phone page is still open: \"Measure again\" there works without "
+                          "scanning a new code.");
+                if (ui_ghost_button("Close phone page", ImVec2(180.0f * m.layout_scale, 0.0f)))
+                    roomeq::close_page();
             }
         }
         else

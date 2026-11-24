@@ -16,8 +16,14 @@ Settings → **Room correction**.
 3. Review the curve: gray is what the mic heard, the thin line is the target,
    green is the predicted result. Apply or discard.
 
-The sweep pauses whatever is playing, plays the calibration signal at the
-current volume, and resumes playback afterwards.
+The page stays open after a measurement, so **Measure again** on the phone
+works without scanning a new code (it closes on cancel, "Close phone page", or
+after 30 idle minutes).
+
+The sweep pauses whatever is playing, plays three calibration sweeps at the
+current volume, and resumes playback afterwards. The three responses are
+averaged, which is what makes the estimate stable and lets the app tell signal
+from noise.
 
 ### Three ways to capture
 
@@ -32,23 +38,51 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
 
 ## What it does to the sound
 
+- **Target** (default *Balanced*) follows the speaker's own broadband balance
+  and only corrects deviations from it. This is the important part: flattening
+  the whole in-room curve (*Flat*) removes the room's bass gain and makes a good
+  speaker sound thin, which is why Flat is labelled "reference" and is not the
+  default. *Warm* adds a gentle bass lift on top of Balanced.
+- **Strength**: Gentle / Balanced / Strong scales the correction amount.
 - Designs up to 12 peaking filters inside a correction window (40 Hz–16 kHz for
-  a flat mic, 90 Hz–16 kHz for a phone), with at most +6 dB of boost and −12 dB
-  of cut.
+  a calibrated mic, 90 Hz–12 kHz for a phone), with at most +3 dB of boost and
+  −12 dB of cut.
+- Correction strength tapers with frequency: full below 400 Hz, ~55% at 2 kHz,
+  ~20% at 10 kHz. Above the room's transition region a single-point measurement
+  is dominated by comb filtering, so correcting it makes things worse.
 - Never fills a narrow null: positive corrections are capped by the 1-octave
-  trend, so a suck-out does not turn into a huge resonance.
-- Adds a preamp trim for the summed boost so the output cannot clip.
+  trend, and the fitter can only place filters where the measurement is trusted.
+- Adds a preamp trim for the summed boost so the output cannot clip (usually
+  0 dB with Balanced, since it hardly boosts).
 - Applies *after* the manual equalizer, as a separate band set, so the two never
   overwrite each other. Turning room correction off leaves the manual EQ alone.
-- The chain is `loudnorm? → volume(preamp)? → equalizer…`, visible in
-  `Settings → Playback` as a normal, editable equalizer.
+
+## Trusted vs. untrusted parts of the curve
+
+A microphone cannot measure what is not there. If a laptop speaker has no
+output at 60 Hz, the deconvolved curve at 60 Hz is just the recording's noise
+floor, and designing a filter from it produces the classic "it boosted/cut
+bass that does not exist" result. The analysis therefore marks a point
+untrustworthy when it is:
+
+- more than 40 dB below the midband (nothing audible to correct) or more than
+  25 dB above it (implausible),
+- not repeatable between the three sweeps (more than 3.5 dB spread, which is
+  what noise looks like),
+- part of an isolated run of one or two points (a real response is contiguous).
+
+Untrusted points are drawn dimmed, get no correction, and never attract a
+filter. That is why the graph can show a big dip below a speaker's cutoff
+without the EQ trying to "fix" it.
 
 ## Accuracy and honest limits
 
 - **Phone mics are the weak link.** They are not flat, vary by unit, and the OS
   may apply voice processing. The page asks the browser to disable echo
   cancellation, noise suppression and AGC, but that is a request, not a
-  guarantee.
+  guarantee. If no profile is selected and the measurement comes from a phone,
+  the host reads the browser's user agent and picks the matching profile (S24)
+  or the generic consumer-mic curve — it never silently assumes "flat".
 - **No S24 calibration data exists publicly.** The built-in "Galaxy S24
   (approximate)" curve is a generic modern-flagship shape (bass roll-off,
   presence lift, air roll-off), labelled approximate in the UI. It is there so
@@ -64,24 +98,28 @@ import its `.cal` file (REW format, `freq dB` per line) in the panel.
 
 ## How the measurement works
 
-1. **Excitation** — a 6 s exponential sine sweep, 30 Hz–17 kHz, with lead-in,
-   tail and raised-cosine fades (`dsp::make_sweep`).
-2. **Capture** — the phone records 9 s at 48 kHz mono (resampled in the browser
-   if the AudioContext picked another rate) and uploads raw 16-bit PCM.
+1. **Excitation** — three 4 s exponential sine sweeps, 25 Hz–19 kHz, separated by
+   1 s of silence, with lead-in, tail and raised-cosine fades
+   (`dsp::make_sweep`).
+2. **Capture** — the phone records the whole train (~16 s) at 48 kHz mono
+   (resampled in the browser if the AudioContext picked another rate) and
+   uploads raw 16-bit PCM.
 3. **Deconvolution** — `H = Y·conj(X) / (|X|²+ε)` over a zero-padded FFT. The
    start delay and the microphone gain both drop out of `|H|`, so no clock sync
    is needed; drift between the PC's DAC and the phone's ADC is irrelevant for
    magnitude.
-4. **Sanity checks** — silence, clipping and "the sweep is not in this file"
-   (impulse energy must be concentrated within ±300 ms of its peak) are rejected
-   with a readable message.
-5. **Analysis** — 1/6-octave smoothing on a 1/24-octave log grid, normalise at
-   midband, subtract the mic calibration, add the target (flat or warm).
-6. **Design** — greedy band placement where the optimal gain for a centre/Q pair
+4. **Averaging** — the deconvolved response contains one room impulse per
+   sweep. Each is windowed (±1.5 s, Tukey) and their power spectra averaged.
+5. **Sanity checks** — silence, clipping, "the sweep is not in this file"
+   (impulse peak versus the response's RMS) and the trusted/untrusted mask
+   above.
+6. **Analysis** — 1/6-octave smoothing on a 1/24-octave log grid, normalise at
+   midband, subtract the mic calibration, derive the target.
+7. **Design** — greedy band placement where the optimal gain for a centre/Q pair
    has a closed form, then coordinate refinement against the exact biquad
-   response. Reports the residual RMS before/after.
-7. **Apply** — the band list goes into `settings.room_eq_*` and the existing
-   `crossfade::audio_filter()` emits it.
+   response, restricted to trusted points. Reports the residual RMS before/after.
+8. **Apply** — the band list goes into `settings.room_eq_*` and the existing
+   `crossfade::audio_filter()` emits `loudnorm? → volume(preamp)? → equalizer…`.
 
 ## The QR / HTTPS detail
 

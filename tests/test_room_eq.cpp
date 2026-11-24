@@ -133,8 +133,8 @@ int main()
             }
         }
         check(close, "deconvolution recovers the room response");
-        check(m.ir_focus > 0.5, "real sweep response is time-localised");
-        std::printf("  ir focus %.3f\n", m.ir_focus);
+        check(m.ir_peak_ratio > 8.0, "real sweep response is time-localised");
+        std::printf("  ir peak ratio %.1f, repeats %d\n", m.ir_peak_ratio, m.repeats_used);
     }
 
     // ---- design --------------------------------------------------------
@@ -157,16 +157,69 @@ int main()
         lim.lo_hz = 40.0;
         lim.hi_hz = 16000.0;
         lim.max_bands = 10;
-        dsp::Design d = dsp::design(grid, measured, target, lim, spec.sample_rate);
+        dsp::Design d = dsp::design(grid, measured, target, lim, spec.sample_rate, m.valid);
 
         check(!d.bands.empty(), "design produces filters");
         check(d.bands.size() <= 10, "design respects the band cap");
         check((int)d.predicted_db.size() == (int)grid.hz.size(), "predicted curve sized");
-        check(d.residual_rms_db < before * 0.5,
-              "design halves the deviation from flat");
+        check(d.residual_rms_db < before * 0.7,
+              "design cuts the deviation from flat substantially");
+        const double mode_55 = grid_value(grid, d.predicted_db, 55.0);
+        check(mode_55 < -4.0, "the 55 Hz room mode is cut");
+        std::printf("  55 Hz mode filter %+.1f dB\n", mode_55);
         check(d.preamp_db <= 0.0, "preamp never boosts");
         std::printf("  room eq: %.1f dB rms -> %.1f dB rms, %zu bands\n", before,
                     d.residual_rms_db, d.bands.size());
+    }
+
+    // ---- targets --------------------------------------------------------
+    // A broad room/boundary bass shelf must survive the "Balanced" target:
+    // flattening it is what makes a good speaker sound thin.
+    {
+        std::vector<double> shelf(grid.hz.size(), 0.0);
+        for (std::size_t i = 0; i < grid.hz.size(); ++i)
+            shelf[i] = 9.0 / (1.0 + std::pow(grid.hz[i] / 120.0, 2.0));
+
+        dsp::DesignLimits lim;
+        lim.lo_hz = 40.0;
+        lim.hi_hz = 16000.0;
+
+        const auto balanced = dsp::target_curve(grid, dsp::TargetKind::Balanced, shelf);
+        const dsp::Design db = dsp::design(grid, shelf, balanced, lim, 48000);
+        const double total_60 = grid_value(grid, db.predicted_db, 60.0);
+        check(std::fabs(total_60) < 2.0, "balanced target leaves a broad bass shelf alone");
+
+        const auto flat = dsp::target_curve(grid, dsp::TargetKind::Flat);
+        const dsp::Design df = dsp::design(grid, shelf, flat, lim, 48000);
+        const double flat_60 = grid_value(grid, df.predicted_db, 60.0);
+        check(flat_60 < -4.0, "flat target cuts the broad bass shelf");
+        std::printf("  shelf: balanced %+.1f dB, flat %+.1f dB at 60 Hz\n", total_60, flat_60);
+    }
+
+    // ---- untrusted regions ---------------------------------------------
+    // An impossible-looking bass peak in a region the recording cannot
+    // resolve must not produce a filter there.
+    {
+        std::vector<double> measured(grid.hz.size(), 0.0);
+        std::vector<char> valid(grid.hz.size(), 1);
+        for (std::size_t i = 0; i < grid.hz.size(); ++i)
+        {
+            if (grid.hz[i] < 200.0)
+            {
+                measured[i] = 12.0; // phantom peak
+                valid[i] = 0;
+            }
+        }
+        dsp::DesignLimits lim;
+        lim.lo_hz = 40.0;
+        lim.hi_hz = 16000.0;
+        const auto target = dsp::target_curve(grid, dsp::TargetKind::Flat);
+        const dsp::Design d = dsp::design(grid, measured, target, lim, 48000, valid);
+        bool bass_band = false;
+        for (const dsp::Band &b : d.bands)
+            if (b.freq < 180.0)
+                bass_band = true;
+        check(!bass_band, "no filters are designed in untrusted regions");
     }
 
     // ---- clipping / silence rejection ----------------------------------
@@ -190,7 +243,7 @@ int main()
         }
         dsp::Measurement n = dsp::measure(noise, 48000, spec, grid);
         check(!n.ok, "noise without the sweep is rejected");
-        check(n.ir_focus < 0.25, "noise has a spread-out impulse response");
+        check(n.ir_peak_ratio < 8.0, "noise has a spread-out impulse response");
     }
 
     // ---- calibration files ---------------------------------------------

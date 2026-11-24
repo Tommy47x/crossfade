@@ -214,7 +214,7 @@ async function begin() {
       bars[i].style.height = (6 + v * 46) + "px";
     }
     frames++;
-    if (frames < 90) requestAnimationFrame(tick);
+    if (analyser && ctx) requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
 
@@ -375,6 +375,14 @@ $("again").addEventListener("click", () => { show("intro"); setSteps(1); $("star
 $("retry").addEventListener("click", () => { show("intro"); setSteps(1); $("start").disabled = false; });
 $("pick").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => uploadFile(e.target.files && e.target.files[0]));
+
+// Lets the host pick the right microphone profile (e.g. a Galaxy S24) when the
+// user has not chosen one. Body, not a query string: UAs contain spaces.
+fetch(base + "/hello", {
+  method: "POST",
+  headers: { "Content-Type": "text/plain" },
+  body: navigator.userAgent
+}).catch(function () {});
 
 if (!SECURE) {
   $("uploadCard").hidden = false;

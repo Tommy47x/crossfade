@@ -13,22 +13,31 @@ namespace dsp
 struct SweepSpec
 {
     int sample_rate = 48000;
-    double f1 = 30.0;          // Hz
-    double f2 = 17000.0;       // Hz
-    double seconds = 6.0;      // sweep length, excluding lead-in/tail
+    double f1 = 25.0;          // Hz
+    double f2 = 19000.0;       // Hz
+    double seconds = 4.0;      // one sweep, excluding lead-in/tail
     double amplitude = 0.30;   // linear peak (~ -10.5 dBFS)
-    double lead_in = 0.8;      // silence before the sweep, seconds
-    double tail = 1.2;         // silence after the sweep, seconds
+    double lead_in = 0.8;      // silence before the first sweep, seconds
+    double tail = 1.2;         // silence after the last sweep, seconds
     double fade = 0.02;        // raised-cosine fade at both sweep ends
+    // Repeated sweeps improve the estimate: their responses are averaged.
+    int repeats = 3;
+    double gap = 1.0; // silence between sweeps, seconds
 
-    double total_seconds() const { return lead_in + seconds + tail; }
+    double total_seconds() const
+    {
+        const int r = repeats < 1 ? 1 : repeats;
+        return lead_in + (double)r * seconds + (double)(r - 1) * gap + tail;
+    }
 };
 
 struct Sweep
 {
-    std::vector<float> audio; // lead-in + sweep + tail
+    std::vector<float> audio; // lead-in + [sweep + gap]* + tail
     std::size_t core_begin = 0;
     std::size_t core_len = 0;
+    // Distance between the starts of two consecutive sweeps, in samples.
+    std::size_t repeat_stride = 0;
 };
 
 // Exponential (logarithmic) sine sweep — the excitation signal. The return
@@ -63,12 +72,20 @@ struct Measurement
     double peak_dbfs = -120.0;
     double noise_dbfs = -120.0;
     double snr_db = 0.0;
-    // Fraction of the deconvolved impulse energy that sits within ±300 ms of
-    // its peak. A sweep response is concentrated there; broadband noise is
-    // spread evenly, which is how "you forgot to play the sweep" is caught.
-    double ir_focus = 0.0;
+    // Peak of the deconvolved impulse relative to the RMS of the whole impulse
+    // response. A sweep deconvolves to sharp, time-localised events; noise
+    // spreads evenly and sits near ~5. This catches a recording made without
+    // the sweep far more reliably than any level check.
+    double ir_peak_ratio = 0.0;
     int clipped = 0;
-    std::vector<double> db; // deconvolved magnitude, normalised at midband
+    int repeats_used = 1;
+    std::vector<double> db;  // deconvolved magnitude, normalised at midband
+    // Per grid point: 1 when the estimate is above the noise/sanity limits and
+    // repeatable. Filters are never designed from untrusted points.
+    std::vector<char> valid;
+    // Per grid point: peak-to-peak spread across repeated sweeps, dB. Small on
+    // a real response, large where the estimate is just noise.
+    std::vector<double> spread_db;
 };
 
 // Estimates the transfer function of playback->room->microphone from the
@@ -87,13 +104,21 @@ std::vector<double> smooth_octave(const Grid &grid, const std::vector<double> &d
 
 enum class TargetKind
 {
-    Flat = 0,
+    // Follows the system's own broadband balance and only corrects deviations
+    // from it. This is the safe default: it fixes modes and comb peaks without
+    // turning a speaker that has bass into one that does not.
+    Balanced = 0,
+    // Balanced plus a gentle bass lift / treble tilt.
     Warm = 1,
+    // Flatten everything in the window to 0 dB. Aggressive: it removes the
+    // room's own bass gain and can sound thin.
+    Flat = 2,
 };
 
-// Correction target relative to the normalised measurement. `Flat` is a
-// neutral in-room response; `Warm` adds a small bass lift and treble tilt.
-std::vector<double> target_curve(const Grid &grid, TargetKind kind);
+// `measured_db` is required for Balanced/Warm (the target is derived from it)
+// and ignored for Flat. Pass an empty vector to fall back to Flat.
+std::vector<double> target_curve(const Grid &grid, TargetKind kind,
+                                 const std::vector<double> &measured_db = {});
 
 // ---------------------------------------------------------------- design ----
 
@@ -108,9 +133,11 @@ struct DesignLimits
 {
     double lo_hz = 40.0;       // correction window
     double hi_hz = 16000.0;
-    double max_boost_db = 6.0;
+    double max_boost_db = 3.0;
     double max_cut_db = -12.0;
     int max_bands = 12;
+    // User "amount": scales every correction after the frequency taper.
+    double strength = 1.0;
     // Positive corrections are additionally capped by the 1-octave smoothed
     // correction, so a narrow null is never filled with a huge boost.
     double boost_margin_db = 0.0;
@@ -126,10 +153,11 @@ struct Design
 };
 
 // Designs parametric peaking filters that move `measured_db` toward
-// `target_db` inside the correction window.
+// `target_db` inside the correction window. `valid` (optional, one entry per
+// grid point) marks points that are worth correcting at all.
 Design design(const Grid &grid, const std::vector<double> &measured_db,
               const std::vector<double> &target_db, const DesignLimits &limits,
-              int sample_rate);
+              int sample_rate, const std::vector<char> &valid = {});
 
 // |H| in dB of one peaking biquad at `f` (Audio EQ Cookbook, as implemented by
 // ffmpeg's `equalizer` filter and therefore by mpv's audio filter chain).

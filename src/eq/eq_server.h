@@ -34,6 +34,10 @@ void set_status(const std::string &state, const std::string &message);
 // worker thread; must be cheap and thread-safe).
 void set_wake(void (*fn)());
 
+// Last user agent reported by the phone page ("" before it loads). Used to
+// pick the microphone profile automatically when none was chosen.
+std::string phone_user_agent();
+
 // Phone -> host mailbox.
 void note_ready();
 bool consume_ready(); // true once per note_ready()

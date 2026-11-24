@@ -24,6 +24,21 @@ double clampd(double v, double lo, double hi)
     return std::max(lo, std::min(hi, v));
 }
 
+// Tukey (tapered cosine) window over t in [0,1]. Flat in the middle so the
+// early part of a room impulse is not attenuated, tapered so the truncation
+// does not ring.
+double tukey(double t, double alpha)
+{
+    t = clampd(t, 0.0, 1.0);
+    if (alpha <= 0.0)
+        return 1.0;
+    if (t < alpha * 0.5)
+        return 0.5 * (1.0 + std::cos(kPi * (2.0 * t / alpha - 1.0)));
+    if (t > 1.0 - alpha * 0.5)
+        return 0.5 * (1.0 + std::cos(kPi * (2.0 * t / alpha - 2.0 / alpha + 1.0)));
+    return 1.0;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- sweep ----
@@ -38,6 +53,7 @@ Sweep make_sweep(const SweepSpec &spec)
     const std::size_t n = (std::size_t)std::llround(T * (double)sr);
     const std::size_t lead = (std::size_t)std::llround(std::max(0.0, spec.lead_in) * (double)sr);
     const std::size_t tail = (std::size_t)std::llround(std::max(0.0, spec.tail) * (double)sr);
+    const std::size_t gap = (std::size_t)std::llround(std::max(0.0, spec.gap) * (double)sr);
 
     std::vector<float> core(n, 0.0f);
     const double K = std::log(f2 / f1);
@@ -61,10 +77,18 @@ Sweep make_sweep(const SweepSpec &spec)
         core[n - 1 - i] *= w;
     }
 
-    out.audio.assign(lead + n + tail, 0.0f);
-    std::copy(core.begin(), core.end(), out.audio.begin() + (std::ptrdiff_t)lead);
+    out.audio.assign(lead + (std::size_t)std::max(1, spec.repeats) * n +
+                         (std::size_t)(std::max(1, spec.repeats) - 1) * gap + tail,
+                     0.0f);
+    const std::size_t stride = n + gap;
+    for (int r = 0; r < std::max(1, spec.repeats); ++r)
+    {
+        const std::size_t at = lead + (std::size_t)r * stride;
+        std::copy(core.begin(), core.end(), out.audio.begin() + (std::ptrdiff_t)at);
+    }
     out.core_begin = lead;
     out.core_len = n;
+    out.repeat_stride = stride;
     return out;
 }
 
@@ -246,6 +270,7 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
         H[k] = Y[k] * std::conj(X[k]) / (std::norm(X[k]) + eps);
 
     m.db.assign(grid.hz.size(), 0.0);
+    std::vector<char> trusted(grid.hz.size(), 0);
     const double bin_hz = (double)sr / (double)N;
     double best_valid = grid.f_lo;
     bool have_valid = false;
@@ -255,7 +280,7 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
         const double f = grid.hz[i];
         // Ignore the band edges where the sweep has no energy: the ratio is
         // pure noise there and would otherwise look like a huge correction.
-        if (f < spec.f1 * 1.2 || f > spec.f2 / 1.2)
+        if (f < spec.f1 * 1.1 || f > spec.f2 / 1.1)
         {
             m.db[i] = std::nan("");
             continue;
@@ -267,6 +292,7 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
             continue;
         }
         m.db[i] = db(std::abs(H[k]));
+        trusted[i] = 1;
         if (!have_valid)
         {
             best_valid = m.db[i];
@@ -281,8 +307,8 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
     {
         // Band-limit the transfer function first: outside the sweep's band the
         // division is dominated by noise and would swamp the impulse.
-        const double lo = spec.f1 * 1.15;
-        const double hi = spec.f2 / 1.15;
+        const double lo = spec.f1 * 1.05;
+        const double hi = spec.f2 / 1.05;
         for (std::size_t k = 0; k < N; ++k)
         {
             const double fk = (k <= N / 2) ? (double)k * bin_hz
@@ -291,31 +317,135 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
                 H[k] = cplx(0.0, 0.0);
         }
         fft(H, true);
-        double peak = 0.0;
-        std::size_t peak_idx = 0;
-        for (std::size_t i = 0; i < N; ++i)
-            if (std::abs(H[i]) > peak)
-            {
-                peak = std::abs(H[i]);
-                peak_idx = i;
-            }
-        const std::size_t win = (std::size_t)((double)sr * 0.3);
-        double e_total = 0.0, e_local = 0.0;
+        double peak = 0.0, energy = 0.0;
         for (std::size_t i = 0; i < N; ++i)
         {
-            const double e = std::norm(H[i]);
-            e_total += e;
-            const std::size_t d = i > peak_idx ? i - peak_idx : peak_idx - i;
-            if (std::min(d, N - d) <= win)
-                e_local += e;
+            const double v = std::abs(H[i]);
+            peak = std::max(peak, v);
+            energy += v * v;
         }
-        m.ir_focus = e_total > 0.0 ? e_local / e_total : 0.0;
+        const double rms = std::sqrt(energy / (double)N);
+        m.ir_peak_ratio = peak / std::max(rms, 1e-30);
     }
-    if (m.ir_focus < 0.25)
+    if (m.ir_peak_ratio < 8.0)
     {
         m.error = "The sweep was not found in the recording. Start the measurement "
                   "and let the sweep play while the mic records.";
         return m;
+    }
+
+    // ---- repeat averaging ------------------------------------------------
+    // The measurement train contains several sweeps, so the deconvolved
+    // response contains one room impulse per sweep. Windowing and power
+    // averaging them is what makes repeated sweeps worth the extra seconds:
+    // ambient noise and one-off glitches average down.
+    const int repeats = std::max(1, spec.repeats);
+    const std::size_t db_len = grid.hz.size();
+    std::vector<double> spread_db(db_len, 0.0);
+    if (repeats > 1 && ref.repeat_stride > 0)
+    {
+        double peak = 0.0;
+        for (std::size_t i = 0; i < N; ++i)
+            peak = std::max(peak, std::abs(H[i]));
+        // Anchor on the first strong peak rather than the global one, so a
+        // noisy later repeat cannot shift every window.
+        std::size_t first = 0;
+        for (std::size_t i = 0; i < N; ++i)
+            if (std::abs(H[i]) > peak * 0.5)
+            {
+                first = i;
+                break;
+            }
+        const long search = (long)(0.05 * (double)sr);
+        auto local_peak = [&](std::size_t centre, double &level) {
+            std::size_t best_i = centre;
+            double best = -1.0;
+            for (long d = -search; d <= search; ++d)
+            {
+                const std::size_t idx =
+                    (std::size_t)(((long)centre + d + (long)N) % (long)N);
+                const double v = std::abs(H[idx]);
+                if (v > best)
+                {
+                    best = v;
+                    best_i = idx;
+                }
+            }
+            level = best;
+            return best_i;
+        };
+        double first_level = 0.0;
+        const std::size_t p0 = local_peak(first, first_level);
+
+        const std::size_t half = (std::size_t)(1.5 * (double)sr);
+        const std::size_t M = half * 2;
+        const std::size_t NF = next_pow2(M);
+        std::vector<double> power(grid.hz.size(), 0.0);
+        std::vector<std::vector<double>> per_repeat;
+        std::vector<cplx> seg(NF);
+        int used = 0;
+        for (int r = 0; r < repeats; ++r)
+        {
+            const std::size_t predicted = (p0 + (std::size_t)r * ref.repeat_stride) % N;
+            double level = 0.0;
+            const std::size_t centre = local_peak(predicted, level);
+            // A missing repeat (a single-sweep upload) or one buried in noise
+            // is skipped instead of being averaged in.
+            if (r > 0 && level < first_level * 0.2)
+                continue;
+            std::fill(seg.begin(), seg.end(), cplx(0.0, 0.0));
+            for (std::size_t i = 0; i < M; ++i)
+            {
+                const std::size_t idx = (centre + N - half + i) % N;
+                const double w = tukey((double)i / (double)(M - 1), 0.5);
+                seg[i] = cplx(H[idx].real() * w, 0.0);
+            }
+            fft(seg, false);
+            std::vector<double> rep(db_len, std::nan(""));
+            for (std::size_t i = 0; i < grid.hz.size(); ++i)
+            {
+                if (!trusted[i])
+                    continue;
+                const std::size_t k =
+                    (std::size_t)std::llround(grid.hz[i] * (double)NF / (double)sr);
+                if (k > 0 && k < NF / 2)
+                {
+                    power[i] += std::norm(seg[k]);
+                    rep[i] = 10.0 * std::log10(std::max(1e-30, std::norm(seg[k])));
+                }
+            }
+            per_repeat.push_back(std::move(rep));
+            ++used;
+        }
+        if (used > 1)
+        {
+            for (std::size_t i = 0; i < grid.hz.size(); ++i)
+                if (trusted[i] && power[i] > 0.0)
+                    m.db[i] = 10.0 * std::log10(power[i] / (double)used);
+            m.repeats_used = used;
+
+            // Repeatability: a real response reproduces across sweeps, while a
+            // noise-dominated bin scatters. The spread is what separates a
+            // measurement from the noise floor.
+            spread_db.assign(db_len, 0.0);
+            for (std::size_t i = 0; i < db_len; ++i)
+            {
+                if (!trusted[i])
+                    continue;
+                double lo = 1e9, hi = -1e9;
+                int seen = 0;
+                for (const auto &rep : per_repeat)
+                {
+                    if (!std::isfinite(rep[i]))
+                        continue;
+                    lo = std::min(lo, rep[i]);
+                    hi = std::max(hi, rep[i]);
+                    ++seen;
+                }
+                if (seen >= 2)
+                    spread_db[i] = hi - lo;
+            }
+        }
     }
 
     // Hold the edge values across the untrusted ends so plots stay sane.
@@ -336,36 +466,88 @@ Measurement measure(const std::vector<float> &recording, int sample_rate,
             v = best_valid;
 
     // Normalise around the midband: a microphone measures relative level.
-    double sum = 0.0;
-    int count = 0;
-    for (std::size_t i = 0; i < grid.hz.size(); ++i)
-        if (grid.hz[i] >= 250.0 && grid.hz[i] <= 2000.0)
-        {
-            sum += m.db[i];
-            ++count;
-        }
-    const double offset = count ? sum / (double)count : 0.0;
-    for (double &v : m.db)
-        v -= offset;
+    auto midband_mean = [&](bool trust_only) {
+        double sum = 0.0;
+        int count = 0;
+        for (std::size_t i = 0; i < grid.hz.size(); ++i)
+            if (grid.hz[i] >= 250.0 && grid.hz[i] <= 2000.0 &&
+                (!trust_only || m.valid[i]))
+            {
+                sum += m.db[i];
+                ++count;
+            }
+        return count ? sum / (double)count : 0.0;
+    };
 
+    // Anything far outside the midband is either inaudible (a speaker that
+    // cannot reach it) or an artifact. Correcting it only adds filters that
+    // do nothing or make things worse, so those points are marked untrusted.
+    // With repeated sweeps, repeatability separates signal from noise floor.
+    m.valid.assign(db_len, 0);
+    const double pre_offset = midband_mean(false);
+    for (std::size_t i = 0; i < db_len; ++i)
+    {
+        if (!trusted[i])
+            continue;
+        const double rel = m.db[i] - pre_offset;
+        bool ok = rel > -40.0 && rel < 25.0;
+        if (m.repeats_used >= 2 && spread_db[i] > 3.5)
+            ok = false;
+        m.valid[i] = ok ? 1 : 0;
+    }
+
+    double offset = midband_mean(true);
+    if (offset == 0.0)
+        offset = pre_offset;
+    for (std::size_t i = 0; i < db_len; ++i)
+        m.db[i] -= offset;
+
+    // Clean the mask: a real response is contiguous, while a single noise bin
+    // can pass both tests by chance (and would then attract a filter).
+    if (db_len >= 7)
+    {
+        std::vector<char> cleaned(db_len, 0);
+        for (std::size_t i = 0; i < db_len; ++i)
+        {
+            int hits = 0;
+            for (long d = -3; d <= 3; ++d)
+            {
+                const long j = (long)i + d;
+                if (j >= 0 && j < (long)db_len && m.valid[(std::size_t)j])
+                    ++hits;
+            }
+            cleaned[i] = hits >= 4 ? 1 : 0;
+        }
+        m.valid.swap(cleaned);
+    }
+
+    m.spread_db = spread_db;
     m.ok = true;
     return m;
 }
 
 // --------------------------------------------------------------- target ----
 
-std::vector<double> target_curve(const Grid &g, TargetKind kind)
+std::vector<double> target_curve(const Grid &g, TargetKind kind,
+                                 const std::vector<double> &measured_db)
 {
     std::vector<double> t(g.hz.size(), 0.0);
-    if (kind == TargetKind::Flat)
+    if (kind == TargetKind::Flat || measured_db.size() != g.hz.size())
         return t;
-    for (std::size_t i = 0; i < g.hz.size(); ++i)
+
+    // Broadband trend of the measurement (1 octave). Correcting the difference
+    // between this and the 1/6-octave curve leaves the speaker's voicing and
+    // the room's bass gain alone while still taming modes and comb peaks.
+    t = smooth_octave(g, measured_db, 1.0);
+    if (kind == TargetKind::Warm)
     {
-        const double f = g.hz[i];
-        // Gentle low shelf (+3 dB toward DC) and a mild treble tilt.
-        const double bass = 3.0 / (1.0 + std::pow(f / 90.0, 2.0));
-        const double treble = -2.0 / (1.0 + std::pow(3500.0 / f, 2.0));
-        t[i] = bass + treble;
+        for (std::size_t i = 0; i < g.hz.size(); ++i)
+        {
+            const double f = g.hz[i];
+            const double bass = 2.5 / (1.0 + std::pow(f / 70.0, 2.0));
+            const double treble = -1.0 / (1.0 + std::pow(4000.0 / f, 2.0));
+            t[i] += bass + treble;
+        }
     }
     return t;
 }
@@ -430,11 +612,28 @@ double window_weight(double f, double lo, double hi)
         return clampd((hi_edge - f) / (hi_edge - hi), 0.0, 1.0);
     return 1.0;
 }
+
+// Correction strength versus frequency. Above the room's transition region a
+// single-point measurement is dominated by comb filtering and the direct
+// sound, so a full-strength correction there makes things worse, not better.
+// Bass modes get the full treatment; the top octave gets almost nothing.
+double correction_taper(double f)
+{
+    if (f <= 400.0)
+        return 1.0;
+    if (f <= 2000.0)
+        return 1.0 - 0.45 * std::log2(f / 400.0) / std::log2(5.0);
+    if (f <= 10000.0)
+        return 0.55 - 0.35 * std::log2(f / 2000.0) / std::log2(5.0);
+    if (f <= 20000.0)
+        return 0.20 - 0.20 * std::log2(f / 10000.0);
+    return 0.0;
+}
 } // namespace
 
 Design design(const Grid &g, const std::vector<double> &measured_db,
               const std::vector<double> &target_db, const DesignLimits &limits,
-              int sample_rate)
+              int sample_rate, const std::vector<char> &valid)
 {
     Design out;
     const std::size_t n = g.hz.size();
@@ -442,14 +641,20 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
         return out;
     if (limits.hi_hz <= limits.lo_hz * 1.01 || limits.max_bands <= 0)
         return out;
+    const bool use_valid = valid.size() == n;
 
-    // 1. Raw correction, faded out at the window edges and clamped.
+    // 1. Raw correction, faded out at the window edges, tapered with
+    //    frequency and scaled by the user's strength, then clamped.
     std::vector<double> corr(n, 0.0), weight(n, 0.0);
+    const double strength = clampd(limits.strength, 0.1, 2.0);
     for (std::size_t i = 0; i < n; ++i)
     {
         weight[i] = window_weight(g.hz[i], limits.lo_hz, limits.hi_hz);
-        double c = (target_db[i] - measured_db[i]) * weight[i];
-        corr[i] = clampd(c, limits.max_cut_db, limits.max_boost_db);
+        if (use_valid && !valid[i])
+            weight[i] = 0.0;
+        const double taper = correction_taper(g.hz[i]);
+        const double c = (target_db[i] - measured_db[i]) * weight[i] * taper * strength;
+        corr[i] = clampd(c, limits.max_cut_db, limits.max_boost_db * taper);
     }
 
     // 2. Never fill narrow nulls: a boost may not exceed the broad trend.
@@ -468,7 +673,27 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
 
     const double lo = limits.lo_hz;
     const double hi = limits.hi_hz;
-    const int steps = (int)std::floor(std::log2(hi / lo) * 6.0);
+    (void)lo;
+    (void)hi;
+
+    // Candidate centres come only from trusted points. Otherwise the fitter
+    // happily parks a wide filter in a region that must not be touched and
+    // uses its skirt elsewhere (that produced -12 dB sub-bass holes).
+    std::vector<double> centres;
+    for (std::size_t i = 0; i < n; ++i)
+        if (weight[i] > 0.5)
+            centres.push_back(g.hz[i]);
+    const std::size_t thin = 4; // 1/6 octave on the 1/24-octave grid
+    if (centres.size() > thin)
+    {
+        std::vector<double> thinned;
+        for (std::size_t i = 0; i < centres.size(); i += thin)
+            thinned.push_back(centres[i]);
+        centres.swap(thinned);
+    }
+    if (centres.empty())
+        return out;
+
     for (int iter = 0; iter < max_bands; ++iter)
     {
         double best_sse = dot(residual, residual);
@@ -476,9 +701,8 @@ Design design(const Grid &g, const std::vector<double> &measured_db,
             break;
         Band best;
         double best_shape_sse = best_sse;
-        for (int s = 0; s <= steps; ++s)
+        for (double f : centres)
         {
-            const double f = lo * std::pow(hi / lo, (double)s / (double)steps);
             for (double q : kQs)
             {
                 Band unit{f, 1.0, q};

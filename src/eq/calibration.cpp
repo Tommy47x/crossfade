@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -82,6 +83,8 @@ bool g_secure = false;
 dsp::SweepSpec g_spec = default_spec();
 dsp::Grid g_grid = default_grid();
 std::string g_mic;
+float g_strength = 1.0f;
+std::string g_effective_mic;
 dsp::TargetKind g_target_kind = dsp::TargetKind::Flat;
 std::vector<dsp::CalPoint> g_cal;
 
@@ -183,17 +186,42 @@ std::vector<dsp::CalPoint> load_cal(const std::string &mic, std::string &error)
     return pts;
 }
 
-dsp::DesignLimits limits_for(const std::string &mic)
+dsp::DesignLimits limits_for(const std::string &mic, float strength)
 {
     dsp::DesignLimits l;
     const bool phone = (mic == "galaxy_s24" || mic == "phone_generic");
-    // A phone below ~90 Hz is guesswork even with the built-in profile.
+    // A phone below ~90 Hz is guesswork even with the built-in profile, and
+    // its top octave is mostly mic roll-off.
     l.lo_hz = phone ? 90.0 : 40.0;
-    l.hi_hz = 16000.0;
+    l.hi_hz = phone ? 12000.0 : 16000.0;
     l.max_bands = 12;
-    l.max_boost_db = 6.0;
+    l.max_boost_db = 3.0; // boosting room dips usually makes things worse
     l.max_cut_db = -12.0;
+    l.strength = std::max(0.3f, std::min(1.5f, strength));
     return l;
+}
+
+dsp::TargetKind target_kind_of(const std::string &id)
+{
+    if (id == "warm")
+        return dsp::TargetKind::Warm;
+    if (id == "flat")
+        return dsp::TargetKind::Flat;
+    return dsp::TargetKind::Balanced;
+}
+
+// A phone microphone is never flat, so an empty profile on the phone path
+// falls back to the best guess we have for that device.
+std::string resolve_mic(const std::string &chosen)
+{
+    if (!chosen.empty() || g_mode != Mode::Phone)
+        return chosen;
+    std::string ua = eqserver::phone_user_agent();
+    for (char &c : ua)
+        c = (char)std::tolower((unsigned char)c);
+    if (ua.find("sm-s92") != std::string::npos) // Galaxy S24 / S24+ / S24 Ultra
+        return "galaxy_s24";
+    return "phone_generic";
 }
 
 #ifndef P100_WINDOWS
@@ -320,8 +348,11 @@ void start_job(std::vector<float> samples, int rate)
     const dsp::SweepSpec spec = g_spec;
     const dsp::Grid grid = g_grid;
     const dsp::TargetKind kind = g_target_kind;
-    const std::vector<dsp::CalPoint> cal = g_cal;
-    const dsp::DesignLimits limits = limits_for(g_mic);
+    const std::string eff_mic = resolve_mic(g_mic);
+    std::string cal_error;
+    const std::vector<dsp::CalPoint> cal = load_cal(eff_mic, cal_error);
+    const dsp::DesignLimits limits = limits_for(eff_mic, g_strength);
+    g_effective_mic = eff_mic;
 
     std::thread worker([samples = std::move(samples), rate, session, spec, grid, kind, cal,
                         limits]() mutable {
@@ -334,14 +365,16 @@ void start_job(std::vector<float> samples, int rate)
             for (std::size_t i = 0; i < r.meas.db.size(); ++i)
                 r.meas.db[i] -= correction[i];
             r.smooth = dsp::smooth_octave(grid, r.meas.db, 1.0 / 6.0);
-            r.target = dsp::target_curve(grid, kind);
-            r.design = dsp::design(grid, r.smooth, r.target, limits, spec.sample_rate);
+            r.target = dsp::target_curve(grid, kind, r.smooth);
+            r.design = dsp::design(grid, r.smooth, r.target, limits, spec.sample_rate,
+                                   r.meas.valid);
             r.corrected = r.design.corrected_db;
 
             double sse = 0.0;
             int n = 0;
             for (std::size_t i = 0; i < grid.hz.size(); ++i)
-                if (grid.hz[i] >= limits.lo_hz && grid.hz[i] <= limits.hi_hz)
+                if (grid.hz[i] >= limits.lo_hz && grid.hz[i] <= limits.hi_hz &&
+                    (r.meas.valid.empty() || r.meas.valid[i]))
                 {
                     const double e = r.target[i] - r.smooth[i];
                     sse += e * e;
@@ -382,7 +415,7 @@ void finish_job()
         g_message = r.error.empty() ? "The measurement could not be used." : r.error;
         eqserver::set_status("error", g_message);
         // Let the phone poll the error, then close the page.
-        g_server_stop_at = now_sec() + 20.0;
+        g_server_stop_at = now_sec() + 60.0;
         return;
     }
     g_meas = r.meas;
@@ -395,8 +428,9 @@ void finish_job()
     g_stage = Stage::Ready;
     g_message = "Correction ready.";
     eqserver::set_status("done", "Done");
-    // Keep the page alive briefly so the phone sees the final state.
-    g_server_stop_at = now_sec() + 20.0;
+    // Keep the page alive: "Measure again" on the phone should not need a new
+    // scan. It is closed explicitly, on cancel, or after half an hour idle.
+    g_server_stop_at = now_sec() + 1800.0;
 }
 
 bool take_and_start_job()
@@ -555,8 +589,8 @@ bool start_phone(AppState &state, std::string &error)
     g_spec = default_spec();
     g_grid = default_grid();
     g_mic = state.settings.room_eq_mic;
-    g_target_kind = state.settings.room_eq_target == "warm" ? dsp::TargetKind::Warm
-                                                           : dsp::TargetKind::Flat;
+    g_strength = state.settings.room_eq_strength;
+    g_target_kind = target_kind_of(state.settings.room_eq_target);
     g_cal = load_cal(g_mic, error);
     if (!error.empty())
         return false;
@@ -598,8 +632,8 @@ bool start_pc_mic(AppState &state, const std::string &device, std::string &error
     g_spec = default_spec();
     g_grid = default_grid();
     g_mic = state.settings.room_eq_mic;
-    g_target_kind = state.settings.room_eq_target == "warm" ? dsp::TargetKind::Warm
-                                                           : dsp::TargetKind::Flat;
+    g_strength = state.settings.room_eq_strength;
+    g_target_kind = target_kind_of(state.settings.room_eq_target);
     g_cal = load_cal(g_mic, error);
     if (!error.empty())
         return false;
@@ -673,6 +707,7 @@ Status status()
     s.secure = g_secure;
     s.pc_mic = (g_mode == Mode::PcMic);
     s.has_result = g_has_result;
+    s.page_open = eqserver::running();
     s.sample_rate = g_spec.sample_rate;
     s.residual_before_db = g_before_db;
     s.residual_after_db = g_design.residual_rms_db;
@@ -683,8 +718,18 @@ Status status()
         s.target_db = g_target;
         s.corrected_db = g_corrected;
         s.bands = g_design.bands;
+        s.valid = g_meas.valid;
+        s.mic = g_effective_mic;
     }
     return s;
+}
+
+void close_page()
+{
+    if (eqserver::running())
+        eqserver::stop();
+    g_server_stop_at = 0.0;
+    g_url.clear();
 }
 
 bool apply(AppState &state)
@@ -718,6 +763,7 @@ void forget(AppState &state)
 void reset_result()
 {
     g_has_result = false;
+    g_effective_mic.clear();
     g_design = dsp::Design{};
     g_meas = dsp::Measurement{};
     g_smooth.clear();

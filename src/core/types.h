@@ -320,8 +320,10 @@ struct Settings
     float room_eq_preamp = 0.0f;
     // Microphone profile: "" (flat), "phone_generic", "galaxy_s24", "custom".
     std::string room_eq_mic;
-    // Correction target: "flat" or "warm".
-    std::string room_eq_target = "flat";
+    // Correction target: "balanced" (default), "warm" or "flat".
+    std::string room_eq_target = "balanced";
+    // How much of the measured deviation to correct (0.5 - 1.5).
+    float room_eq_strength = 1.0f;
     // Free-form label of the last successful calibration.
     std::string room_eq_label;
     // Residual deviation from the target after correction, dB RMS.
@@ -381,6 +383,7 @@ struct Settings
                room_eq_bands == o.room_eq_bands &&
                room_eq_preamp == o.room_eq_preamp && room_eq_mic == o.room_eq_mic &&
                room_eq_target == o.room_eq_target &&
+               room_eq_strength == o.room_eq_strength &&
                room_eq_label == o.room_eq_label &&
                room_eq_residual_db == o.room_eq_residual_db &&
                discord_client_id == o.discord_client_id &&

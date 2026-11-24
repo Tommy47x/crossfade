@@ -41,6 +41,13 @@ struct Status
     std::vector<double> target_db;
     std::vector<double> corrected_db; // measured + predicted filters
     std::vector<dsp::Band> bands;
+    // Per grid point: 1 where the measurement was trustworthy enough to
+    // correct (shown dimmed in the graph otherwise).
+    std::vector<char> valid;
+    // Microphone profile actually used for the result.
+    std::string mic;
+    // The phone page is still being served (so it can measure again).
+    bool page_open = false;
 };
 
 void init();
@@ -63,6 +70,8 @@ bool apply(AppState &state);
 void forget(AppState &state);
 // Drops the pending (unapplied) measurement so a new one can start cleanly.
 void reset_result();
+// Closes the phone page but keeps the current result on screen.
+void close_page();
 // Persists a REW-style .cal file and selects it as the microphone profile.
 bool import_cal(AppState &state, const std::string &path, std::string &error);
 std::string cal_file_path();

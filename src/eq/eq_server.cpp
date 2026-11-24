@@ -43,6 +43,7 @@ std::string g_page_state = "measuring";
 std::string g_page_message = "Waiting for the sweep…";
 std::vector<std::int16_t> g_pcm;
 int g_pcm_rate = 0;
+std::string g_user_agent;
 void (*g_wake)() = nullptr;
 
 std::string replace_all(std::string s, const std::string &from, const std::string &to)
@@ -269,8 +270,21 @@ bool start(const Config &cfg, std::string &error)
                  res.set_content(config_json, "application/json");
              });
 
-    svr->Post(R"(/e/([A-Za-z0-9_-]+)/ready)",
+    svr->Post(R"(/e/([A-Za-z0-9_-]+)/hello)",
               [token](const httplib::Request &req, httplib::Response &res) {
+                  if (req.matches.size() < 2 || req.matches[1].str() != token)
+                  {
+                      bad_token(res);
+                      return;
+                  }
+                  {
+                      std::lock_guard<std::mutex> lock(g_mail_mutex);
+                      g_user_agent = req.body.substr(0, 512);
+                  }
+                  res.set_content("{\"ok\":true}", "application/json");
+              });
+
+    svr->Post(R"(/e/([A-Za-z0-9_-]+)/ready)",              [token](const httplib::Request &req, httplib::Response &res) {
                   if (req.matches.size() < 2 || req.matches[1].str() != token)
                   {
                       bad_token(res);
@@ -373,6 +387,7 @@ void stop()
     g_ready = false;
     g_pcm.clear();
     g_pcm_rate = 0;
+    g_user_agent.clear();
 }
 
 bool running()
@@ -419,6 +434,12 @@ void note_ready()
 void set_wake(void (*fn)())
 {
     g_wake = fn;
+}
+
+std::string phone_user_agent()
+{
+    std::lock_guard<std::mutex> lock(g_mail_mutex);
+    return g_user_agent;
 }
 
 bool consume_ready()
