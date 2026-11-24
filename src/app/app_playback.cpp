@@ -254,7 +254,7 @@ void resolve_audio(const std::string &video_id, const std::string &video_url,
 
 
 void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
-                       int cancel_search_id)
+                       int cancel_search_id, size_t batch)
 {
     if (power::low_power())
         return; // no speculative network work in low power mode
@@ -278,12 +278,15 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
     if (ids.empty())
         return;
 
-    tasks::spawn("prefetch", [ids = std::move(ids), cancel_search_id]()
+    tasks::spawn("prefetch", [ids = std::move(ids), cancel_search_id, batch]()
     {
         // Resolve in backend-parallel batches. One command per batch keeps the
         // pipe from serializing four extractions behind each other; between
-        // batches we can still abandon a superseded search.
-        const size_t kBatch = (size_t)tunable_int("playback.prefetch_batch");
+        // batches we can still abandon a superseded search. Background batches
+        // request a small size so a lyrics request can slip in between them.
+        const size_t kBatch = batch > 0
+                                  ? batch
+                                  : (size_t)tunable_int("playback.prefetch_batch");
         for (size_t start = 0; start < ids.size(); start += kBatch)
         {
             if (cancel_search_id != 0 && g_state.search_id != cancel_search_id)
@@ -292,20 +295,30 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
                 // URLs stay warmed) so a future list can warm them again.
                 std::lock_guard<std::mutex> lock(g_prefetch_mutex);
                 for (size_t j = start; j < ids.size(); ++j)
-                    g_prefetched_urls.erase(ids[j]);
+                {
+                    auto it = g_prefetched_urls.find(ids[j]);
+                    if (it != g_prefetched_urls.end() && it->second.empty())
+                        g_prefetched_urls.erase(it);
+                }
                 return;
             }
             std::vector<std::string> batch(ids.begin() + start,
                                            ids.begin() + std::min(ids.size(), start + kBatch));
-            auto urls = fetch_stream_urls_prefetch(batch);
+            auto urls = fetch_stream_urls_prefetch(batch, /*background=*/true);
             std::lock_guard<std::mutex> lock(g_prefetch_mutex);
             for (const std::string &id : batch)
             {
                 auto it = urls.find(id);
-                if (it == urls.end() || it->second.empty())
-                    g_prefetched_urls.erase(id); // failed: allow a retry later
-                else
+                if (it != urls.end() && !it->second.empty())
                     g_prefetched_urls[id] = it->second;
+                else
+                {
+                    // Failed: allow a retry later, but never drop a URL the
+                    // priority hover worker warmed in the meantime.
+                    auto cur = g_prefetched_urls.find(id);
+                    if (cur != g_prefetched_urls.end() && cur->second.empty())
+                        g_prefetched_urls.erase(cur);
+                }
             }
         }
     });
@@ -315,6 +328,65 @@ void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
 // a row we can have its URL ready before the click lands. One at a time, and
 // only for rows not already reserved by the list prefetch.
 static std::atomic<bool> g_hover_prefetch_active{false};
+static std::mutex g_hover_pending_mutex;
+static std::string g_hover_pending;
+static bool g_hover_pending_set = false;
+
+void prefetch_hovered_track(const std::string &video_id);
+
+static bool prefetch_url_ready(const std::string &video_id)
+{
+    std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+    auto it = g_prefetched_urls.find(video_id);
+    return it != g_prefetched_urls.end() && !it->second.empty();
+}
+
+static void finish_hover_cycle()
+{
+    std::string next;
+    {
+        std::lock_guard<std::mutex> lock(g_hover_pending_mutex);
+        if (g_hover_pending_set)
+        {
+            next = std::move(g_hover_pending);
+            g_hover_pending.clear();
+            g_hover_pending_set = false;
+        }
+    }
+    if (!next.empty())
+    {
+        // Re-enter through the public entry so its checks run on the latest id.
+        g_hover_prefetch_active.store(false);
+        prefetch_hovered_track(next);
+    }
+    else
+    {
+        g_hover_prefetch_active.store(false);
+    }
+}
+
+static void start_hover_prefetch(const std::string &video_id)
+{
+    tasks::spawn("hover-prefetch", [video_id]()
+    {
+        auto urls = fetch_stream_urls_prefetch(std::vector<std::string>{video_id});
+        {
+            std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+            auto it = urls.find(video_id);
+            if (it != urls.end() && !it->second.empty())
+                g_prefetched_urls[video_id] = it->second;
+            else
+            {
+                // Keep a URL another channel may have warmed meanwhile.
+                auto cur = g_prefetched_urls.find(video_id);
+                if (cur != g_prefetched_urls.end() && cur->second.empty())
+                    g_prefetched_urls.erase(cur);
+            }
+        }
+        g_state.repaint_requested = true;
+        finish_hover_cycle();
+    });
+}
 
 void prefetch_hovered_track(const std::string &video_id)
 {
@@ -322,34 +394,50 @@ void prefetch_hovered_track(const std::string &video_id)
         return;
     if (!find_cached_audio_path(video_id).empty())
         return;
-    if (g_hover_prefetch_active.exchange(true))
+    if (prefetch_url_ready(video_id))
         return;
+    if (g_hover_prefetch_active.exchange(true))
     {
-        std::lock_guard<std::mutex> lock(g_prefetch_mutex);
-        if (g_prefetched_urls.count(video_id))
-        {
-            g_hover_prefetch_active.store(false);
-            return;
-        }
-        g_prefetched_urls[video_id]; // reserve the in-flight slot
+        // One resolve at a time on the priority channel; remember the latest
+        // request so the row hovered while busy still gets warmed.
+        std::lock_guard<std::mutex> lock(g_hover_pending_mutex);
+        g_hover_pending = video_id;
+        g_hover_pending_set = true;
+        return;
     }
-
-    tasks::spawn("hover-prefetch", [video_id]()
-    {
-        auto urls = fetch_stream_urls_prefetch(std::vector<std::string>{video_id});
-        {
-            std::lock_guard<std::mutex> lock(g_prefetch_mutex);
-            auto it = urls.find(video_id);
-            if (it == urls.end() || it->second.empty())
-                g_prefetched_urls.erase(video_id);
-            else
-                g_prefetched_urls[video_id] = it->second;
-        }
-        g_hover_prefetch_active.store(false);
-        g_state.repaint_requested = true;
-    });
+    start_hover_prefetch(video_id);
 }
 
+// "Prefetch the world": warm the visible list (not just the hovered row).
+// Runs on the meta channel so it cannot delay a click or a hover warmup.
+void prefetch_visible_list_if_aggressive()
+{
+    if (!g_state.settings.aggressive_prefetch || power::low_power())
+        return;
+    TrackListPtr list = get_playlist(g_state);
+    if (!list || list->empty())
+        return;
+    // Only when the page/list actually changes: the per-id reservation map
+    // would make repeats cheap, but walking a 1000-row list every frame is not.
+    static uint64_t s_sig = 0;
+    uint64_t sig = (uint64_t)(int)g_state.current_tab * 1000003u;
+    sig ^= (uint64_t)list->size() * 7919u;
+    sig ^= (uint64_t)(g_state.selected_playlist_index + 1) << 17;
+    if (!list->front().id.empty())
+        sig ^= std::hash<std::string>{}(list->front().id);
+    if (list->size() > 1 && !list->back().id.empty())
+        sig ^= std::hash<std::string>{}(list->back().id) << 1;
+    if (sig == s_sig)
+        return;
+    s_sig = sig;
+    const size_t count =
+        (size_t)std::max(0, tunable_int("prefetch.aggressive_count"));
+    if (count > 0)
+    {
+        const size_t batch = (size_t)std::max(1, tunable_int("prefetch.aggressive_batch"));
+        prefetch_urls_for(*list, count, 0, batch);
+    }
+}
 
 void prefetch_urls_for_serial(const std::vector<Track> &tracks, size_t count,
                               const std::atomic<uint64_t> *cancel_token,
@@ -387,7 +475,11 @@ void prefetch_urls_for_serial(const std::vector<Track> &tracks, size_t count,
             {
                 std::lock_guard<std::mutex> lock(g_prefetch_mutex);
                 if (url.empty())
-                    g_prefetched_urls.erase(id);
+                {
+                    auto cur = g_prefetched_urls.find(id);
+                    if (cur != g_prefetched_urls.end() && cur->second.empty())
+                        g_prefetched_urls.erase(cur);
+                }
                 else
                     g_prefetched_urls[id] = url;
             }

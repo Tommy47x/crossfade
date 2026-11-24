@@ -680,6 +680,8 @@ bool apply(const Target &target, const std::string &stage_dir,
             add_file("scripts/crossfade-login-helper.py",
                      share + "/scripts/crossfade-login-helper.py", false);
             add_file("scripts/bootstrap-venv.sh", share + "/scripts/bootstrap-venv.sh", true);
+            add_file("scripts/fetch-js-runtime.sh",
+                     share + "/scripts/fetch-js-runtime.sh", true);
             add_dir("assets-fonts", share + "/assets/fonts");
             add_file("crossfade.desktop",
                      target.root + "/share/applications/crossfade.desktop", false);
@@ -719,11 +721,28 @@ bool apply(const Target &target, const std::string &stage_dir,
             run_with_timeout({share + "/scripts/bootstrap-venv.sh", share + "/venv",
                               share + "/requirements.txt"},
                              180, stage_dir + "/venv.log");
+        // Existing installs predate the JavaScript runtime; provision it now so
+        // an in-app update does not leave playback on "Requested format is not
+        // available". Best-effort: the app still starts if this fails.
+        {
+            const std::string fetch = share + "/scripts/fetch-js-runtime.sh";
+            std::error_code fetch_ec;
+            if (fs::is_regular_file(fetch, fetch_ec))
+                run_with_timeout({fetch, share + "/runtime"}, 300,
+                                 stage_dir + "/runtime.log");
+        }
         rewrite_desktop_exec(target.root + "/share/applications/crossfade.desktop",
                              target.root + "/bin/crossfade");
     }
     else if (target.kind == Kind::FlatDir)
     {
+        // Portable layout: the runtime lives beside the executable, which is
+        // also this update's root.
+        const std::string fetch = target.root + "/scripts/fetch-js-runtime.sh";
+        std::error_code fetch_ec;
+        if (fs::is_regular_file(fetch, fetch_ec))
+            run_with_timeout({fetch, target.root + "/runtime"}, 300,
+                             stage_dir + "/runtime.log");
         rewrite_desktop_exec(target.root + "/crossfade.desktop",
                              target.root + "/crossfade");
     }

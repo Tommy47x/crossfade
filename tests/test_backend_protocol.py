@@ -68,6 +68,29 @@ def main():
             print("FAIL:", what, file=sys.stderr)
             failures += 1
 
+    # JavaScript runtime plumbing for yt-dlp (--js-runtimes).
+    saved_runtime = core._JS_RUNTIME
+    try:
+        core._JS_RUNTIME = "deno:/opt/deno"
+        check(core._js_runtime_opts() == {'js_runtimes': {'deno': {'path': '/opt/deno'}}},
+              "runtime spec becomes js_runtimes options")
+        check(core._js_runtime_args() == ['--js-runtimes', 'deno:/opt/deno'],
+              "runtime spec becomes a yt-dlp argument")
+        core._JS_RUNTIME = ""
+        check(core._js_runtime_opts() == {}, "no runtime means no options")
+        check(core._js_runtime_args() == [], "no runtime means no argument")
+    finally:
+        core._JS_RUNTIME = saved_runtime
+    check(core._format_dead_end("ERROR: Requested format is not available"),
+          "format errors stop the client cascade")
+    check(core._format_dead_end("Signature solving failed: missing runtime"),
+          "challenge failures stop the client cascade")
+    check(not core._format_dead_end("connection reset by peer"),
+          "network errors still walk the client cascade")
+    check("JavaScript runtime" in core._missing_runtime_hint(
+              "Requested format is not available"),
+          "a missing runtime is explained to the user")
+
     core.get_home_tracks = lambda yt, limit=40: [{"id": "home", "limit": limit}]
     core.search_tracks = lambda yt, query, limit=20: [{"id": "s", "q": query}]
     core.search_all = lambda yt, query, limit=20: {

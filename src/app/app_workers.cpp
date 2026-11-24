@@ -331,10 +331,11 @@ void search_all_and_update(const std::string &query, int expect_id)
         top_in.local_tracks = library::search_tracks(query, 60);
         TopResult top = choose_search_top(top_in);
 
-        // Warm the URLs of the visible results so clicking one starts fast.
-        // Depth matches the rows a search page shows; warming runs on the
-        // main backend channel and aborts as soon as search_id changes.
-        prefetch_urls_for(results.songs, (size_t)tunable_int("search.prefetch_count"), expect_id);
+        // Store the page first so the hero/rows can be used immediately, then
+        // warm the intent match on the priority channel *before* the bulk
+        // list (the bulk runs on the meta channel and must not delay it).
+        const std::string top_id =
+            top.kind == TopKind::Song ? top.id : std::string();
         std::atomic_store(&g_state.search_results,
                           std::make_shared<const std::vector<Track>>(std::move(results.songs)));
         std::atomic_store(&g_state.search_album_results,
@@ -343,6 +344,12 @@ void search_all_and_update(const std::string &query, int expect_id)
                           std::make_shared<const std::vector<ArtistSummary>>(std::move(results.artists)));
         std::atomic_store(&g_state.search_top,
                           std::make_shared<const TopResult>(std::move(top)));
+        if (!top_id.empty())
+            prefetch_hovered_track(top_id);
+        // Warm the rest of the visible results: depth matches the rows a
+        // search page shows, and the batch aborts when search_id changes.
+        prefetch_urls_for(results.songs,
+                          (size_t)tunable_int("search.prefetch_count"), expect_id);
         g_state.current_playlist_source = PlaylistSource::SEARCH;
         g_state.search_loading = false;
         // Success clears any previous failure state; a genuinely empty result

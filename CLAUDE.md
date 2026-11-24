@@ -26,7 +26,12 @@ cmake --build build -j"$(nproc)"
 - Windows: UCRT64 MSYS2 toolchain, SDL2, mpv; desktop integration links
   `runtimeobject`, `propsys`, `ole32` and `shell32` (SMTC + toasts)
 - Python 3 with `ytmusicapi` and `yt-dlp` in an isolated venv
-- For browser auth: run `p100-login` (or `./scripts/p100-login`) to create
+- Deno for playback: yt-dlp needs a JavaScript runtime for YouTube's
+  signature/challenge checks. `install.sh` and the update path fetch a pinned
+  build into `<share>/runtime/deno` (`scripts/fetch-js-runtime.sh`); a system
+  `deno`/`node` is also detected. Without it, stream resolution fails with
+  "Requested format is not available".
+- For browser auth: run `crossfade-login` (or `./scripts/crossfade-login`) to create
   `<config>/browser.json`
 
 `./install.sh` installs to `~/.local` by default:
@@ -72,7 +77,9 @@ Desktop YouTube Music client. C++ frontend (SDL2 + OpenGL + Dear ImGui) drives t
 ```
 p100 binary (C++)
   ├── mpv (libmpv)          — audio playback, gapless/crossfade
-  ├── Python backend (fork) — stdin/stdout JSON protocol, communicates with ytmusicapi
+  ├── Python backends (main/play/prefetch/meta) — stdin/stdout JSON protocol;
+  │     main is id-tagged and concurrent (4-thread pool, per-thread YTMusic),
+  │     the others are serial; lyrics + background warmups run off main
   └── yt-dlp subprocess     — audio stream URL extraction, audio file caching
 ```
 

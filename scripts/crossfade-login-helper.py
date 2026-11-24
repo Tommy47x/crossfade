@@ -143,22 +143,35 @@ def _read_cookies(path):
 # Capability probing
 # ---------------------------------------------------------------------------
 
-def _webkit_imports():
+def _webkit_probe():
+    """Return (imports, reason); reason explains a missing WebKitGTK."""
     try:
         import gi
     except Exception:
-        return None
+        return None, "PyGObject (python3-gobject) is not installed"
+    reason = "WebKitGTK is not installed (no WebKit or WebKit2 typelib)"
     for ns, ver, gtk_ver in WEBKIT_SPECS:
         try:
             gi.require_version(ns, ver)
+        except Exception:
+            continue
+        try:
             gi.require_version("Gtk", gtk_ver)
+        except Exception:
+            reason = f"GTK {gtk_ver.split('.')[0]} is not installed"
+            continue
+        try:
             Gtk = importlib.import_module("gi.repository.Gtk")
             WebKit = importlib.import_module("gi.repository." + ns)
             GLib = importlib.import_module("gi.repository.GLib")
-            return ns, ver, gtk_ver, Gtk, WebKit, GLib
-        except Exception:
-            continue
-    return None
+            return (ns, ver, gtk_ver, Gtk, WebKit, GLib), ""
+        except Exception as e:
+            reason = f"{ns} {ver} is installed but could not be loaded ({e})"
+    return None, reason
+
+
+def _webkit_imports():
+    return _webkit_probe()[0]
 
 
 def _qt_binding():
@@ -172,6 +185,19 @@ def _qt_binding():
         except Exception:
             continue
     return ""
+
+
+def _qt_reason():
+    found = []
+    for name in QT_BINDINGS:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                found.append(name)
+        except Exception:
+            continue
+    if not found:
+        return "no Qt for Python (PyQt6, PySide6, PyQt5 or PySide2) is installed"
+    return ", ".join(found) + " is installed without QtWebEngineWidgets"
 
 
 def _webview2_available():
@@ -193,52 +219,95 @@ def _engine_available_here(engine):
     return False
 
 
+_PREFIX_CACHE = {}
+
+
+def _interpreter_prefix(path):
+    """sys.prefix of `path`, or None when it cannot be asked."""
+    if path in _PREFIX_CACHE:
+        return _PREFIX_CACHE[path]
+    prefix = None
+    try:
+        proc = subprocess.run([path, "-c", "import sys; print(sys.prefix)"],
+                              capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0 and proc.stdout.strip():
+            prefix = os.path.realpath(proc.stdout.strip())
+    except Exception:
+        prefix = None
+    _PREFIX_CACHE[path] = prefix
+    return prefix
+
+
+def _interp_identity(path):
+    """Identify an interpreter *environment*, not just its binary.
+
+    A venv's bin/python is normally a symlink to the system interpreter, so
+    comparing realpaths made every venv look like the system python and hid it.
+    The app's venv has no system site-packages, so PyGObject/WebKitGTK lives
+    only in the system interpreter and sign-in never found it (Fedora, Debian,
+    Arch -- any distro where the venv links instead of copying).
+    """
+    binary = os.path.realpath(path)
+    return binary, _interpreter_prefix(path)
+
+
 def _system_pythons():
-    candidates = []
     env = os.environ.get("P100_SYSTEM_PYTHON")
-    if env:
-        candidates.append(env)
+    candidates = [env] if env else []
     candidates += ["/usr/bin/python3", "/usr/local/bin/python3", shutil.which("python3")]
     out = []
-    seen = {os.path.realpath(sys.executable)}
+    seen = {_interp_identity(sys.executable)}
     for py in candidates:
-        if not py:
+        if not py or not os.path.exists(py) or not os.access(py, os.X_OK):
             continue
-        real = os.path.realpath(py)
-        if real in seen or not os.path.exists(real):
+        key = _interp_identity(py)
+        if key in seen:
             continue
-        seen.add(real)
+        seen.add(key)
         out.append(py)
     return out
 
 
 def _probe_engine_here(engine):
-    if _engine_available_here(engine):
-        if engine == "webkit":
-            info = _webkit_imports()
-            return True, f"WebKitGTK {info[1]}"
-        if engine == "qt":
-            return True, _qt_binding()
-        return True, "WebView2 (pywebview)"
-    return False, "not available in this interpreter"
+    if engine == "webkit":
+        imports, reason = _webkit_probe()
+        if imports:
+            return True, f"WebKitGTK {imports[1]}"
+        return False, reason
+    if engine == "qt":
+        binding = _qt_binding()
+        if binding:
+            return True, binding
+        return False, _qt_reason()
+    if engine == "webview2":
+        if _webview2_available():
+            return True, "WebView2 (pywebview)"
+        return False, "pywebview is not installed (Windows only)"
+    return False, "unknown engine"
 
 
 def _probe_engine(engine):
     ok, label = _probe_engine_here(engine)
     if ok or engine == "webview2" or sys.platform == "win32":
         return ok, label
+    # The app venv usually lacks PyGObject/Qt, while the system interpreter
+    # may have them. Keep every attempt's reason so the panel can say what is
+    # actually missing instead of a bare "unavailable".
+    reasons = ["this python: " + label]
     for py in _system_pythons():
         try:
             proc = subprocess.run(
                 [py, os.path.abspath(__file__), "--probe-engine", engine],
                 capture_output=True, text=True, timeout=20)
+            data = {}
             if proc.returncode == 0 and proc.stdout.strip():
                 data = json.loads(proc.stdout.strip().splitlines()[-1])
-                if data.get("available"):
-                    return True, data.get("label") or py
+            if data.get("available"):
+                return True, data.get("label") or py
+            reasons.append("%s: %s" % (py, data.get("label") or "not available"))
         except Exception:
-            continue
-    return False, label
+            reasons.append("%s: could not be started" % py)
+    return False, "; ".join(reasons)
 
 
 def probe_payload():
@@ -493,7 +562,14 @@ def run_qt(out_path):
     state = {"cookies": {}, "done": False, "closed": False, "error": ""}
 
     def on_cookie(cookie):
+        # Only the YouTube host's cookies are valid for music.youtube.com.
+        # The store also sees accounts.google.com during the login flow, and
+        # those copies of HSID/SSID/__Secure-*PSIDTS differ per domain -- mixing
+        # them makes Google treat the session as anonymous.
         try:
+            domain = (cookie.domain() or "").lower().lstrip(".")
+            if domain and not domain.endswith("youtube.com"):
+                return
             state["cookies"][cookie.name()] = _cookie_text(cookie.value())
         except Exception:
             pass
@@ -688,15 +764,20 @@ def _invoke_engine(engine, out_path):
         return _run_engine(engine, out_path)
     if engine == "webview2":
         return EXIT_NO_ENGINE, "pywebview is not installed"
+    # The app venv rarely has PyGObject/Qt; fall back to a system interpreter
+    # that has system site-packages (the venv symlinks its binary, so this is
+    # also the case where the system python must not be deduped away).
+    reasons = ["this python: " + _probe_engine_here(engine)[1]]
     for py in _system_pythons():
         try:
             rc = subprocess.call(
                 [py, os.path.abspath(__file__), "--engine", engine, "--out", out_path])
             if rc != EXIT_NO_ENGINE:
                 return rc, f"{engine} (via {py})"
-        except Exception:
-            continue
-    return EXIT_NO_ENGINE, f"{engine} is not available"
+            reasons.append("%s: no engine" % py)
+        except Exception as e:
+            reasons.append("%s: %s" % (py, e))
+    return EXIT_NO_ENGINE, "; ".join(reasons)
 
 
 def cmd_signin(choice):
@@ -726,7 +807,8 @@ def cmd_signin(choice):
             continue
         if rc == EXIT_CANCELLED:
             return EXIT_CANCELLED
-    log("No embedded sign-in engine worked; use the paste panel.")
+    log("No embedded sign-in engine is available; sign in with your browser "
+        "and import the session instead.")
     return EXIT_BLOCKED if attempted else EXIT_NO_ENGINE
 
 
@@ -742,16 +824,20 @@ def cmd_import_cookies(choice):
                 root = None
                 if name == "librewolf":
                     root = _browser_candidates()["librewolf"][0]
-                cookies = login.cookies_from_firefox(profile_root=root)
+                sessions = login.firefox_sessions(profile_root=root)
             else:
-                cookies = login.cookies_from_ytdlp_browser(name)
+                sessions = [(name, login.cookies_from_ytdlp_browser(name))]
         except Exception as e:
             log(f"{name}: {e}")
             continue
-        ok, message = login.install_from_cookies(cookies)
-        log(f"{name}: {message}")
-        if ok:
-            return EXIT_OK
+        if not sessions:
+            log(f"{name}: no signed-in session found")
+            continue
+        for profile, cookies in sessions:
+            ok, message = login.install_from_cookies(cookies)
+            log(f"{name} [{os.path.basename(profile)}]: {message}")
+            if ok:
+                return EXIT_OK
     log("No usable signed-in browser session was found.")
     return EXIT_REJECTED
 

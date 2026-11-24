@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -66,6 +67,35 @@ def _tune(key, default):
 
 def _tunei(key, default):
     return int(round(_tune(key, default)))
+
+
+def _install_http_timeout():
+    """Bound ytmusicapi's HTTP requests.
+
+    ytmusicapi's default session uses a 30 s timeout. One stalled request then
+    blocks the whole command channel for half a minute, which is exactly the
+    "opening an album fails and everything is down" symptom. Fail fast instead
+    so the retry can succeed.
+    """
+    try:
+        import requests
+    except Exception:
+        return
+    original = requests.Session.request
+    if getattr(original, '_crossfade_timeout', False):
+        return
+    default = max(3.0, _tune('backend.ytmusic_timeout_sec', 8))
+
+    def request(self, *args, **kwargs):
+        if kwargs.get('timeout') is None:
+            kwargs['timeout'] = default
+        return original(self, *args, **kwargs)
+
+    request._crossfade_timeout = True
+    requests.Session.request = request
+
+
+_install_http_timeout()
 
 
 _STREAM_TTL = _tunei('backend.stream_ttl_sec', 7200)  # googlevideo URLs are valid ~6h; probed before caching
@@ -1381,19 +1411,13 @@ def login_state(yt):
     YTMusic object can be constructed from an incomplete or stale cookie file
     and then silently send anonymous requests; only this flag distinguishes
     that from a real sign-in.
+
+    The parser lives in login.py so the import helper verifies sessions with
+    exactly the same check the backend uses to pick guest or account mode.
     """
-    try:
-        response = yt._send_request("account/account_menu", {})
-    except Exception:
-        return None
-    tracking = response.get('responseContext', {}).get('serviceTrackingParams', [])
-    for service in tracking:
-        if service.get('service') != 'GFEEDBACK':
-            continue
-        for param in service.get('params', []):
-            if param.get('key') == 'logged_in':
-                return str(param.get('value')) == '1'
-    return None
+    from .login import server_login_state
+
+    return server_login_state(yt)
 
 
 def check_logged_in(yt):
@@ -1549,21 +1573,40 @@ def get_lyrics(yt, video_id):
     track_name, artist_name, album_name, duration_sec = _extract_meta(
         (watch.get('tracks') or [None])[0])
 
+    # Providers run on the background "meta" channel, but the panel still
+    # waits for the reply: cap the whole cascade so one dead provider cannot
+    # hold the request for a minute.
+    deadline = time.time() + _tune('backend.lyrics_deadline_sec', 8)
+    per_call = _tune('backend.lyrics_provider_timeout_sec', 4)
+
     providers = (
-        lambda: _ytm_timed_lyrics(browse_id),
-        lambda: _lrclib_lyrics(artist_name, track_name, album_name, duration_sec),
-        lambda: _netease_lyrics(track_name, artist_name, duration_sec),
-        lambda: _kugou_lyrics(track_name, artist_name, duration_sec),
-        lambda: _lyrics_ovh(artist_name, track_name),
-        lambda: _ytm_plain_lyrics(yt, browse_id),
+        ('ytm-timed', lambda: _ytm_timed_lyrics(browse_id, timeout=per_call)),
+        ('lrclib', lambda: _lrclib_lyrics(artist_name, track_name, album_name,
+                                          duration_sec, timeout=per_call)),
+        ('netease', lambda: _netease_lyrics(track_name, artist_name, duration_sec,
+                                            timeout=per_call)),
+        ('kugou', lambda: _kugou_lyrics(track_name, artist_name, duration_sec,
+                                        timeout=per_call)),
+        ('lyrics-ovh', lambda: _lyrics_ovh(artist_name, track_name, timeout=per_call)),
+        ('ytm-plain', lambda: _ytm_plain_lyrics(yt, browse_id)),
     )
 
     plain_fallback = None
-    for provider in providers:
+    for name, provider in providers:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"[lyrics] {video_id} {name} skipped (deadline)", file=sys.stderr,
+                  flush=True)
+            break
+        started = time.perf_counter()
         try:
             result = provider()
         except Exception:
             result = None
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        hit = bool(result)
+        print(f"[lyrics] {video_id} {name} {elapsed_ms:.0f}ms "
+              f"{'hit' if hit else 'miss'}", file=sys.stderr, flush=True)
         if not result:
             continue
         if result.get('synced'):
@@ -1693,7 +1736,7 @@ def _strip_lrc_tags(text):
 
 # ---- Providers ----------------------------------------------------------
 
-def _ytm_timed_lyrics(browse_id):
+def _ytm_timed_lyrics(browse_id, timeout=None):
     """
     YouTube Music's own timed lyrics. The browser-cookie auth path 400s on the
     mobile client, but an unauthenticated mobile browse of the lyrics page
@@ -1713,7 +1756,7 @@ def _ytm_timed_lyrics(browse_id):
                       headers={'Content-Type': 'application/json',
                                'User-Agent': _YTM_MOBILE_UA,
                                'Origin': 'https://music.youtube.com'},
-                      data=payload)
+                      data=payload, timeout=timeout)
     timed = _find_key(data or {}, 'timedLyricsData')
     if not timed:
         return None
@@ -1756,10 +1799,10 @@ def _ytm_plain_lyrics(yt, browse_id):
     return None
 
 
-def _lrclib_lyrics(artist, track, album, duration_sec):
+def _lrclib_lyrics(artist, track, album, duration_sec, timeout=None):
     if not (track and artist):
         return None
-    data = _lrclib_lookup(artist, track, album, duration_sec)
+    data = _lrclib_lookup(artist, track, album, duration_sec, timeout=timeout)
     if not data or data.get('instrumental'):
         return None
     if data.get('syncedLyrics'):
@@ -1771,14 +1814,14 @@ def _lrclib_lyrics(artist, track, album, duration_sec):
     return None
 
 
-def _netease_lyrics(track, artist, duration_sec):
+def _netease_lyrics(track, artist, duration_sec, timeout=None):
     if not track:
         return None
     query = (track + ' ' + (artist or '')).strip()
     search = _http_json(
         'https://music.163.com/api/search/get?' +
         urllib.parse.urlencode({'s': query, 'type': 1, 'limit': 8}),
-        headers={'Referer': 'https://music.163.com/'})
+        headers={'Referer': 'https://music.163.com/'}, timeout=timeout)
     songs = (((search or {}).get('result') or {}).get('songs')) or []
     song = _pick_song(
         songs, track, artist, duration_sec,
@@ -1790,19 +1833,20 @@ def _netease_lyrics(track, artist, duration_sec):
     lyric = _http_json(
         'https://music.163.com/api/song/lyric?' +
         urllib.parse.urlencode({'id': song['id'], 'lv': 1, 'kv': 1, 'tv': -1}),
-        headers={'Referer': 'https://music.163.com/'})
+        headers={'Referer': 'https://music.163.com/'}, timeout=timeout)
     lrc = ((lyric or {}).get('lrc') or {}).get('lyric') or ''
     return _synced_from_lrc('NetEase', lrc) or _plain_result('NetEase', _strip_lrc_tags(lrc))
 
 
-def _kugou_lyrics(track, artist, duration_sec):
+def _kugou_lyrics(track, artist, duration_sec, timeout=None):
     if not track:
         return None
     query = (track + ' ' + (artist or '')).strip()
     search = _http_json(
         'https://songsearch.kugou.com/song_search_v2?' +
         urllib.parse.urlencode({'keyword': query, 'page': 1, 'pagesize': 8,
-                                'platform': 'WebFilter', 'tag': 'em'}))
+                                'platform': 'WebFilter', 'tag': 'em'}),
+        timeout=timeout)
     songs = (((search or {}).get('data') or {}).get('lists')) or []
     song = _pick_song(
         songs, track, artist, duration_sec,
@@ -1817,7 +1861,8 @@ def _kugou_lyrics(track, artist, duration_sec):
     cands = _http_json(
         'https://krcs.kugou.com/search?' +
         urllib.parse.urlencode({'ver': 1, 'man': 'yes', 'client': 'mobi',
-                                'keyword': query, 'hash': file_hash}))
+                                'keyword': query, 'hash': file_hash}),
+        timeout=timeout)
     cand_list = (cands or {}).get('candidates') or []
     if not cand_list:
         return None
@@ -1826,7 +1871,8 @@ def _kugou_lyrics(track, artist, duration_sec):
         'https://krcs.kugou.com/download?' +
         urllib.parse.urlencode({'ver': 1, 'client': 'mobi', 'id': cand.get('id'),
                                 'accesskey': cand.get('accesskey'),
-                                'fmt': 'lrc', 'charset': 'utf8'}))
+                                'fmt': 'lrc', 'charset': 'utf8'}),
+        timeout=timeout)
     content = (dl or {}).get('content')
     if not content:
         return None
@@ -1837,11 +1883,12 @@ def _kugou_lyrics(track, artist, duration_sec):
     return _synced_from_lrc('Kugou', lrc) or _plain_result('Kugou', _strip_lrc_tags(lrc))
 
 
-def _lyrics_ovh(artist, track):
+def _lyrics_ovh(artist, track, timeout=None):
     if not (track and artist):
         return None
     data = _http_json('https://api.lyrics.ovh/v1/' +
-                      urllib.parse.quote(artist) + '/' + urllib.parse.quote(track))
+                      urllib.parse.quote(artist) + '/' + urllib.parse.quote(track),
+                      timeout=timeout)
     lyrics = (data or {}).get('lyrics')
     if not lyrics:
         return None
@@ -1852,7 +1899,7 @@ _LRCLIB_UA = 'p100/0.1.0 (https://github.com/anomalyco/p100)'
 _LRC_TAG = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\]')
 
 
-def _lrclib_lookup(artist, track, album, duration_sec):
+def _lrclib_lookup(artist, track, album, duration_sec, timeout=None):
     """
     Query the LRCLIB exact-match endpoint. Tries with album+duration first
     (best match) and then drops them, since a wrong extra field yields a 404.
@@ -1868,7 +1915,7 @@ def _lrclib_lookup(artist, track, album, duration_sec):
         url = 'https://lrclib.net/api/get?' + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={'User-Agent': _LRCLIB_UA})
         try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or 12) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except Exception:
             return None
@@ -1930,45 +1977,61 @@ def _url_playable(url, timeout=None, attempts=None):
 
 _WARM_EXTRACTOR = os.environ.get('P100_WARM_EXTRACTOR') == '1'
 
+# yt-dlp needs a JavaScript runtime (deno/node) to run its YouTube challenge
+# solver (yt-dlp-ejs). The app provisions one and passes "name:/abs/path";
+# without it most clients return no audio formats at all.
+_JS_RUNTIME = (os.environ.get('P100_JS_RUNTIME') or '').strip()
 
-def _js_runtime():
-    """Return (params, cli_args) enabling a JavaScript runtime for yt-dlp.
+# Which worker this process is (main / play / prefetch / meta); set by the app.
+_BACKEND_ROLE = os.environ.get('P100_BACKEND_ROLE', 'main')
+# Concurrent command loop: the main channel answers many in-flight commands
+# (album page, search, library) and tags each reply with a request id, so one
+# slow HTTP request can no longer block everything. Other workers stay serial.
+_BACKEND_CONCURRENT = os.environ.get('P100_BACKEND_CONCURRENT') == '1'
+_TRACE_LOCK = threading.Lock()
 
-    yt-dlp 2026+ needs one to solve YouTube's signature/n challenges; only
-    deno is enabled by default, and Debian systems commonly have node instead.
-    Without this, extraction silently drops the audio formats and reports
-    "Requested format is not available". P100_JS_RUNTIME can override the path.
-    """
-    preferred = os.environ.get('P100_JS_RUNTIME') or ''
-    candidates = []
-    if preferred:
-        candidates.append(preferred)
-    for name in ('deno', 'node', 'bun', 'quickjs'):
-        try:
-            import shutil
-            found = shutil.which(name if name != 'quickjs' else 'qjs')
-        except Exception:
-            found = None
-        if found:
-            candidates.append(found)
-        # Backends started from a desktop session don't inherit nvm's PATH.
-        if name == 'node':
-            exe = 'node.exe' if os.name == 'nt' else 'node'
-            for d in sorted(glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin')),
-                            reverse=True):
-                candidate = os.path.join(d, exe)
-                if os.access(candidate, os.X_OK):
-                    candidates.append(candidate)
-    for path in candidates:
-        name = os.path.basename(path).lower()
-        name = name[:-4] if name.endswith('.exe') else name
-        if name == 'qjs':
-            name = 'quickjs'
-        if name not in ('deno', 'node', 'bun', 'quickjs'):
-            continue
-        return {name: {'path': path}}, ['--js-runtimes', f'{name}:{path}']
-    return None, []
 
+def _js_runtime_opts():
+    name, sep, path = _JS_RUNTIME.partition(':')
+    if not sep or not name or not path:
+        return {}
+    return {'js_runtimes': {name: {'path': path}}}
+
+
+def _js_runtime_args():
+    return ['--js-runtimes', _JS_RUNTIME] if _JS_RUNTIME else []
+
+
+def _js_runtime_available():
+    if _JS_RUNTIME:
+        return True
+    return bool(shutil.which('deno') or shutil.which('node'))
+
+
+# Errors that mean yt-dlp could not build any audio/video format (missing JS
+# runtime, challenge failure, SABR-only reply). Retrying other clients or a
+# second yt-dlp process gives the same answer and only wedges the command
+# thread, so those stop the cascade early.
+_FORMAT_DEAD_ENDS = (
+    'requested format is not available',
+    'signature solving failed',
+    'n challenge solving failed',
+    'no supported javascript runtime',
+    'only images are available',
+)
+
+
+def _format_dead_end(error):
+    text = (error or '').lower()
+    return any(marker in text for marker in _FORMAT_DEAD_ENDS)
+
+
+def _missing_runtime_hint(error):
+    hint = ("YouTube needs a JavaScript runtime (Deno) to resolve streams. "
+            "Run crossfade's installer to provision it, then restart.")
+    if not error or _format_dead_end(error):
+        return hint
+    return error
 
 # In-process extraction (P100_WARM_EXTRACTOR=1): run yt-dlp as a module so a
 # resolve skips the per-subprocess Python interpreter startup (~1-3 s). The
@@ -2010,10 +2073,11 @@ def _in_process_extract(video_id, client_arg, browser):
         'no_warnings': True,
         'skip_download': True,
         'noplaylist': True,
+        # Bound the network work: this runs on the single command thread.
+        'socket_timeout': _tune('backend.resolve_socket_timeout_sec', 10),
+        'retries': 1,
     }
-    js_params, _ = _js_runtime()
-    if js_params:
-        opts['js_runtimes'] = js_params
+    opts.update(_js_runtime_opts())
     if client_arg:
         opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
     if browser:
@@ -2052,21 +2116,26 @@ def _in_process_extract(video_id, client_arg, browser):
     return url, None
 
 
-def _extract_stream_url(video_id, client_arg, browser):
+def _extract_stream_url(video_id, client_arg, browser, deadline=None):
     """Resolve a stream URL. With the warm extractor enabled the in-process
     module path is tried first and the original yt-dlp subprocess (with its
     cookie variant) stays as the fallback."""
+    def remaining(default):
+        if deadline is None:
+            return default
+        return max(3.0, min(float(default), deadline - time.time()))
+
+    last_error = "yt-dlp returned no URL"
     if _WARM_EXTRACTOR:
         url, err = _in_process_extract(video_id, client_arg, browser)
         if url:
             return url, None
         last_error = err
-    else:
-        last_error = "yt-dlp returned no URL"
-    cmd = [YTDLP, "-f", "bestaudio", "-g", "--no-warnings"]
-    _, js_args = _js_runtime()
-    if js_args:
-        cmd += js_args
+        # The same yt-dlp would give the same answer; spawning it again only
+        # doubles the wait while the single command thread is blocked.
+        if _format_dead_end(err):
+            return None, err
+    cmd = [YTDLP, "-f", "bestaudio", "-g", "--no-warnings"] + _js_runtime_args()
     if client_arg:
         cmd += ["--extractor-args", f"youtube:player_client={client_arg}"]
     cmd.append(f"https://www.youtube.com/watch?v={video_id}")
@@ -2074,16 +2143,21 @@ def _extract_stream_url(video_id, client_arg, browser):
     if browser:
         attempts.append(cmd[:3] + ["--cookies-from-browser", browser] + cmd[3:])
     for attempt in attempts:
+        if deadline is not None and time.time() >= deadline:
+            break
         try:
             # Bounded: this runs on the single command thread, so a child that
             # hangs (cookie/keyring prompt, stuck network) would wedge every
             # later command long after the C++ side stopped waiting.
-            url = subprocess.check_output(attempt, text=True, timeout=30,
-                                          creationflags=_NO_WINDOW).strip()
+            url = subprocess.check_output(
+                attempt, text=True, timeout=remaining(12),
+                creationflags=_NO_WINDOW).strip()
             if url:
                 return url, None
         except Exception as e:
             last_error = str(e)
+            if _format_dead_end(last_error):
+                break
     return None, last_error
 
 
@@ -2167,10 +2241,7 @@ def _find_public_equivalent(video_id, title, artist, duration):
     if not query:
         return None
     cmd = [YTDLP, '--no-warnings', '--flat-playlist', '--print',
-           '%(id)s\t%(duration)s\t%(title)s\t%(channel)s']
-    _, js_args = _js_runtime()
-    if js_args:
-        cmd += js_args
+           '%(id)s\t%(duration)s\t%(title)s\t%(channel)s'] + _js_runtime_args()
     cmd.append('ytsearch8:' + query)
     try:
         out = subprocess.check_output(cmd, text=True, timeout=40,
@@ -2279,8 +2350,22 @@ def get_stream_url(video_id, fresh=False):
     for c in ('visionos', 'web_music', None) + _PLAYER_CLIENT_FALLBACKS:
         if c not in client_args:
             client_args.append(c)
+    # Without a JS runtime most clients cannot build audio formats at all.
+    # visionos/mweb are the JS-free ones, so try those and stop instead of
+    # walking the whole cascade for minutes.
+    js_available = _js_runtime_available()
+    if not js_available:
+        client_args = [c for c in client_args if c in ('visionos', 'mweb')]
+    # Hard stop for the whole resolve. Each client attempt can start a yt-dlp
+    # process and probe a URL; an unbounded cascade blocks the command thread
+    # long past the app's 45 s read timeout, which reads as "backend is not
+    # responding" and starves every later command.
+    deadline = time.time() + _tune('backend.resolve_deadline_sec', 25)
     for client_arg in client_args:
-        url, err = _extract_stream_url(video_id, client_arg, browser)
+        if time.time() >= deadline:
+            last_error = last_error or 'stream resolution timed out'
+            break
+        url, err = _extract_stream_url(video_id, client_arg, browser, deadline)
         if not url:
             last_error = err
             continue
@@ -2297,13 +2382,15 @@ def get_stream_url(video_id, fresh=False):
     # still accept it, and if not, the player's fresh-resolve retry fires.
     if last_url:
         return {'url': last_url, 'id': video_id}
-    # E.g. "This video is only available to Music Premium members": use a
-    # public upload of the same song. Cached under the requested id.
+    # "This video is only available to Music Premium members": use a public
+    # upload of the same song. Cached under the requested id.
     fallback = _fallback_stream_url(video_id)
     if fallback:
         _cache_stream_url(video_id, fallback)
         _save_stream_disk()
         return {'url': fallback, 'id': video_id}
+    if not js_available:
+        last_error = _missing_runtime_hint(last_error)
     return {'error': last_error}
 
 
@@ -2563,10 +2650,10 @@ def _in_process_extract_video(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
         'no_warnings': True,
         'skip_download': True,
         'noplaylist': True,
+        'socket_timeout': _tune('backend.resolve_socket_timeout_sec', 10),
+        'retries': 1,
     }
-    js_params, _ = _js_runtime()
-    if js_params:
-        opts['js_runtimes'] = js_params
+    opts.update(_js_runtime_opts())
     if client_arg:
         opts['extractor_args'] = {'youtube': {'player_client': [client_arg]}}
     if browser:
@@ -2602,10 +2689,7 @@ def _extract_video_urls(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
         last_error = err
     else:
         last_error = 'yt-dlp returned no URL'
-    cmd = [YTDLP, '-f', fmt, '-g', '--no-warnings']
-    _, js_args = _js_runtime()
-    if js_args:
-        cmd += js_args
+    cmd = [YTDLP, '-f', fmt, '-g', '--no-warnings'] + _js_runtime_args()
     if client_arg:
         cmd += ['--extractor-args', f'youtube:player_client={client_arg}']
     cmd.append(f'https://www.youtube.com/watch?v={video_id}')
@@ -2614,13 +2698,15 @@ def _extract_video_urls(video_id, client_arg, browser, fmt=_VIDEO_FORMAT):
         attempts.append(cmd[:3] + ['--cookies-from-browser', browser] + cmd[3:])
     for attempt in attempts:
         try:
-            out = subprocess.check_output(attempt, text=True, timeout=45,
+            out = subprocess.check_output(attempt, text=True, timeout=20,
                                           creationflags=_NO_WINDOW).strip()
             lines = [line.strip() for line in out.splitlines() if line.strip()]
             if lines:
                 return lines[0], (lines[1] if len(lines) > 1 else None), None
         except Exception as e:
             last_error = str(e)
+            if _format_dead_end(last_error):
+                break
     return None, None, last_error
 
 
@@ -2728,7 +2814,15 @@ def get_video_urls(video_id, fresh=False, max_height=720, fast=False):
         for c in ('visionos', 'web_music', None) + _PLAYER_CLIENT_FALLBACKS:
             if c not in client_args:
                 client_args.append(c)
+        if not _js_runtime_available():
+            # Same reasoning as the audio path: without a JS runtime only the
+            # JS-free clients have a chance.
+            client_args = [c for c in client_args if c in ('visionos', 'mweb')]
+    deadline = time.time() + _tune('backend.resolve_deadline_sec', 25)
     for client_arg in client_args:
+        if time.time() >= deadline:
+            last_error = last_error or 'video stream resolution timed out'
+            break
         video, audio, err = _extract_video_urls(video_id, client_arg, browser, fmt)
         if not video:
             last_error = err or last_error
@@ -3013,7 +3107,11 @@ def prefetch_stream_urls(video_ids):
     The command pipe answers one command at a time, so the parallelism has to
     live here: four worker threads, each with its own persistent YoutubeDL
     instance, turn a 10-row prefetch from ~30 s into a few seconds -- and the
-    first rows are ready in under three."""
+    first rows are ready in under three. A hard deadline keeps a single stuck
+    extraction from holding the command (and therefore the whole channel) past
+    the app's read timeout; partial results are still useful because each URL
+    is written to the shared disk cache as it resolves.
+    """
     ids = [v for v in video_ids if re.fullmatch(r'[A-Za-z0-9_-]{11}', v or '')]
     if not ids:
         return {'urls': []}
@@ -3026,7 +3124,25 @@ def prefetch_stream_urls(video_ids):
         url = result.get('url') if isinstance(result, dict) else None
         return {'id': vid, 'url': url} if url else None
 
-    rows = [r for r in _get_prefetch_pool().map(one, ids) if r]
+    from concurrent.futures import as_completed
+    budget = max(1.0, _tune('backend.prefetch_deadline_sec', 20))
+    pool = _get_prefetch_pool()
+    futures = [pool.submit(one, vid) for vid in ids]
+    rows = []
+    deadline = time.time() + budget
+    try:
+        for fut in as_completed(futures, timeout=budget):
+            try:
+                row = fut.result()
+            except Exception:
+                continue
+            if row:
+                rows.append(row)
+            if time.time() >= deadline:
+                break
+    except Exception:
+        print(f"[prefetch] deadline {budget:.0f}s: {len(rows)}/{len(ids)} resolved",
+              file=sys.stderr, flush=True)
     return {'urls': rows}
 
 
@@ -3307,7 +3423,273 @@ _GUEST_MESSAGES = {
 }
 
 
-def run_command_loop(yt, stdin=None, stdout=None, guest=False):
+def execute_command(yt, cmd, arg, guest=False):
+    """Run one backend command and return its JSON-serialisable result."""
+    started = time.perf_counter()
+
+    try:
+        if cmd == 'ping':
+            # Resync probe: the C++ side sends this after a timed-out
+            # command and discards stale replies until the nonce returns.
+            try:
+                nonce = int(arg) if arg else 0
+            except ValueError:
+                nonce = 0
+            result = {'ok': True, 'nonce': nonce}
+        elif guest and cmd in _GUEST_MESSAGES:
+            # Anonymous YTMusic() can browse public content, but the
+            # account surface stays behind a sign-in. The UI shows a
+            # dedicated prompt for these.
+            result = _err(_GUEST_MESSAGES[cmd], kind='auth')
+        elif cmd == 'recommendations':
+            limit = 40
+            if arg:
+                try:
+                    limit = int(arg)
+                except ValueError:
+                    limit = 40
+            result = get_home_tracks(yt, limit=limit)
+        elif cmd == 'search':
+            result = (_cached_search(arg, lambda: search_tracks(yt, arg), 'search')
+                      if arg else {'error': 'Missing query'})
+        elif cmd == 'suggest':
+            result = get_search_suggestions(yt, arg or '')
+        elif cmd == 'search_all':
+            result = (_cached_search(arg, lambda: search_all(yt, arg), 'search_all')
+                      if arg else {'error': 'Missing query'})
+        elif cmd == 'album_search':
+            result = (_cached_search(arg, lambda: search_albums(yt, arg), 'album_search')
+                      if arg else {'error': 'Missing query'})
+        elif cmd == 'radio':
+            result = get_radio_tracks(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'album':
+            result = get_album_data(yt, arg) if arg else {'error': 'Missing album_id'}
+        elif cmd == 'album_of':
+            result = album_for_track(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'artist':
+            result = get_artist_data(yt, arg) if arg else {'error': 'Missing artist_id'}
+        elif cmd == 'artist_songs':
+            try:
+                bits = (arg or '').split()
+                if len(bits) != 3:
+                    result = {'error': 'Usage: artist_songs <browse_id> <offset> <count>'}
+                else:
+                    result = get_artist_songs(yt, bits[0], int(bits[1]), int(bits[2]))
+            except ValueError:
+                result = {'error': 'Bad artist_songs offset/count'}
+        elif cmd == 'artist_of':
+            result = artist_for_track(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'artist_search':
+            result = (_cached_search(arg, lambda: search_artists(yt, arg), 'artist_search')
+                      if arg else {'error': 'Missing query'})
+        elif cmd == 'play':
+            result = get_stream_url(arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'play_video':
+            bits = (arg or '').split()
+            result = (get_video_urls(bits[0], max_height=int(bits[1]) if len(bits) > 1 else 720)
+                      if bits else {'error': 'Missing video_id'})
+        elif cmd == 'play_video_fast':
+            bits = (arg or '').split()
+            result = (get_video_urls(bits[0], max_height=int(bits[1]) if len(bits) > 1 else 720,
+                                     fast=True)
+                      if bits else {'error': 'Missing video_id'})
+        elif cmd == 'play_video_fresh':
+            bits = (arg or '').split()
+            result = (get_video_urls(bits[0], fresh=True,
+                                     max_height=int(bits[1]) if len(bits) > 1 else 720)
+                      if bits else {'error': 'Missing video_id'})
+        elif cmd == 'musicvideo':
+            result = get_music_video(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'videosync_cached':
+            bits = (arg or '').split()
+            result = (get_video_sync_cached(bits[0], bits[1])
+                      if len(bits) >= 2 else {'error': 'Usage: videosync_cached <song> <video>'})
+        elif cmd == 'videosync':
+            bits = (arg or '').split()
+            result = (get_video_sync(yt, bits[0], bits[1],
+                                     int(bits[2]) if len(bits) > 2 else 0)
+                      if len(bits) >= 2 else {'error': 'Usage: videosync <song> <video> [dur]'})
+        elif cmd == 'prefetch':
+            result = prefetch_stream_urls((arg or '').split())
+        elif cmd == 'play_fresh':
+            result = get_stream_url(arg, fresh=True) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'lyrics':
+            result = get_lyrics(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'analyze':
+            result = analyze_audio(_json_arg(arg))
+        elif cmd == 'meta':
+            result = get_track_meta(yt, arg) if arg else {'error': 'Missing video_id'}
+        elif cmd == 'library_playlists':
+            result = yt.get_library_playlists(limit=100)
+        elif cmd == 'playlist':
+            result = yt.get_playlist(arg, limit=1000) if arg else {'error': 'Missing playlist_id'}
+        elif cmd == 'spotify_import':
+            result = import_spotify(yt, arg) if arg else {'error': 'Missing Spotify playlist'}
+        elif cmd == 'spotify_library':
+            try:
+                result = _spotify_library()
+            except Exception as e:
+                result = _err(str(e))
+        elif cmd == 'podcasts_library':
+            result = get_podcast_library(yt)
+        elif cmd == 'podcasts_search':
+            result = (_cached_search(arg, lambda: search_podcasts(yt, arg), 'podcasts_search')
+                      if arg else {'error': 'Missing query'})
+        elif cmd == 'podcast':
+            result = get_podcast_details(yt, arg) if arg else {'error': 'Missing podcast_id'}
+        elif cmd == 'episodes_later':
+            result = get_episodes_later(yt)
+        elif cmd == 'rate_song':
+            payload = _json_arg(arg) or {}
+            vid = payload.get('videoId')
+            rating = payload.get('rating', 'LIKE')
+            if not vid:
+                result = {'error': 'Missing videoId'}
+            elif rating not in ('LIKE', 'DISLIKE', 'INDIFFERENT'):
+                result = {'error': f'Invalid rating: {rating}'}
+            else:
+                yt.rate_song(vid, rating)
+                result = {'status': 'ok'}
+        elif cmd == 'create_playlist':
+            payload = _json_arg(arg) or {}
+            title = payload.get('title')
+            if not title:
+                result = {'error': 'Missing title'}
+            else:
+                pid = yt.create_playlist(
+                    title=title,
+                    description=payload.get('description'),
+                    privacy_status=payload.get('privacyStatus', 'PRIVATE'),
+                    video_ids=payload.get('videoIds'))
+                result = {'status': 'ok', 'playlistId': pid}
+        elif cmd == 'delete_playlist':
+            payload = _json_arg(arg) or {}
+            pid = payload.get('playlistId')
+            if not pid:
+                result = {'error': 'Missing playlistId'}
+            else:
+                yt.delete_playlist(pid)
+                result = {'status': 'ok'}
+        elif cmd == 'edit_playlist':
+            payload = _json_arg(arg) or {}
+            pid = payload.get('playlistId')
+            if not pid:
+                result = {'error': 'Missing playlistId'}
+            else:
+                kwargs = {}
+                for key in ('title', 'description', 'privacyStatus'):
+                    if payload.get(key) is not None:
+                        kwargs[key] = payload[key]
+                if payload.get('moveItem') is not None:
+                    kwargs['moveItem'] = payload['moveItem']
+                yt.edit_playlist(pid, **kwargs)
+                result = {'status': 'ok'}
+        elif cmd == 'add_playlist_items':
+            payload = _json_arg(arg) or {}
+            pid = payload.get('playlistId')
+            video_ids = payload.get('videoIds')
+            if not pid or not video_ids:
+                result = {'error': 'Missing playlistId or videoIds'}
+            else:
+                yt.add_playlist_items(pid, videoIds=video_ids, duplicates=False)
+                result = {'status': 'ok'}
+        elif cmd == 'remove_playlist_items':
+            payload = _json_arg(arg) or {}
+            pid = payload.get('playlistId')
+            videos = payload.get('videos')
+            if not pid or not videos:
+                result = {'error': 'Missing playlistId or videos'}
+            else:
+                yt.remove_playlist_items(pid, videos)
+                result = {'status': 'ok'}
+        else:
+            result = {'error': f'Unknown command: {cmd}'}
+    except Exception as e:
+        result = {'error': f'Unhandled error in command {cmd!r}: {str(e)}'}
+
+    if isinstance(result, dict) and 'error' in result and 'kind' not in result:
+        result['kind'] = _classify_error(result['error'])
+
+    # One line per command in backend.log (the diagnostics bundle and the
+    # Settings log tail both read it), with the channel role and timing so
+    # a slow provider or a queue is visible without a debugger.
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    trace_arg = ''
+    if arg:
+        trace_arg = ' ' + (arg if len(arg) <= 48 else arg[:48] + '...')
+    status = 'ok'
+    if isinstance(result, dict) and result.get('error'):
+        status = 'error'
+    with _TRACE_LOCK:
+        print(f"[{_BACKEND_ROLE}] {cmd}{trace_arg} {elapsed_ms:.0f}ms {status}",
+              file=sys.stderr, flush=True)
+    return result
+
+
+def _run_command_loop_concurrent(yt, stdin, stdout, guest, session_factory):
+    """Id-tagged, multi-threaded command loop used by the main channel.
+
+    Requests arrive as `@<id> <command> [arg]` and each reply is written as
+    `@<id> <json>` when its worker finishes, so a slow album/HTTP call cannot
+    delay a search (or anything else) behind it. Each worker gets its own
+    YTMusic instance because ytmusicapi's requests session is not safe to share
+    across threads. Ordering is irrelevant: the client routes by id.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max(1, int(os.environ.get('P100_BACKEND_WORKERS', '4')))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    local = threading.local()
+    write_lock = threading.Lock()
+
+    def thread_yt():
+        instance = getattr(local, 'yt', None)
+        if instance is None:
+            try:
+                instance = session_factory() if session_factory else yt
+            except Exception as e:
+                print(f"[{_BACKEND_ROLE}] per-thread session failed: {e}",
+                      file=sys.stderr, flush=True)
+                instance = yt
+            local.yt = instance
+        return instance
+
+    def run(req_id, cmd, arg):
+        try:
+            result = execute_command(thread_yt(), cmd, arg, guest)
+        except Exception as e:
+            result = {'error': f'Unhandled error in command {cmd!r}: {e}',
+                      'kind': _classify_error(str(e))}
+        line = '@%s %s' % (req_id, json.dumps(result, ensure_ascii=False))
+        with write_lock:
+            stdout.write(line + '\n')
+            stdout.flush()
+
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        if line == 'quit':
+            break
+        if line.startswith('@'):
+            req_id, _, rest = line[1:].partition(' ')
+            if not rest:
+                continue
+            cmd, _, arg = rest.partition(' ')
+            pool.submit(run, req_id, cmd, arg or None)
+        else:
+            # Mixed-protocol client (tests, manual tools): answer inline.
+            parts = line.split(' ', 1)
+            result = execute_command(yt, parts[0],
+                                     parts[1] if len(parts) > 1 else None, guest)
+            with write_lock:
+                stdout.write(json.dumps(result, ensure_ascii=False) + '\n')
+                stdout.flush()
+    pool.shutdown(wait=True)
+
+
+def run_command_loop(yt, stdin=None, stdout=None, guest=False,
+                     session_factory=None):
     """Read newline-delimited commands from stdin until EOF/quit.
 
     Every reply is one JSON object per line. Errors are stamped with a
@@ -3328,6 +3710,9 @@ def run_command_loop(yt, stdin=None, stdout=None, guest=False):
                 pass
     global _yt_client
     _yt_client = yt
+    if os.environ.get('P100_BACKEND_CONCURRENT') == '1':
+        _run_command_loop_concurrent(yt, stdin, stdout, guest, session_factory)
+        return
     for line in stdin:
         line = line.strip()
         if not line:
@@ -3335,191 +3720,8 @@ def run_command_loop(yt, stdin=None, stdout=None, guest=False):
         parts = line.split(' ', 1)
         cmd = parts[0]
         arg = parts[1] if len(parts) > 1 else None
-
-        try:
-            if cmd == 'ping':
-                # Resync probe: the C++ side sends this after a timed-out
-                # command and discards stale replies until the nonce returns.
-                try:
-                    nonce = int(arg) if arg else 0
-                except ValueError:
-                    nonce = 0
-                result = {'ok': True, 'nonce': nonce}
-            elif guest and cmd in _GUEST_MESSAGES:
-                # Anonymous YTMusic() can browse public content, but the
-                # account surface stays behind a sign-in. The UI shows a
-                # dedicated prompt for these.
-                result = _err(_GUEST_MESSAGES[cmd], kind='auth')
-            elif cmd == 'recommendations':
-                limit = 40
-                if arg:
-                    try:
-                        limit = int(arg)
-                    except ValueError:
-                        limit = 40
-                result = get_home_tracks(yt, limit=limit)
-            elif cmd == 'search':
-                result = (_cached_search(arg, lambda: search_tracks(yt, arg), 'search')
-                          if arg else {'error': 'Missing query'})
-            elif cmd == 'suggest':
-                result = get_search_suggestions(yt, arg or '')
-            elif cmd == 'search_all':
-                result = (_cached_search(arg, lambda: search_all(yt, arg), 'search_all')
-                          if arg else {'error': 'Missing query'})
-            elif cmd == 'album_search':
-                result = (_cached_search(arg, lambda: search_albums(yt, arg), 'album_search')
-                          if arg else {'error': 'Missing query'})
-            elif cmd == 'radio':
-                result = get_radio_tracks(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'album':
-                result = get_album_data(yt, arg) if arg else {'error': 'Missing album_id'}
-            elif cmd == 'album_of':
-                result = album_for_track(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'artist':
-                result = get_artist_data(yt, arg) if arg else {'error': 'Missing artist_id'}
-            elif cmd == 'artist_songs':
-                try:
-                    bits = (arg or '').split()
-                    if len(bits) != 3:
-                        result = {'error': 'Usage: artist_songs <browse_id> <offset> <count>'}
-                    else:
-                        result = get_artist_songs(yt, bits[0], int(bits[1]), int(bits[2]))
-                except ValueError:
-                    result = {'error': 'Bad artist_songs offset/count'}
-            elif cmd == 'artist_of':
-                result = artist_for_track(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'artist_search':
-                result = (_cached_search(arg, lambda: search_artists(yt, arg), 'artist_search')
-                          if arg else {'error': 'Missing query'})
-            elif cmd == 'play':
-                result = get_stream_url(arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'play_video':
-                bits = (arg or '').split()
-                result = (get_video_urls(bits[0], max_height=int(bits[1]) if len(bits) > 1 else 720)
-                          if bits else {'error': 'Missing video_id'})
-            elif cmd == 'play_video_fast':
-                bits = (arg or '').split()
-                result = (get_video_urls(bits[0], max_height=int(bits[1]) if len(bits) > 1 else 720,
-                                         fast=True)
-                          if bits else {'error': 'Missing video_id'})
-            elif cmd == 'play_video_fresh':
-                bits = (arg or '').split()
-                result = (get_video_urls(bits[0], fresh=True,
-                                         max_height=int(bits[1]) if len(bits) > 1 else 720)
-                          if bits else {'error': 'Missing video_id'})
-            elif cmd == 'musicvideo':
-                result = get_music_video(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'videosync_cached':
-                bits = (arg or '').split()
-                result = (get_video_sync_cached(bits[0], bits[1])
-                          if len(bits) >= 2 else {'error': 'Usage: videosync_cached <song> <video>'})
-            elif cmd == 'videosync':
-                bits = (arg or '').split()
-                result = (get_video_sync(yt, bits[0], bits[1],
-                                         int(bits[2]) if len(bits) > 2 else 0)
-                          if len(bits) >= 2 else {'error': 'Usage: videosync <song> <video> [dur]'})
-            elif cmd == 'prefetch':
-                result = prefetch_stream_urls((arg or '').split())
-            elif cmd == 'play_fresh':
-                result = get_stream_url(arg, fresh=True) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'lyrics':
-                result = get_lyrics(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'analyze':
-                result = analyze_audio(_json_arg(arg))
-            elif cmd == 'meta':
-                result = get_track_meta(yt, arg) if arg else {'error': 'Missing video_id'}
-            elif cmd == 'library_playlists':
-                result = yt.get_library_playlists(limit=100)
-            elif cmd == 'playlist':
-                result = yt.get_playlist(arg, limit=1000) if arg else {'error': 'Missing playlist_id'}
-            elif cmd == 'spotify_import':
-                result = import_spotify(yt, arg) if arg else {'error': 'Missing Spotify playlist'}
-            elif cmd == 'spotify_library':
-                try:
-                    result = _spotify_library()
-                except Exception as e:
-                    result = _err(str(e))
-            elif cmd == 'podcasts_library':
-                result = get_podcast_library(yt)
-            elif cmd == 'podcasts_search':
-                result = (_cached_search(arg, lambda: search_podcasts(yt, arg), 'podcasts_search')
-                          if arg else {'error': 'Missing query'})
-            elif cmd == 'podcast':
-                result = get_podcast_details(yt, arg) if arg else {'error': 'Missing podcast_id'}
-            elif cmd == 'episodes_later':
-                result = get_episodes_later(yt)
-            elif cmd == 'rate_song':
-                payload = _json_arg(arg) or {}
-                vid = payload.get('videoId')
-                rating = payload.get('rating', 'LIKE')
-                if not vid:
-                    result = {'error': 'Missing videoId'}
-                elif rating not in ('LIKE', 'DISLIKE', 'INDIFFERENT'):
-                    result = {'error': f'Invalid rating: {rating}'}
-                else:
-                    yt.rate_song(vid, rating)
-                    result = {'status': 'ok'}
-            elif cmd == 'create_playlist':
-                payload = _json_arg(arg) or {}
-                title = payload.get('title')
-                if not title:
-                    result = {'error': 'Missing title'}
-                else:
-                    pid = yt.create_playlist(
-                        title=title,
-                        description=payload.get('description'),
-                        privacy_status=payload.get('privacyStatus', 'PRIVATE'),
-                        video_ids=payload.get('videoIds'))
-                    result = {'status': 'ok', 'playlistId': pid}
-            elif cmd == 'delete_playlist':
-                payload = _json_arg(arg) or {}
-                pid = payload.get('playlistId')
-                if not pid:
-                    result = {'error': 'Missing playlistId'}
-                else:
-                    yt.delete_playlist(pid)
-                    result = {'status': 'ok'}
-            elif cmd == 'edit_playlist':
-                payload = _json_arg(arg) or {}
-                pid = payload.get('playlistId')
-                if not pid:
-                    result = {'error': 'Missing playlistId'}
-                else:
-                    kwargs = {}
-                    for key in ('title', 'description', 'privacyStatus'):
-                        if payload.get(key) is not None:
-                            kwargs[key] = payload[key]
-                    if payload.get('moveItem') is not None:
-                        kwargs['moveItem'] = payload['moveItem']
-                    yt.edit_playlist(pid, **kwargs)
-                    result = {'status': 'ok'}
-            elif cmd == 'add_playlist_items':
-                payload = _json_arg(arg) or {}
-                pid = payload.get('playlistId')
-                video_ids = payload.get('videoIds')
-                if not pid or not video_ids:
-                    result = {'error': 'Missing playlistId or videoIds'}
-                else:
-                    yt.add_playlist_items(pid, videoIds=video_ids, duplicates=False)
-                    result = {'status': 'ok'}
-            elif cmd == 'remove_playlist_items':
-                payload = _json_arg(arg) or {}
-                pid = payload.get('playlistId')
-                videos = payload.get('videos')
-                if not pid or not videos:
-                    result = {'error': 'Missing playlistId or videos'}
-                else:
-                    yt.remove_playlist_items(pid, videos)
-                    result = {'status': 'ok'}
-            elif cmd == 'quit':
-                break
-            else:
-                result = {'error': f'Unknown command: {cmd}'}
-        except Exception as e:
-            result = {'error': f'Unhandled error in command {cmd!r}: {str(e)}'}
-
-        if isinstance(result, dict) and 'error' in result and 'kind' not in result:
-            result['kind'] = _classify_error(result['error'])
-
+        if cmd == 'quit':
+            break
+        result = execute_command(yt, cmd, arg, guest)
         print(json.dumps(result, ensure_ascii=False), file=stdout)
         stdout.flush()

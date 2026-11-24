@@ -79,12 +79,25 @@ static std::vector<std::string> list_dir_names(const std::string &dir)
 #define P100_PID_T pid_t
 #endif
 
+// One in-flight id-tagged command on a concurrent channel.
+struct BackendReply
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::string response;
+};
+
 struct BackendChannel
 {
     std::atomic<bool> ready{false}; // set once the {"status":"ready"} line arrives
     std::atomic<uint64_t> commands{0};
     std::atomic<uint64_t> errors{0};
     std::atomic<uint64_t> last_ms{0};
+    std::atomic<uint64_t> max_ms{0};
+    // Commands currently waiting on this channel (the backend handles one at
+    // a time); shown in the debug window so a queue shows up immediately.
+    std::atomic<int> pending{0};
     std::mutex ready_mutex;
     std::condition_variable ready_cv;
 #ifndef P100_WINDOWS
@@ -94,13 +107,23 @@ struct BackendChannel
     P100_PID_T pid = 0;
     std::mutex mutex;
     std::atomic<bool> dead{false}; // process exited / pipe EOF
+    // Auto-revive throttle for optional workers (play/prefetch/meta): a crash
+    // or a wedged command must not disable the feature for the whole session.
+    std::atomic<int64_t> last_revive_ms{0};
+    // Concurrent (main) channel: commands carry an id, replies are routed by
+    // id by a reader thread, and multiple requests can be in flight.
+    bool concurrent = false;
+    std::thread reader;
+    std::mutex write_mutex;
+    std::mutex pending_mutex;
+    std::unordered_map<uint64_t, std::shared_ptr<BackendReply>> pending_replies;
+    std::atomic<uint64_t> next_req{0};
 #ifdef P100_WINDOWS
     // Named-analogue of the POSIX pair: two anonymous pipes (write end feeds
     // the child's stdin, read end drains its stdout) plus a reader thread,
     // because ReadFile on an anonymous pipe cannot timeout the way poll() can.
     HANDLE h_in_write = NULL;  // our end of the child's stdin
     HANDLE h_out_read = NULL;  // our end of the child's stdout
-    std::thread reader;
     std::mutex q_mutex;
     std::condition_variable q_cv;
     std::deque<std::string> lines;
@@ -109,6 +132,10 @@ struct BackendChannel
 static BackendChannel g_backend;
 static BackendChannel g_play_backend;
 static BackendChannel g_prefetch_backend;
+// Background metadata (lyrics today): slow provider cascades must never share
+// the interactive main pipe with search/browse. Also hosts speculative
+// prefetch batches so the hover/hero channel stays free.
+static BackendChannel g_meta_backend;
 static std::atomic<bool> g_backend_stopping{false};
 // Set from the backend's ready handshake: true when it started without a
 // usable sign-in and is limited to public (unauthenticated) browsing.
@@ -129,11 +156,91 @@ static const char *backend_channel_name(const BackendChannel &ch)
         return "play";
     if (&ch == &g_prefetch_backend)
         return "prefetch";
+    if (&ch == &g_meta_backend)
+        return "meta";
     return "?";
 }
 
+static bool channel_usable(const BackendChannel &ch)
+{
+    return ch.ready.load(std::memory_order_acquire) &&
+           !ch.dead.load(std::memory_order_relaxed);
+}
+
+// Declaring a channel dead must also clear `ready`, otherwise the send paths
+// keep routing to the corpse instead of falling back (this is how lyrics
+// stopped working after a stuck prefetch killed the meta channel).
+static void channel_mark_dead(BackendChannel &ch)
+{
+    ch.dead.store(true, std::memory_order_relaxed);
+    ch.ready.store(false, std::memory_order_release);
+    ch.ready_cv.notify_all();
+    // Fail every in-flight id-tagged request; their replies will never come.
+    std::unordered_map<uint64_t, std::shared_ptr<BackendReply>> pending;
+    {
+        std::lock_guard<std::mutex> lock(ch.pending_mutex);
+        pending.swap(ch.pending_replies);
+    }
+    for (auto &entry : pending)
+    {
+        std::lock_guard<std::mutex> lock(entry.second->mutex);
+        entry.second->response = "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
+        entry.second->done = true;
+        entry.second->cv.notify_all();
+    }
+}
+
+// One complete reply line from a backend. Id-tagged replies on a concurrent
+// channel wake their waiting request; on other channels lines go to the
+// serial read queue (the ready handshake uses the same queue).
+static void route_backend_line(BackendChannel &ch, std::string line)
+{
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+        line.pop_back();
+    if (ch.concurrent && !line.empty() && line[0] == '@')
+    {
+        const size_t space = line.find(' ');
+        if (space != std::string::npos && space > 1)
+        {
+            const uint64_t id = std::strtoull(line.c_str() + 1, nullptr, 10);
+            std::shared_ptr<BackendReply> reply;
+            {
+                std::lock_guard<std::mutex> lock(ch.pending_mutex);
+                auto it = ch.pending_replies.find(id);
+                if (it != ch.pending_replies.end())
+                {
+                    reply = it->second;
+                    ch.pending_replies.erase(it);
+                }
+            }
+            if (reply)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(reply->mutex);
+                    reply->response = line.substr(space + 1);
+                    reply->done = true;
+                }
+                reply->cv.notify_all();
+            }
+            return;
+        }
+    }
+#ifdef P100_WINDOWS
+    {
+        std::lock_guard<std::mutex> lock(ch.q_mutex);
+        ch.lines.push_back(std::move(line));
+    }
+    ch.q_cv.notify_all();
+#endif
+}
+
+// Forward decl: JSON helpers are defined below, but the debug log wants the
+// backend's error string when it records a failed command.
+static std::string json_get_string(const std::string &json, const std::string &key);
+
 static void record_backend_log(const BackendChannel &ch, const std::string &cmd,
-                               uint64_t ms, const std::string &response, bool error)
+                               uint64_t ms, const std::string &response, bool error,
+                               uint64_t queue_ms = 0, size_t pending = 0)
 {
     std::lock_guard<std::mutex> lock(g_backend_log_mutex);
     BackendLogEntry e;
@@ -145,9 +252,25 @@ static void record_backend_log(const BackendChannel &ch, const std::string &cmd,
     const size_t kCmdClip = (size_t)tunable_int("diag.command_clip");
     e.command = cmd.size() > kCmdClip ? cmd.substr(0, kCmdClip) + "…" : cmd;
     e.ms = ms;
+    e.queue_ms = queue_ms;
+    e.pending = pending;
     e.error = error || response.empty() ||
               response.find("\"error\"") != std::string::npos;
     e.bytes = response.size();
+    if (e.error)
+    {
+        // Keep the actionable part visible in the debug window: the backend's
+        // "error" string, or a short label for transport-level failures.
+        if (response.find("did not respond in time") != std::string::npos)
+            e.detail = "timed out";
+        else if (response.find("\"error\"") != std::string::npos)
+            e.detail = json_get_string(response, "error");
+        else
+            e.detail = "empty response";
+        const size_t kDetailClip = (size_t)tunable_int("diag.detail_clip");
+        if (e.detail.size() > kDetailClip)
+            e.detail = e.detail.substr(0, kDetailClip) + "…";
+    }
     g_backend_log.push_back(std::move(e));
     while (g_backend_log.size() > (size_t)tunable_int("diag.backend_log_lines"))
         g_backend_log.pop_front();
@@ -430,6 +553,108 @@ static std::string ytdlp_bin()
     return "yt-dlp";
 }
 
+// yt-dlp needs a JavaScript runtime plus the yt-dlp-ejs solver to pass
+// YouTube's signature/challenge checks. Without one most clients return no
+// audio formats and every resolve fails with "Requested format is not
+// available". The installer and the AppImage launcher provision a pinned
+// Deno under runtime/; a system deno/node still works for users who have one.
+struct JsRuntime
+{
+    std::string name;
+    std::string path;
+};
+
+static std::string find_in_path(const char *name)
+{
+#ifdef P100_WINDOWS
+    const char sep = ';';
+    const char *joiner = "\\";
+#else
+    const char sep = ':';
+    const char *joiner = "/";
+#endif
+    const char *env = getenv("PATH");
+    if (!env || !*env)
+        return "";
+    const std::string path(env);
+    size_t start = 0;
+    for (;;)
+    {
+        const size_t end = path.find(sep, start);
+        const std::string dir = path.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty())
+        {
+            const std::string candidate = dir + joiner + name;
+            if (is_executable(candidate))
+                return candidate;
+        }
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+    return "";
+}
+
+static JsRuntime find_js_runtime()
+{
+    // The runtime never moves while the app runs; detecting it costs a few
+    // stat calls per yt-dlp invocation otherwise.
+    static const JsRuntime cached = []() {
+        if (const char *env = getenv("P100_JS_RUNTIME"); env && *env)
+        {
+            const std::string spec(env);
+            const size_t colon = spec.find(':');
+            if (colon != std::string::npos && colon > 0)
+                return JsRuntime{spec.substr(0, colon), spec.substr(colon + 1)};
+            return JsRuntime{"deno", spec};
+        }
+#ifdef P100_WINDOWS
+        const char *deno_name = "deno.exe";
+        const char *node_name = "node.exe";
+#else
+        const char *deno_name = "deno";
+        const char *node_name = "node";
+#endif
+        std::vector<std::string> candidates;
+        // Installed share dir (install.sh) or a bundled AppImage payload.
+        candidates.push_back(p100_share_dir() + "/runtime/" + deno_name);
+        // Per-user data dir: the AppImage is read-only, so its launcher
+        // provisions the runtime next to the venv instead.
+        {
+            std::string base;
+#ifdef P100_WINDOWS
+            if (const char *appdata = getenv("LOCALAPPDATA"); appdata && *appdata)
+                base = std::string(appdata) + "/crossfade";
+#else
+            if (const char *xdg = getenv("XDG_DATA_HOME"); xdg && *xdg)
+                base = std::string(xdg) + "/crossfade";
+            else if (const char *home = getenv("HOME"); home && *home)
+                base = std::string(home) + "/.local/share/crossfade";
+#endif
+            if (!base.empty())
+                candidates.push_back(base + "/runtime/" + deno_name);
+        }
+        // Portable build: runtime next to the executable.
+        candidates.push_back(exe_dir() + "/" + deno_name);
+        candidates.push_back(exe_dir() + "/runtime/" + deno_name);
+        // Windows installer layout: next to yt-dlp.exe in the venv.
+        const std::string ytdlp = ytdlp_bin();
+        const size_t slash = ytdlp.find_last_of("/\\");
+        if (slash != std::string::npos)
+            candidates.push_back(ytdlp.substr(0, slash + 1) + deno_name);
+        for (const auto &candidate : candidates)
+            if (is_executable(candidate))
+                return JsRuntime{"deno", candidate};
+        if (std::string found = find_in_path(deno_name); !found.empty())
+            return JsRuntime{"deno", found};
+        if (std::string found = find_in_path(node_name); !found.empty())
+            return JsRuntime{"node", found};
+        return JsRuntime{};
+    }();
+    return cached;
+}
+
 static std::string shell_quote(const std::string &value)
 {
 #ifdef P100_WINDOWS
@@ -469,11 +694,11 @@ static void backend_reader_thread(BackendChannel *ch)
         if (!ok || n == 0)
         {
             // EOF / broken pipe: the backend process is gone.
-            ch->dead = true;
+            if (!pending.empty())
+                route_backend_line(*ch, pending);
+            channel_mark_dead(*ch);
             {
                 std::lock_guard<std::mutex> lock(ch->q_mutex);
-                if (!pending.empty())
-                    ch->lines.push_back(pending);
                 ch->lines.push_back(""); // sentinel: dead, nothing more coming
             }
             ch->q_cv.notify_all();
@@ -487,7 +712,7 @@ static void backend_reader_thread(BackendChannel *ch)
             // retire the channel after handing over the error.
             fprintf(stderr, "ERROR: Backend response too large ( > %zu MB). Aborting read.\n",
                     kMaxBackendLine / (1024 * 1024));
-            ch->dead = true;
+            channel_mark_dead(*ch);
             {
                 std::lock_guard<std::mutex> lock(ch->q_mutex);
                 ch->lines.clear();
@@ -497,19 +722,13 @@ static void backend_reader_thread(BackendChannel *ch)
             ch->q_cv.notify_all();
             return;
         }
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos)
         {
-            std::lock_guard<std::mutex> lock(ch->q_mutex);
-            size_t pos;
-            while ((pos = pending.find('\n')) != std::string::npos)
-            {
-                std::string line = pending.substr(0, pos);
-                pending.erase(0, pos + 1);
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-                    line.pop_back();
-                ch->lines.push_back(std::move(line));
-            }
+            std::string line = pending.substr(0, pos);
+            pending.erase(0, pos + 1);
+            route_backend_line(*ch, std::move(line));
         }
-        ch->q_cv.notify_all();
     }
 }
 
@@ -557,7 +776,7 @@ static bool channel_write_line(BackendChannel &ch, const std::string &cmd)
             written == 0)
         {
             // A failed/zero write mid-command desyncs the protocol.
-            ch.dead = true;
+            channel_mark_dead(ch);
             return false;
         }
         sent += written;
@@ -615,7 +834,7 @@ static std::string backend_read_line(BackendChannel &ch, int timeout_sec = -1)
         {
             if (errno == EINTR)
                 continue;
-            ch.dead = true;
+            channel_mark_dead(ch);
             return "{\"error\":\"Backend pipe error\",\"kind\":\"backend\"}";
         }
         if (pr == 0)
@@ -626,13 +845,13 @@ static std::string backend_read_line(BackendChannel &ch, int timeout_sec = -1)
         {
             if (errno == EINTR)
                 continue;
-            ch.dead = true;
+            channel_mark_dead(ch);
             return "{\"error\":\"Backend pipe error\",\"kind\":\"backend\"}";
         }
         if (n == 0)
         {
             // EOF: the backend process exited (crash, killed, bad auth).
-            ch.dead = true;
+            channel_mark_dead(ch);
             return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
         }
         line.append(buf, (size_t)n);
@@ -649,6 +868,49 @@ static std::string backend_read_line(BackendChannel &ch, int timeout_sec = -1)
         line.pop_back();
     return line;
 }
+// Reader for id-tagged channels: routes `@id <json>` replies to their waiting
+// request. Only the main channel uses this; legacy channels stay request/reply.
+static void backend_reader_thread_posix(BackendChannel *ch)
+{
+    std::string pending;
+    char buf[8192];
+    for (;;)
+    {
+        if (ch->dead.load(std::memory_order_relaxed))
+            break;
+        struct pollfd pfd = {fileno(ch->out), POLLIN, 0};
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (pr == 0)
+            continue; // re-check dead
+        const ssize_t n = read(fileno(ch->out), buf, sizeof(buf));
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break; // EOF: backend exited
+        pending.append(buf, (size_t)n);
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos)
+        {
+            std::string line = pending.substr(0, pos);
+            pending.erase(0, pos + 1);
+            route_backend_line(*ch, std::move(line));
+        }
+    }
+    if (!pending.empty())
+        route_backend_line(*ch, pending);
+    channel_mark_dead(*ch);
+}
+
 #endif // !P100_WINDOWS
 
 static void backend_write_line(BackendChannel &ch, const std::string &cmd)
@@ -667,6 +929,9 @@ static void backend_write_line(BackendChannel &ch, const std::string &cmd)
 
 static bool spawn_backend(BackendChannel &ch)
 {
+    // The main channel answers id-tagged commands concurrently; the workers
+    // stay serial (one resolve / provider cascade at a time per channel).
+    ch.concurrent = (&ch == &g_backend);
 #ifdef P100_WINDOWS
     // A stopped backend's reader queues an empty EOF sentinel. If it survives
     // into the new process, the first read returns that stale line and the
@@ -687,6 +952,16 @@ static bool spawn_backend(BackendChannel &ch)
     _putenv_s("P100_CONFIG_DIR", p100_config_dir().c_str());
     _putenv_s("P100_YTDLP", ytdlp_bin().c_str());
     _putenv_s("P100_WARM_EXTRACTOR", g_warm_extractor.c_str());
+    _putenv_s("P100_BACKEND_ROLE", backend_channel_name(ch));
+    _putenv_s("P100_BACKEND_CONCURRENT", ch.concurrent ? "1" : "0");
+    _putenv_s("P100_BACKEND_WORKERS", "4");
+    {
+        // Same contract as POSIX: the backend resolves streams in-process, so
+        // it needs the runtime path for yt-dlp's js_runtimes option.
+        const JsRuntime js = find_js_runtime();
+        const std::string spec = js.path.empty() ? "" : js.name + ":" + js.path;
+        _putenv_s("P100_JS_RUNTIME", spec.c_str());
+    }
     _putenv_s("PYTHONUNBUFFERED", "1");
     // The command protocol is UTF-8 on both ends; without this, redirected
     // stdio uses the ANSI code page and non-Latin titles/queries break.
@@ -756,7 +1031,7 @@ static bool spawn_backend(BackendChannel &ch)
         fprintf(stderr, "Backend not ready: %s\n", ready.c_str());
         if (ready.find("\"error\"") != std::string::npos)
             record_backend_error(ready);
-        ch.dead = true;
+        channel_mark_dead(ch);
         ch.ready_cv.notify_all();
         return false;
     }
@@ -805,6 +1080,30 @@ static bool spawn_backend(BackendChannel &ch)
         setenv("P100_CONFIG_DIR", p100_config_dir().c_str(), 1);
         setenv("P100_YTDLP", ytdlp_bin().c_str(), 1);
         setenv("P100_WARM_EXTRACTOR", g_warm_extractor.c_str(), 1);
+        setenv("P100_BACKEND_ROLE", backend_channel_name(ch), 1);
+        setenv("P100_BACKEND_CONCURRENT", ch.concurrent ? "1" : "0", 1);
+        setenv("P100_BACKEND_WORKERS", "4", 1);
+        // The backend runs yt-dlp in-process for resolves. Hand it the same
+        // JavaScript runtime the C++ side passes on the command line, and put
+        // it first on PATH so any yt-dlp invocation that doesn't take the flag
+        // still finds it.
+        {
+            const JsRuntime js = find_js_runtime();
+            if (!js.path.empty())
+            {
+                const std::string spec = js.name + ":" + js.path;
+                setenv("P100_JS_RUNTIME", spec.c_str(), 1);
+                const size_t slash = js.path.find_last_of('/');
+                if (slash != std::string::npos)
+                {
+                    const std::string runtime_dir = js.path.substr(0, slash);
+                    const char *old = getenv("PATH");
+                    const std::string path =
+                        runtime_dir + (old ? ":" + std::string(old) : "");
+                    setenv("PATH", path.c_str(), 1);
+                }
+            }
+        }
         setenv("PYTHONUNBUFFERED", "1", 1);
         // The command protocol is UTF-8 on both ends; keep stdio from
         // falling back to the locale encoding (ASCII under LANG=C).
@@ -848,18 +1147,95 @@ static bool spawn_backend(BackendChannel &ch)
             if (ready.find("\"error\"") != std::string::npos)
                 record_backend_error(ready);
         }
-        ch.dead = true;
+        channel_mark_dead(ch);
         ch.ready_cv.notify_all();
         return false;
     }
     g_backend_guest.store(ready_says_guest(ready), std::memory_order_relaxed);
     ch.ready.store(true, std::memory_order_release);
     ch.ready_cv.notify_all();
+    if (ch.concurrent && !ch.reader.joinable())
+        ch.reader = std::thread(backend_reader_thread_posix, &ch);
     return true;
 #endif // !P100_WINDOWS
 }
 
 static std::thread g_optional_backend_thread;
+
+// Tear a channel down completely (both platforms) so it can be spawned again.
+// Only used for a channel that is already dead, so no other thread should be
+// reading or writing its pipes.
+static void teardown_channel(BackendChannel &ch)
+{
+    // Serialize with any command I/O on this channel before closing its pipes.
+    std::lock_guard<std::mutex> io_lock(ch.mutex);
+    channel_mark_dead(ch);
+#ifdef P100_WINDOWS
+    channel_close(ch);
+    if (ch.pid)
+    {
+        TerminateProcess(ch.pid, 0);
+        WaitForSingleObject(ch.pid, 2000);
+        CloseHandle(ch.pid);
+        ch.pid = NULL;
+    }
+    if (ch.reader.joinable())
+        ch.reader.join();
+    {
+        std::lock_guard<std::mutex> lock(ch.q_mutex);
+        ch.lines.clear();
+    }
+#else
+    // Let a concurrent reader leave poll() before its fd is closed.
+    if (ch.reader.joinable())
+        ch.reader.join();
+    if (ch.in)
+    {
+        fclose(ch.in);
+        ch.in = nullptr;
+    }
+    if (ch.out)
+    {
+        fclose(ch.out);
+        ch.out = nullptr;
+    }
+    if (ch.pid > 0)
+    {
+        kill(ch.pid, SIGTERM);
+        waitpid(ch.pid, nullptr, 0);
+        ch.pid = 0;
+    }
+#endif
+    ch.dead.store(false, std::memory_order_relaxed);
+}
+
+// Optional workers can die (a crashed backend, a killed process) or be marked
+// dead after a wedged reply. Bring one back instead of degrading the whole
+// session: play falls back to main, but meta death silently killed lyrics and
+// prefetch. Throttled so a persistent fault cannot spawn a process per command.
+static bool revive_channel(BackendChannel &ch)
+{
+    if (&ch == &g_backend)
+        return false;
+    if (!g_optional_backends_enabled.load(std::memory_order_relaxed) ||
+        g_backend_stopping.load(std::memory_order_relaxed))
+        return false;
+    static std::mutex revive_mutex;
+    std::lock_guard<std::mutex> lock(revive_mutex);
+    if (channel_usable(ch))
+        return true;
+    const int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const int64_t last = ch.last_revive_ms.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 30000)
+        return false;
+    ch.last_revive_ms.store(now, std::memory_order_relaxed);
+    fprintf(stderr, "Backend worker %s is not usable; restarting it.\n",
+            backend_channel_name(ch));
+    teardown_channel(ch);
+    return spawn_backend(ch);
+}
 
 void set_optional_backends_enabled(bool enabled)
 {
@@ -874,7 +1250,7 @@ void set_backend_deferred(bool deferred)
 bool start_backend()
 {
     g_backend_stopping.store(false, std::memory_order_relaxed);
-    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend})
+    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend, &g_meta_backend})
     {
         ch->ready.store(false, std::memory_order_relaxed);
         ch->dead.store(false, std::memory_order_relaxed);
@@ -894,6 +1270,12 @@ bool start_backend()
             !g_backend_stopping.load(std::memory_order_relaxed))
             fprintf(stderr, "Play backend worker unavailable; stream resolves "
                             "share the main backend channel.\n");
+        // Meta before prefetch: lyrics and background list warmups should get
+        // their own pipe as early as possible so neither touches main.
+        if (!spawn_backend(g_meta_backend) &&
+            !g_backend_stopping.load(std::memory_order_relaxed))
+            fprintf(stderr, "Meta backend worker unavailable; lyrics and background "
+                            "prefetch share the main backend channel.\n");
         if (!spawn_backend(g_prefetch_backend) &&
             !g_backend_stopping.load(std::memory_order_relaxed))
             fprintf(stderr, "Prefetch backend worker unavailable; speculative "
@@ -910,7 +1292,7 @@ bool backend_is_guest()
 void cancel_backend_startup()
 {
     g_backend_stopping.store(true, std::memory_order_relaxed);
-    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend})
+    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend, &g_meta_backend})
         ch->ready_cv.notify_all();
 }
 
@@ -919,12 +1301,15 @@ std::string backend_diagnostics()
     auto line = [](const char *name, const BackendChannel &ch) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "%-8s ready=%d dead=%d pid=%llu commands=%llu errors=%llu last=%llums",
+                      "%-8s ready=%d dead=%d pending=%d pid=%llu commands=%llu errors=%llu "
+                      "last=%llums max=%llums",
                       name, (int)ch.ready.load(), (int)ch.dead.load(),
+                      (int)std::max(0, ch.pending.load()),
                       (unsigned long long)(uintptr_t)ch.pid,
                       (unsigned long long)ch.commands.load(),
                       (unsigned long long)ch.errors.load(),
-                      (unsigned long long)ch.last_ms.load());
+                      (unsigned long long)ch.last_ms.load(),
+                      (unsigned long long)ch.max_ms.load());
         return std::string(buf);
     };
     std::string out;
@@ -933,6 +1318,8 @@ std::string backend_diagnostics()
     out += line("play", g_play_backend);
     out += '\n';
     out += line("prefetch", g_prefetch_backend);
+    out += '\n';
+    out += line("meta", g_meta_backend);
     out += '\n';
     return out;
 }
@@ -950,11 +1337,14 @@ BackendDebugSnapshot backend_debug_snapshot()
         s.commands = ch.commands.load(std::memory_order_relaxed);
         s.errors = ch.errors.load(std::memory_order_relaxed);
         s.last_ms = ch.last_ms.load(std::memory_order_relaxed);
+        s.max_ms = ch.max_ms.load(std::memory_order_relaxed);
+        s.pending = (size_t)std::max(0, ch.pending.load(std::memory_order_relaxed));
         snap.channels.push_back(std::move(s));
     };
     channel("main", g_backend);
     channel("play", g_play_backend);
     channel("prefetch", g_prefetch_backend);
+    channel("meta", g_meta_backend);
 
     {
         std::lock_guard<std::mutex> lock(g_backend_log_mutex);
@@ -979,7 +1369,7 @@ void stop_backend()
     g_backend_stopping.store(true, std::memory_order_relaxed);
     if (g_optional_backend_thread.joinable())
         g_optional_backend_thread.join();
-    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend})
+    for (BackendChannel *ch : {&g_backend, &g_play_backend, &g_prefetch_backend, &g_meta_backend})
     {
         backend_write_line(*ch, "quit");
 #ifdef P100_WINDOWS
@@ -994,6 +1384,9 @@ void stop_backend()
         if (ch->reader.joinable())
             ch->reader.join();
 #else
+        channel_mark_dead(*ch);
+        if (ch->reader.joinable())
+            ch->reader.join();
         if (ch->in)
             fclose(ch->in);
         if (ch->out)
@@ -1422,6 +1815,83 @@ static bool resync_backend_channel(BackendChannel &ch)
     return false;
 }
 
+// Id-tagged command for a concurrent channel. The write is serialized, the
+// wait is per request, and the reader thread routes the reply back. A late
+// reply after a timeout finds no pending entry and is dropped, so no resync is
+// needed.
+static std::string send_command_job(BackendChannel &ch, const std::string &cmd)
+{
+    const uint64_t id = ch.next_req.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto reply = std::make_shared<BackendReply>();
+    {
+        std::lock_guard<std::mutex> lock(ch.pending_mutex);
+        ch.pending_replies[id] = reply;
+    }
+    const int pending_ahead = ch.pending.fetch_add(1, std::memory_order_relaxed);
+    const auto cmd_start = std::chrono::steady_clock::now();
+    uint64_t queue_ms = 0;
+    bool written = false;
+    {
+        std::lock_guard<std::mutex> wl(ch.write_mutex);
+        queue_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - cmd_start)
+                        .count();
+        if (!ch.dead.load(std::memory_order_relaxed))
+            written = write_line_locked(
+                ch, "@" + std::to_string(id) + " " + cmd);
+    }
+
+    std::string response;
+    if (!written)
+    {
+        channel_mark_dead(ch);
+        response = "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
+    }
+    else
+    {
+        std::unique_lock<std::mutex> lk(reply->mutex);
+        const int wait_sec = read_timeout_seconds();
+        if (!reply->cv.wait_for(lk, std::chrono::seconds(wait_sec),
+                                [&] { return reply->done; }))
+        {
+            fprintf(stderr, "ERROR: Backend command timed out after %d s: %.80s\n",
+                    wait_sec, cmd.c_str());
+            response = "{\"error\":\"Backend did not respond in time\",\"kind\":\"backend\"}";
+        }
+        else
+        {
+            response = reply->response;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ch.pending_mutex);
+        ch.pending_replies.erase(id);
+    }
+    ch.pending.fetch_sub(1, std::memory_order_relaxed);
+
+    const uint64_t elapsed_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - cmd_start)
+                                    .count();
+    ch.commands.fetch_add(1, std::memory_order_relaxed);
+    ch.last_ms.store(elapsed_ms, std::memory_order_relaxed);
+    if (elapsed_ms > ch.max_ms.load(std::memory_order_relaxed))
+        ch.max_ms.store(elapsed_ms, std::memory_order_relaxed);
+    if (response.find("\"error\"") != std::string::npos)
+    {
+        ch.errors.fetch_add(1, std::memory_order_relaxed);
+        record_backend_error(response);
+    }
+    else
+    {
+        std::lock_guard<std::mutex> err_lock(g_backend_error_mutex);
+        if (g_backend_error.ok())
+            g_backend_error.clear();
+    }
+    record_backend_log(ch, cmd, elapsed_ms, response, false, queue_ms,
+                       (size_t)std::max(0, pending_ahead));
+    return response;
+}
+
 static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
 {
     // A command can arrive while the main worker is still importing Python
@@ -1440,11 +1910,30 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
         if (!ch.ready.load(std::memory_order_acquire))
             return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
     }
+    if (ch.concurrent)
+        return send_command_job(ch, cmd);
     const auto cmd_start = std::chrono::steady_clock::now();
+    ch.pending.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(ch.mutex);
-    if (!write_line_locked(ch, cmd))
+    if (ch.dead.load(std::memory_order_relaxed))
+    {
+        // Another command's timeout/EOF marked the channel dead while this one
+        // waited in the queue; never write into closed pipes.
+        ch.pending.fetch_sub(1, std::memory_order_relaxed);
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
+    }
+    const uint64_t queue_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - cmd_start)
+                                  .count();
+    const size_t pending_ahead = (size_t)std::max(0, ch.pending.load(std::memory_order_relaxed) - 1);
+    if (!write_line_locked(ch, cmd))
+    {
+        ch.pending.fetch_sub(1, std::memory_order_relaxed);
+        channel_mark_dead(ch);
+        return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
+    }
     std::string response = backend_read_line(ch);
+    ch.pending.fetch_sub(1, std::memory_order_relaxed);
     const uint64_t elapsed_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - cmd_start)
                                     .count();
@@ -1460,11 +1949,13 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
             g_backend_error.kind = BackendErrKind::Backend;
             g_backend_error.message = "Backend not running";
         }
-        record_backend_log(ch, cmd, elapsed_ms, response, true);
+        record_backend_log(ch, cmd, elapsed_ms, response, true, queue_ms, pending_ahead);
         return "{\"error\":\"Backend not running\",\"kind\":\"backend\"}";
     }
     ch.commands.fetch_add(1, std::memory_order_relaxed);
     ch.last_ms.store(elapsed_ms, std::memory_order_relaxed);
+    if (elapsed_ms > ch.max_ms.load(std::memory_order_relaxed))
+        ch.max_ms.store(elapsed_ms, std::memory_order_relaxed);
     const bool timed_out =
         response.find("Backend did not respond in time") != std::string::npos;
     if (response.find("\"error\"") != std::string::npos)
@@ -1478,7 +1969,7 @@ static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
         if (g_backend_error.ok())
             g_backend_error.clear();
     }
-    record_backend_log(ch, cmd, elapsed_ms, response, false);
+    record_backend_log(ch, cmd, elapsed_ms, response, false, queue_ms, pending_ahead);
     if (timed_out)
     {
         const auto resync_start = std::chrono::steady_clock::now();
@@ -1505,10 +1996,35 @@ static std::string send_command(const std::string &cmd)
 // worker so they never queue behind searches/lyrics on the main channel.
 // Speculative prefetches use send_prefetch_command() below. Both fall back to
 // the main channel if their worker is down.
+// A reply that means "this channel's process/pipe is gone". Callers use it to
+// fall through to the next worker instead of failing the command outright.
+static bool response_channel_dead(const std::string &response)
+{
+    return response.find("Backend not running") != std::string::npos ||
+           response.find("Backend not responding") != std::string::npos ||
+           response.find("Backend did not respond in time") != std::string::npos;
+}
+
 static std::string send_play_command(const std::string &cmd)
 {
-    if (g_play_backend.ready.load(std::memory_order_acquire))
-        return send_command_on(g_play_backend, cmd);
+    if (channel_usable(g_play_backend))
+    {
+        std::string response = send_command_on(g_play_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+        if (revive_channel(g_play_backend))
+        {
+            response = send_command_on(g_play_backend, cmd);
+            if (!response_channel_dead(response))
+                return response;
+        }
+    }
+    else if (g_play_backend.dead.load() && revive_channel(g_play_backend))
+    {
+        std::string response = send_command_on(g_play_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+    }
     return send_command_on(g_backend, cmd);
 }
 
@@ -1517,9 +2033,92 @@ static std::string send_play_command(const std::string &cmd)
 // metadata lookups; sharing the play channel would make a click wait instead.
 static std::string send_prefetch_command(const std::string &cmd)
 {
-    if (g_prefetch_backend.ready.load(std::memory_order_acquire))
+    if (channel_usable(g_prefetch_backend))
+    {
+        std::string response = send_command_on(g_prefetch_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+        if (revive_channel(g_prefetch_backend))
+        {
+            response = send_command_on(g_prefetch_backend, cmd);
+            if (!response_channel_dead(response))
+                return response;
+        }
+    }
+    else if (g_prefetch_backend.dead.load() && revive_channel(g_prefetch_backend))
+    {
+        std::string response = send_command_on(g_prefetch_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+    }
+    return send_command_on(g_backend, cmd);
+}
+
+// Background metadata and speculative batches: slow provider cascades (lyrics)
+// and list warmups must never sit in front of an interactive search. The meta
+// worker falls back to prefetch and then main when it could not start.
+static std::string send_meta_command(const std::string &cmd)
+{
+    if (channel_usable(g_meta_backend))
+    {
+        std::string response = send_command_on(g_meta_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+        // The worker died between our check and its reply: retry once on the
+        // next channel so the first lyrics request after a crash still works,
+        // then let the revive path bring meta back for the next one.
+        if (revive_channel(g_meta_backend))
+        {
+            response = send_command_on(g_meta_backend, cmd);
+            if (!response_channel_dead(response))
+                return response;
+        }
+    }
+    else if (g_meta_backend.dead.load() && revive_channel(g_meta_backend))
+    {
+        std::string response = send_command_on(g_meta_backend, cmd);
+        if (!response_channel_dead(response))
+            return response;
+    }
+    if (channel_usable(g_prefetch_backend))
+        return send_command_on(g_prefetch_backend, cmd);
+    if (g_prefetch_backend.dead.load() && revive_channel(g_prefetch_backend))
         return send_command_on(g_prefetch_backend, cmd);
     return send_command_on(g_backend, cmd);
+}
+
+// Speculative work (list/queue warmups) must never fall back to main: a large
+// prefetch batch there is exactly what starves a search. Wait for one of the
+// background workers instead (they start a few seconds after main).
+static std::string send_background_command(const std::string &cmd)
+{
+    // Low-memory mode runs only the main worker; it is concurrent, so
+    // speculative work can share it without blocking anything else.
+    if (!g_optional_backends_enabled.load(std::memory_order_relaxed))
+        return send_command_on(g_backend, cmd);
+    for (int i = 0; i < 50; ++i)
+    {
+        if (channel_usable(g_meta_backend))
+        {
+            std::string response = send_command_on(g_meta_backend, cmd);
+            if (!response_channel_dead(response))
+                return response;
+        }
+        else if (channel_usable(g_prefetch_backend))
+        {
+            std::string response = send_command_on(g_prefetch_backend, cmd);
+            if (!response_channel_dead(response))
+                return response;
+        }
+        if (g_meta_backend.dead.load())
+            revive_channel(g_meta_backend);
+        if (g_prefetch_backend.dead.load())
+            revive_channel(g_prefetch_backend);
+        if (g_backend_stopping.load(std::memory_order_relaxed))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return "{\"error\":\"Background backend unavailable\",\"kind\":\"backend\"}";
 }
 
 // ------------------ Cache directory / cookie source ------------------
@@ -1550,23 +2149,14 @@ static std::string cookie_arg()
     return " --cookies-from-browser " + g_ytdl_browser;
 }
 
-// yt-dlp now needs a JavaScript runtime plus the yt-dlp-ejs solver to pass
-// YouTube's signature/challenge checks. Deno is installed next to yt-dlp.exe
-// by the Windows installer; pass it explicitly so downloads work even when
-// the venv's Scripts directory is not on PATH.
+// The runtime path comes from find_js_runtime() above; pass it explicitly so
+// downloads work even when the runtime directory is not on PATH.
 static std::string js_runtime_arg()
 {
-#ifdef P100_WINDOWS
-    const std::string bin = ytdlp_bin();
-    const size_t slash = bin.find_last_of("/\\");
-    if (slash != std::string::npos)
-    {
-        const std::string deno = bin.substr(0, slash + 1) + "deno.exe";
-        if (is_executable(deno))
-            return " --js-runtimes \"deno:" + deno + "\"";
-    }
-#endif
-    return "";
+    const JsRuntime runtime = find_js_runtime();
+    if (runtime.name.empty() || runtime.path.empty())
+        return "";
+    return " --js-runtimes \"" + runtime.name + ":" + runtime.path + "\"";
 }
 
 // Run a shell command and capture combined stdout/stderr so a yt-dlp failure
@@ -2769,7 +3359,9 @@ bool fetch_lyrics(const std::string &video_id, Lyrics &out)
         out.source = "Local file";
         return true;
     }
-    std::string response = send_command("lyrics " + video_id);
+    // Lyrics are a slow provider cascade and are never needed on the
+    // interactive path: keep them off the main channel (meta, then prefetch).
+    std::string response = send_meta_command("lyrics " + video_id);
     return parse_lyrics_json(response, out);
 }
 
@@ -3191,7 +3783,7 @@ MusicVideoMatch fetch_music_video(const std::string &video_id)
 }
 
 std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
-    const std::vector<std::string> &video_ids)
+    const std::vector<std::string> &video_ids, bool background)
 {
     std::unordered_map<std::string, std::string> urls;
     std::string cmd = "prefetch";
@@ -3203,7 +3795,12 @@ std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
     }
     if (cmd == "prefetch")
         return urls;
-    std::string response = send_prefetch_command(cmd);
+    // Interactive warmups (hover/hero) use the dedicated prefetch worker;
+    // page/queue warmups go to the background meta worker so they never sit
+    // in front of a click. A background batch waits for its worker rather than
+    // ever landing on main.
+    std::string response =
+        background ? send_background_command(cmd) : send_prefetch_command(cmd);
     if (response.empty() || response.find("\"error\"") != std::string::npos)
         return urls;
     for_each_json_array_object(response, [&](const std::string &obj) {

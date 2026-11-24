@@ -248,6 +248,8 @@ install(PROGRAMS scripts/crossfade-login-helper.py
     DESTINATION ${CMAKE_INSTALL_DATADIR}/crossfade/scripts)
 install(PROGRAMS scripts/bootstrap-venv.sh
     DESTINATION ${CMAKE_INSTALL_DATADIR}/crossfade/scripts)
+install(PROGRAMS scripts/fetch-js-runtime.sh
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/crossfade/scripts)
 
 # ---- Party mode unit tests (off by default; ./mk stays unchanged) ----
 option(CROSSFADE_BUILD_TESTS "Build crossfade unit tests" ON)

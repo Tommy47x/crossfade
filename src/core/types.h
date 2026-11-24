@@ -249,6 +249,10 @@ struct Settings
     // system reports it is running on battery. P100_LOW_POWER overrides both.
     bool low_power = false;
     bool low_power_on_battery = true;
+    // Low memory mode: run a single (concurrent) backend process instead of
+    // four. Speculative work shares the main channel; saves a few hundred MB.
+    // Applied when the backends start (next launch).
+    bool low_memory_mode = false;
     // Warm start: keep a background instance for instant relaunches. The
     // window may be hidden while the GL context and (per warm_start_mode)
     // backends stay warm. 0 = everything, 1 = main backend only, 2 = UI only.
@@ -287,6 +291,11 @@ struct Settings
     // uncached songs start faster. Turn off if playback misbehaves. Applied
     // when the backend processes start (i.e. next app launch).
     bool warm_stream_resolver = true;
+
+    // "Prefetch the world": warm stream URLs for the whole visible list in the
+    // background instead of only the hovered row. Costs bandwidth and can trip
+    // YouTube rate limits; off by default.
+    bool aggressive_prefetch = false;
 
     // Party mode settings (never the token, guest ids or guest names).
     PartySettings party;
@@ -376,6 +385,7 @@ struct Settings
                check_for_updates == o.check_for_updates &&
                low_power == o.low_power &&
                low_power_on_battery == o.low_power_on_battery &&
+               low_memory_mode == o.low_memory_mode &&
                warm_start == o.warm_start &&
                warm_start_mode == o.warm_start_mode &&
                warm_close_hides == o.warm_close_hides &&
@@ -387,6 +397,7 @@ struct Settings
                repeat_mode == o.repeat_mode && ui_elements == o.ui_elements &&
                notes == o.notes && download_cap_gb == o.download_cap_gb &&
                warm_stream_resolver == o.warm_stream_resolver &&
+               aggressive_prefetch == o.aggressive_prefetch &&
                playback_speed == o.playback_speed && eq_enabled == o.eq_enabled &&
                eq_bands == o.eq_bands && eq_layout == o.eq_layout &&
                eq_preset == o.eq_preset &&

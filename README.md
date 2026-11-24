@@ -284,6 +284,14 @@ sudo dnf install @development-tools cmake SDL2-devel mesa-libGL-devel \
                  mpv-devel glib2-devel libnotify-devel python3 python3-pip curl
 ```
 
+`./install.sh` also provisions the JavaScript runtime yt-dlp needs for
+YouTube's signature challenges: a pinned, checksummed Deno release
+(~40 MB download) under `<prefix>/share/crossfade/runtime/deno`. This is not a
+build dependency — the app just passes its path to yt-dlp. A system `deno` or
+`node` is used when present, `P100_SKIP_JS_RUNTIME=1` skips the download, and
+offline installs can pre-place the release zip as
+`share/crossfade/runtime/deno.zip`.
+
 You need **mpv ≥ 0.35** (libmpv is what the app links against).
 
 Public party links (the Party tab default) additionally need **`cloudflared`**;
@@ -473,9 +481,14 @@ webview engine your system has, with no extra runtime bundled:
 3. **Windows WebView2** through the optional `pywebview` package. The installer
    adds it best-effort; the WebView2 runtime itself ships with Windows.
 
-The panel's **Sign-in methods detected** section shows what was found. If no
-engine is available — or Google refuses the embedded browser — use the paste
-panel below; it always works. Engines are detected at runtime, never required.
+Most distributions do not install WebKitGTK by default (Fedora in particular),
+so when no engine is found **Sign in imports an already signed-in browser
+session**. If there is none, it opens YouTube Music in your browser; log in
+there and press **Import session from this browser**. Imports are verified before
+anything is replaced, need no extra packages, and are the normal path on stock
+Fedora. The panel's **Sign-in methods detected** section shows what was found,
+and what is missing when nothing is available. If an embedded window is
+available but Google refuses it, the paste panel below always works.
 
 ### Paste request headers (works with any browser)
 
@@ -501,6 +514,14 @@ and Edge decryption is delegated to yt-dlp (DPAPI/libsecret/Keychain). This is
 a one-click snapshot and is never used automatically: if the session has
 expired, verification fails and nothing changes, so a fresh window sign-in is
 still the reliable path.
+
+Import reads only the `youtube.com` copy of the account cookies (Google stores
+different `HSID`/`SSID`/`SIDCC`/`__Secure-*PSIDTS` values per domain, and a
+mixed set is rejected as anonymous), tries every Firefox profile, and verifies
+each one against the account with the same `logged_in` check the backend uses.
+A signed-out browser now reports "signed out" instead of a misleading success,
+and the Settings card and sidebar show **Guest mode** until the backend really
+has a session.
 
 Launch crossfade and everything — home feed, likes, playlists, lyrics — is yours.
 
@@ -894,9 +915,10 @@ The scripts still work for scripted backups:
 crossfade (C++17, SDL2 + OpenGL + ImGui)
  ├── libmpv player A ─┐
  ├── libmpv player B ─┴── crossfade handoff (end-of-track + manual skips)
- ├── Python backend: main channel  — search, library, lyrics, radio
+ ├── Python backend: main channel  — search, library, radio, browse
  ├── Python backend: play channel  — stream-URL resolves (clicks never wait)
- ├── Python backend: prefetch      — speculative stream warming only
+ ├── Python backend: prefetch      — hover/hero stream warming only
+ ├── Python backend: meta          — lyrics + background list warmups
  └── yt-dlp                        — in-process extractor or subprocess fallback
 ```
 
@@ -910,12 +932,33 @@ is instant instead of waiting for a resolve.
 
 ### Backends and data flow
 
-The C++ process keeps **three long-lived Python backends** over stdin/stdout pipes, one
-JSON command per line. Splitting them means a slow speculative resolve can delay neither a
-user click nor a search/metadata request: the play channel is the only one that handles a
-click's `play` / `play_fresh`, while speculative prefetches use their own channel and
-self-throttle there. If either extra channel fails to start, its work falls back to the
-main channel.
+The C++ process keeps **four long-lived Python backends** over stdin/stdout pipes. The
+**main channel is concurrent**: commands are id-tagged (`@17 album MPRE…`), answered by a
+four-thread pool with a per-thread `YTMusic` instance, and the C++ reader routes each reply
+back to its waiting caller. A slow album page therefore cannot delay a search or the
+suggestions that follow it. The play channel is the only one that handles a click's `play` /
+`play_fresh`; prefetch warms the hovered row and the search top result; meta runs lyrics and
+background list warmups. If an extra channel fails to start, its work falls back to the next
+one (and finally main, except for background batches, which wait rather than blocking main).
+A dead optional worker is marked unusable and restarted on demand.
+
+HTTP requests to YouTube Music are bounded (8 s default, Settings → Tunables) because
+ytmusicapi's own default is 30 s: one stalled request used to freeze the serial command pipe
+for half a minute. **Low memory mode** (Settings → Power) runs only the concurrent main
+backend instead of four processes.
+
+**Prefetch the world** (Settings → YouTube Music) warms the whole visible list on the meta
+channel instead of only the hovered row, so clicks and the search hero start instantly. It
+is off by default because it uses more bandwidth and can trip YouTube rate limits; the
+depth is tunable in Settings → Tunables.
+
+Optional workers are supervised: if one dies (crash, OOM, or a wedged command past its
+deadline), its channel is marked unusable so commands fall through to the next one, and it
+is restarted on demand. A prefetch batch also has a hard deadline and returns partial
+results, so a single stuck extraction cannot wedge the channel. **F2** opens the backend
+debug window: per-channel pending queue, last/max latency, and every command with its queue
+wait, duration and error text. `backend.log` mirrors the important lines
+(`[main] search_all my query 508ms ok`, `[lyrics] … ytm-timed 402ms hit`).
 
 A typical click:
 
@@ -937,10 +980,13 @@ touches the currently playing one. Stream URLs themselves are cached for 2 hours
 ### Search, lyrics, and thumbnails
 
 - **Search** runs its sub-queries in parallel (4 workers), caches results for 15 minutes,
-  and prefetches stream URLs for the first 10 songs.
+  warms the intent match ("Top result") first on the priority channel, then the first 10
+  rows in the background.
 - **Lyrics** cascade: YouTube Music native timed → LRCLIB → NetEase → Kugou → lyrics.ovh →
   YouTube Music plain. The first timestamped result wins, with normalized title/artist/
-  duration matching so the wrong song's lyrics are never shown.
+  duration matching so the wrong song's lyrics are never shown. The cascade runs on the
+  meta channel with a per-provider timeout and a total deadline, so it can never hold up a
+  search; each provider's timing is logged in `backend.log` (`[lyrics] … 402ms hit`).
 - **Thumbnails** load asynchronously: curl download → stb_image decode → GPU upload on the
   main thread, with a 60-second backoff for failed URLs.
 

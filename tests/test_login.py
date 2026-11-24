@@ -151,6 +151,8 @@ def test_ytdlp_jar(failures):
     fake.extract_cookies_from_browser = lambda *a, **k: [
         FakeCookie("SAPISID", "s", ".google.com"),
         FakeCookie("__Secure-3PAPISID", "p", ".youtube.com"),
+        FakeCookie("HSID", "google-hsid", ".google.com"),
+        FakeCookie("HSID", "youtube-hsid", ".youtube.com"),
         FakeCookie("NOPE", "x", ".google.com"),
         FakeCookie("AUTH", "a", ".example.com"),
     ]
@@ -159,6 +161,8 @@ def test_ytdlp_jar(failures):
     try:
         cookies = login.cookies_from_ytdlp_browser("chrome")
         check(cookies.get("__Secure-3PAPISID") == "p", "reads Google cookies", failures)
+        check(cookies.get("HSID") == "youtube-hsid",
+              "yt-dlp imports prefer the youtube.com copy too", failures)
         check("NOPE" not in cookies, "filters unrelated cookies", failures)
         check("AUTH" not in cookies, "ignores other domains", failures)
     finally:
@@ -263,6 +267,183 @@ def test_chrome_lock_hint(failures):
             sys.modules["yt_dlp.cookies"] = old_mod
 
 
+def test_system_python_not_shadowed(failures):
+    """A venv symlink must not hide the system interpreter.
+
+    Fedora regression: the app venv's bin/python is a symlink to the system
+    binary and has no system site-packages, so deduping by realpath skipped
+    /usr/bin/python3 and PyGObject/WebKitGTK was never found.
+    """
+    import importlib.util
+
+    helper = os.path.join(ROOT, "scripts", "crossfade-login-helper.py")
+    spec = importlib.util.spec_from_file_location("crossfade_login_helper_py", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    root = tempfile.mkdtemp(prefix="crossfade-interp-")
+    venv = os.path.join(root, "venv")
+    venv_bin = os.path.join(venv, "bin")
+    os.makedirs(venv_bin)
+    venv_py = os.path.join(venv_bin, "python")
+    real = os.path.realpath(sys.executable)
+    try:
+        os.symlink(real, venv_py)
+    except (OSError, NotImplementedError):
+        return  # no symlinks on this platform; nothing to check
+    with open(os.path.join(venv, "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write("home = %s\ninclude-system-site-packages = false\n"
+                % os.path.dirname(real))
+
+    here = module._interp_identity(venv_py)
+    check(here != module._interp_identity(sys.executable),
+          "a venv symlink is not mistaken for the system interpreter", failures)
+
+    old = os.environ.get("P100_SYSTEM_PYTHON")
+    os.environ["P100_SYSTEM_PYTHON"] = venv_py
+    try:
+        candidates = module._system_pythons()
+    finally:
+        if old is None:
+            os.environ.pop("P100_SYSTEM_PYTHON", None)
+        else:
+            os.environ["P100_SYSTEM_PYTHON"] = old
+    check(venv_py in candidates,
+          "an explicit interpreter that shares the binary is still tried", failures)
+
+
+def _write_cookie_db(path, cookies, wal=False):
+    import sqlite3
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path)
+    if wal:
+        con.execute("pragma journal_mode=wal")
+    con.execute("create table moz_cookies (id integer primary key, host text,"
+                " name text, value text, expiry integer)")
+    for host, name, value in cookies:
+        con.execute("insert into moz_cookies (host, name, value, expiry)"
+                    " values (?, ?, ?, 0)", (host, name, value))
+    con.commit()
+    return con
+
+
+def test_firefox_sessions(failures):
+    """Every Firefox profile is tried, and cookies still in the WAL are read."""
+    root = tempfile.mkdtemp(prefix="crossfade-ff-")
+    with open(os.path.join(root, "profiles.ini"), "w", encoding="utf-8") as f:
+        f.write("[Profile0]\nName=a\nIsRelative=1\nPath=a.default\n"
+                "[Profile1]\nName=p100\nIsRelative=1\nPath=b.p100\n")
+    _write_cookie_db(os.path.join(root, "a.default", "cookies.sqlite"),
+                     [(".google.com", "HSID", "g1"),
+                      (".youtube.com", "HSID", "y1"),
+                      (".youtube.com", "SAPISID", "old")]).close()
+    writer = _write_cookie_db(
+        os.path.join(root, "b.p100", "cookies.sqlite"),
+        [(".google.com", "HSID", "g2"),
+         (".youtube.com", "HSID", "y2"),
+         (".youtube.com", "SAPISID", "fresh")], wal=True)
+    # Append a signed-in cookie and keep the writer open so the row lives only
+    # in cookies.sqlite-wal, as it does while Firefox runs.
+    writer.execute("insert into moz_cookies (host, name, value, expiry) values"
+                   " ('.youtube.com', '__Secure-3PAPISID', 'walonly', 0)")
+    writer.commit()
+    try:
+        sessions = login.firefox_sessions(profile_root=root)
+        by_profile = {}
+        for profile, cookies in sessions:
+            by_profile.setdefault(os.path.basename(profile), {}).update(cookies)
+        check("a.default" in by_profile and "b.p100" in by_profile,
+              "reads every Firefox profile", failures)
+        check(by_profile.get("b.p100", {}).get("__Secure-3PAPISID") == "walonly",
+              "reads cookies that are still in the WAL", failures)
+        check(by_profile.get("b.p100", {}).get("HSID") == "y2",
+              "the youtube.com HSID wins inside a profile", failures)
+        check(login.cookies_from_firefox(profile_root=root).get("SAPISID") == "old",
+              "cookies_from_firefox keeps its first-profile behaviour", failures)
+    finally:
+        writer.close()
+
+
+def test_cookie_host_preference(failures):
+    """music.youtube.com only accepts the .youtube.com copy of each cookie.
+
+    Google sets different HSID/SSID/SIDCC/__Secure-*PSIDTS per domain. Merging
+    them in row order (the old behaviour) made the API treat a valid session
+    as anonymous depending on which row was read last.
+    """
+    rows = [
+        (".google.com", "SID", "sid"),
+        (".youtube.com", "SID", "sid"),
+        (".google.com", "HSID", "google-hsid"),
+        (".youtube.com", "HSID", "youtube-hsid"),
+        (".google.com", "SIDCC", "google-sidcc"),
+        (".youtube.com", "SIDCC", "youtube-sidcc"),
+        (".google.com", "__Secure-3PSIDTS", "google-psidts"),
+        (".youtube.com", "__Secure-3PSIDTS", "youtube-psidts"),
+        (".google.com", "SAPISID", "sapisid"),
+        (".youtube.com", "__Secure-3PAPISID", "secure"),
+        (".google.com", "NOPE", "x"),
+    ]
+    cookies = login.prefer_youtube_cookies(rows)
+    check(cookies.get("HSID") == "youtube-hsid",
+          "the youtube HSID wins over google.com", failures)
+    check(cookies.get("SIDCC") == "youtube-sidcc",
+          "the youtube SIDCC wins over google.com", failures)
+    check(cookies.get("__Secure-3PSIDTS") == "youtube-psidts",
+          "the youtube rotating token wins over google.com", failures)
+    check(cookies.get("SAPISID") == "sapisid",
+          "google-only auth names are kept as a fallback", failures)
+    check("NOPE" not in cookies, "unrelated cookies are dropped", failures)
+
+    # Reverse row order must not change the outcome.
+    shuffled = login.prefer_youtube_cookies(list(reversed(rows)))
+    check(shuffled.get("HSID") == "youtube-hsid",
+          "row order no longer decides which host wins", failures)
+
+
+def test_verify_auth_file(failures):
+    """A signed-out cookie file must never verify as a session."""
+    import types
+
+    class FakeYT:
+        def __init__(self, path):
+            pass
+
+        def get_library_playlists(self, limit=None):
+            return []  # what ytmusicapi returns for an anonymous session
+
+    fake = types.ModuleType("ytmusicapi")
+    fake.YTMusic = FakeYT
+    old_mod = sys.modules.get("ytmusicapi")
+    old_state = login.server_login_state
+    sys.modules["ytmusicapi"] = fake
+    try:
+        login.server_login_state = lambda yt: False
+        ok, message = login.verify_auth_file("/tmp/crossfade-test-auth")
+        check(not ok and "signed out" in message.lower(),
+              "a signed-out session is rejected", failures)
+
+        login.server_login_state = lambda yt: True
+        ok, _ = login.verify_auth_file("/tmp/crossfade-test-auth")
+        check(ok, "a server-confirmed session is accepted", failures)
+
+        class OfflineYT(FakeYT):
+            def get_library_playlists(self, limit=None):
+                raise RuntimeError("network is down")
+
+        fake.YTMusic = OfflineYT
+        login.server_login_state = lambda yt: None
+        ok, message = login.verify_auth_file("/tmp/crossfade-test-auth")
+        check(not ok and "could not verify" in message.lower(),
+              "an unverifiable session is not reported as signed in", failures)
+    finally:
+        login.server_login_state = old_state
+        if old_mod is None:
+            sys.modules.pop("ytmusicapi", None)
+        else:
+            sys.modules["ytmusicapi"] = old_mod
+
+
 def main():
     failures = []
     test_clean_headers(failures)
@@ -272,6 +453,10 @@ def main():
     test_webview2_cookie_map(failures)
     test_chrome_lock_hint(failures)
     test_helper_cli(failures)
+    test_system_python_not_shadowed(failures)
+    test_firefox_sessions(failures)
+    test_cookie_host_preference(failures)
+    test_verify_auth_file(failures)
     if not failures:
         print("login: all checks passed")
     return 0 if not failures else 1
