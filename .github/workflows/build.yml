@@ -16,7 +16,12 @@ concurrency:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    # Pin the release builder: ubuntu-latest rolled to a glibc-2.43 image and
+    # every artifact (0.4.2+) started requiring GLIBC_2.43 symbols from libm,
+    # so the binaries refused to start on Debian 12/13, Ubuntu 22.04/24.04 and
+    # anything else with an older glibc. 22.04 keeps the floor at glibc 2.35.
+    # Bump this deliberately (and the check below with it), never to `latest`.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Verify version metadata
@@ -116,6 +121,17 @@ jobs:
           ctest --test-dir build-asan --output-on-failure
       - name: Verify binary exists
         run: test -x ./build/crossfade
+      - name: Verify glibc compatibility
+        # A binary built against a newer glibc cannot start on older distros.
+        # Fail the build instead of shipping a release nobody can run.
+        run: |
+          FLOOR=GLIBC_2.35
+          MAX="$(objdump -T build/crossfade | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "highest required symbol version: ${MAX:-none} (allowed: $FLOOR)"
+          if [ -n "$MAX" ] && [ "$(printf '%s\n%s\n' "$FLOOR" "$MAX" | sort -V | tail -1)" != "$FLOOR" ]; then
+            echo "::error::build requires $MAX, newer than $FLOOR — release artifacts will not run on older distros"
+            exit 1
+          fi
       - name: Upload PR binary
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
