@@ -29,6 +29,8 @@ int main()
     check(rooms::list().size() == 1, "one room listed");
     check(rooms::match_device("alsa_output.test") == "room_test1", "device binding matches");
     check(rooms::match_device("alsa_output.other").empty(), "unbound device does not match");
+    check(rooms::match_device("alsa_output.test", "room_test1") == "room_test1",
+          "manual choice is preferred on the same device");
 
     rooms::Profile loaded;
     check(rooms::load("room_test1", loaded), "load a room");

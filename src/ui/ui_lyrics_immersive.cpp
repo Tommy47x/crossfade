@@ -630,7 +630,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const float energy = clampf(au.rms, 0.0f, 1.0f);
         const bool reactive = au.active && energy > 0.008f && motion;
 
-        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), ui_col(ui_c().bg));
+        // Translucent by exactly the backdrop's visibility, so the app's
+        // dithered shader backdrop shows through instead of an opaque fill
+        // (which made this view look flat/banded next to the rest of the app).
+        dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
+                          ui_col(ui_backdrop_window_bg()));
 
         // Cover art, blurred and held well back so the lyrics stay the focal
         // point. This uses the full-screen (512px) blur rather than the hero
@@ -978,17 +982,17 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 const float line_dir = ((active_idx & 1) ? 1.0f : -1.0f);
                 const float slide = (1.0f - line_t) * ui_px(22.0f);
                 const float slide_x = (1.0f - line_t) * line_dir * ui_px(22.0f);
-                const float scale = motion ? (0.965f + 0.035f * line_t +
-                                              0.018f * g_imm.pulse)
-                                           : 1.0f;
+                // No zoom and no bloom on the lyrics: scaling text makes the
+                // glyphs shimmer/soft, and the offset glow halo reads as
+                // "out of focus". Positions still slide and alpha still fades.
+                const float scale = 1.0f;
                 const float alpha = (preview ? 0.58f : 1.0f) * view_a *
                                     (motion ? (0.35f + 0.65f * line_t) : 1.0f);
 
                 draw_rows(dl, font, act,
                           ImVec2(focal.x + slide_x, focal.y + slide),
                           preview ? ui_text_dim_u32() : ui_accent_text_u32(),
-                          alpha, scale, preview ? 0.0f : (0.35f + 0.65f * g_imm.pulse),
-                          karaoke);
+                          alpha, scale, 0.0f, karaoke);
 
                 // Previous line lifts away above the active one.
                 if (motion && !g_imm.prev_text.empty())

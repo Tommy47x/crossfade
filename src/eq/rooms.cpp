@@ -335,13 +335,26 @@ void deactivate(Settings &s)
     s.room_eq_active_id.clear();
 }
 
-std::string match_device(const std::string &device)
+std::string match_device(const std::string &device, const std::string &prefer)
 {
     if (device.empty())
         return "";
+    // Keep the room the user picked if it is bound to this device, so manual
+    // selection is never overridden while the output stays the same.
+    std::string best;
+    long long best_saved = -1;
     for (const Profile &p : list())
-        if (p.device == device)
-            return p.id;
-    return "";
+    {
+        if (p.device != device)
+            continue;
+        if (!prefer.empty() && p.id == prefer)
+            return prefer;
+        if (p.saved_at >= best_saved)
+        {
+            best_saved = p.saved_at;
+            best = p.id;
+        }
+    }
+    return best;
 }
 } // namespace rooms

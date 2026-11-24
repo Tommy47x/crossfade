@@ -574,16 +574,25 @@ void tick(AppState &state, const MpvPlayer &player)
     // every few seconds; nothing happens unless a saved room is bound to the
     // new device.
     static double next_device_check = 0.0;
+    static std::string last_auto_device;
     if (now >= next_device_check)
     {
         next_device_check = now + 10.0;
         const std::string dev = rooms::refresh_output_device();
-        if (!dev.empty() && state.settings.room_eq_auto_room)
+        // Only act when the device *changes*. Re-running the match every poll
+        // made a manual selection bounce back to whichever room was newest on
+        // that device, which made older profiles impossible to keep.
+        if (dev != last_auto_device)
         {
-            const std::string id = rooms::match_device(dev);
-            if (!id.empty() && id != state.settings.room_eq_active_id &&
-                rooms::activate(state.settings, id))
-                save_settings(state.settings);
+            last_auto_device = dev;
+            if (!dev.empty() && state.settings.room_eq_auto_room)
+            {
+                const std::string id =
+                    rooms::match_device(dev, state.settings.room_eq_active_id);
+                if (!id.empty() && id != state.settings.room_eq_active_id &&
+                    rooms::activate(state.settings, id))
+                    save_settings(state.settings);
+            }
         }
     }
 

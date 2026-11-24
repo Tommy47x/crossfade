@@ -48,6 +48,7 @@ std::string refresh_output_device();
 std::string output_device();
 // Human-readable form of the cached device (sink description when available).
 std::string output_device_label();
-// First profile bound to `device`, or "".
-std::string match_device(const std::string &device);
+// Profile bound to `device`. `prefer` wins when it is itself bound to that
+// device; otherwise the most recently saved match is returned. "" when none.
+std::string match_device(const std::string &device, const std::string &prefer = "");
 } // namespace rooms
