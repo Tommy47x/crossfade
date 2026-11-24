@@ -211,6 +211,8 @@ struct ImmersiveAnim
 {
     std::string track;
     int active = -2;
+    // Eased line index the view is centred on (continuous, not snapped).
+    float scroll = -1.0f;
     double active_since = 0.0;
     double view_start = 0.0;
     float enter = 0.0f;
@@ -580,6 +582,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.enter = motion ? 0.0f : 1.0f;
             g_imm.view_start = now;
             g_imm.active = -2;
+            g_imm.scroll = -1.0f;
             g_imm.pulse = 0.0f;
             g_imm.prev_text.clear();
             g_imm.prev_size = 0.0f;
@@ -927,67 +930,59 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         }
         else
         {
-            // ---- Synced: fixed focal point + active/upcoming/exit ----
+            // ---- Synced: continuous scroll through the lyric lines ----
+            // Each line is drawn at its distance from the eased scroll
+            // position, so the next line glides up and grows into focus
+            // instead of being swapped in from a corner.
             const int active = lyrics_active_line(*lx, state, player);
             if (g_imm.active == -2)
             {
                 g_imm.active = active;
+                g_imm.scroll = active >= 0 ? (float)active : 0.0f;
                 g_imm.active_since = now;
                 if (active >= 0)
                     g_imm.pulse = motion ? 1.0f : 0.0f;
             }
             else if (active != g_imm.active)
             {
-                if (g_imm.active >= 0 && g_imm.active < (int)lx->lines.size() &&
-                    !blank(lx->lines[g_imm.active]))
-                {
-                    g_imm.prev_text = lx->lines[g_imm.active];
-                    g_imm.prev_size = g_imm.last_size > 0.0f ? g_imm.last_size
-                                                             : active_pref;
-                    g_imm.prev_since = now;
-                }
                 g_imm.active = active;
                 g_imm.active_since = now;
                 if (motion && active >= 0)
                     g_imm.pulse = 1.0f;
             }
 
-            const float line_t = motion
-                                     ? ease_out((float)((now - g_imm.active_since) / kLineEnter))
-                                     : 1.0f;
-            if (motion && line_t < 1.0f)
-                animating = true;
+            const bool preview = active < 0;
+            int center_idx = active;
+            if (center_idx < 0 || center_idx >= (int)lx->lines.size() ||
+                blank(lx->lines[center_idx]))
+                center_idx = next_nonempty_index(*lx, center_idx < 0 ? 0 : center_idx);
 
-            std::string active_text;
-            int active_idx = -1;
-            if (active >= 0 && active < (int)lx->lines.size())
+            if (center_idx >= 0)
             {
-                active_idx = active;
-                if (!blank(lx->lines[active]))
-                    active_text = lx->lines[active];
-            }
-            if (active_text.empty())
-            {
-                active_idx = next_nonempty_index(*lx, active >= 0 ? active : 0);
-                if (active_idx >= 0)
-                    active_text = lx->lines[active_idx];
-            }
+                // Ease toward the active line (~300 ms feel). A seek that jumps
+                // several lines scrolls through them instead of cutting.
+                if (!motion || g_imm.scroll < 0.0f)
+                    g_imm.scroll = (float)center_idx;
+                else
+                {
+                    const float k = 1.0f - std::exp(-7.5f * dt);
+                    const float before = g_imm.scroll;
+                    g_imm.scroll += ((float)center_idx - g_imm.scroll) * k;
+                    if (std::fabs((float)center_idx - g_imm.scroll) < 0.002f)
+                        g_imm.scroll = (float)center_idx;
+                    if (std::fabs(g_imm.scroll - before) > 0.0004f)
+                        animating = true;
+                }
 
-            if (!active_text.empty())
-            {
-                const bool preview = active < 0;
-
-                // Karaoke wipe: use the gap to the next timed line as this
-                // line's duration, so the accent colour sweeps the words in
-                // step with playback.
+                // Karaoke wipe, timed by the gap to the next lyric line.
                 float karaoke = -1.0f;
-                if (!preview && active_idx < (int)lx->times.size())
+                if (!preview && center_idx < (int)lx->times.size())
                 {
                     const double t = lyrics_playback_time(state, player) -
                                      state.settings.lyrics_offset;
-                    const double t0 = lx->times[active_idx];
-                    double t1 = active_idx + 1 < (int)lx->times.size()
-                                    ? lx->times[active_idx + 1]
+                    const double t0 = lx->times[center_idx];
+                    double t1 = center_idx + 1 < (int)lx->times.size()
+                                    ? lx->times[center_idx + 1]
                                     : t0 + 4.0;
                     if (t1 <= t0)
                         t1 = t0 + 0.5;
@@ -995,62 +990,31 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     if (karaoke < 1.0f && state.playing)
                         animating = true;
                 }
-                const float pref = preview ? active_pref * 0.62f : active_pref;
-                TextLayout act = layout_text(font, active_text, max_text_w, pref,
-                                             std::max(20.0f, pref * 0.5f));
-                g_imm.last_size = act.size;
-                const float act_h = act.rows.size() * act.line_h;
 
-                // Always rise from below. The old alternating left/right
-                // entry made consecutive lines fly in from different corners,
-                // which read as a defocus rather than a lyric change.
-                const float slide = (1.0f - line_t) * ui_px(18.0f);
-                // No zoom and no bloom on the lyrics: scaling text makes the
-                // glyphs shimmer/soft, and the offset glow halo reads as
-                // "out of focus". Positions still slide and alpha still fades.
-                const float scale = 1.0f;
-                const float alpha = (preview ? 0.58f : 1.0f) * view_a *
-                                    (motion ? (0.55f + 0.45f * line_t) : 1.0f);
-
-                draw_rows(dl, font, act,
-                          ImVec2(focal.x, focal.y + slide),
-                          preview ? ui_text_dim_u32() : ui_accent_text_u32(),
-                          alpha, scale, 0.0f, karaoke);
-
-                // Previous line lifts away above the active one.
-                if (motion && !g_imm.prev_text.empty())
-                {
-                    const float exit_t = clampf((float)((now - g_imm.prev_since) / 0.42), 0.0f, 1.0f);
-                    if (exit_t < 1.0f)
-                    {
-                        TextLayout prev = layout_text(font, g_imm.prev_text, max_text_w * 0.9f,
-                                                      g_imm.prev_size * 0.70f, 16.0f);
-                        const float prev_h = prev.rows.size() * prev.line_h;
-                        const float y = focal.y - act_h * 0.5f - ui_px(28.0f) -
-                                        prev_h * 0.5f - exit_t * ui_px(26.0f);
-                        draw_rows(dl, font, prev, ImVec2(focal.x, y),
-                                  ui_text_dim_u32(), (1.0f - exit_t) * 0.30f * view_a,
-                                  1.0f, 0.0f);
-                        animating = true;
-                    }
-                }
-
-                // Faint upcoming lines below.
-                const float up_pref = std::max(17.0f, act.size * 0.37f);
-                float up_y = focal.y + act_h * 0.5f + ui_px(30.0f);
-                int taken = 0;
-                for (int i = active_idx + 1; i < (int)lx->lines.size() && taken < 2; ++i)
+                const float pitch = active_pref * 1.92f;
+                const float up_floor = std::max(15.0f, active_pref * 0.34f);
+                const int lo = std::max(0, (int)std::floor(g_imm.scroll) - 3);
+                const int hi = std::min((int)lx->lines.size() - 1,
+                                        (int)std::ceil(g_imm.scroll) + 3);
+                for (int i = lo; i <= hi; ++i)
                 {
                     if (blank(lx->lines[i]))
                         continue;
-                    TextLayout up = layout_text(font, lx->lines[i],
-                                                max_text_w * 0.82f, up_pref, up_pref);
-                    const float a = view_a * (taken == 0 ? 0.34f : 0.17f) *
-                                    (motion ? (0.55f + 0.45f * line_t) : 1.0f);
-                    draw_rows(dl, font, up, ImVec2(focal.x, up_y + up.height * 0.5f),
-                              ui_text_dim_u32(), a, 1.0f, 0.0f);
-                    up_y += up.height + ui_px(12.0f);
-                    ++taken;
+                    const float d = (float)i - g_imm.scroll;
+                    // 1 on the focal line, 0 by ~1.8 lines away: size and
+                    // opacity both fall off so the neighbour reads as
+                    // "coming into focus" as the scroll passes it.
+                    const float focus = clampf(1.0f - std::fabs(d) * 0.55f, 0.0f, 1.0f);
+                    const float f2 = focus * focus;
+                    const float size = up_floor + (active_pref - up_floor) * f2;
+                    const float alpha =
+                        (preview ? 0.60f : 1.0f) * (0.08f + 0.92f * f2) * view_a;
+                    const bool is_active = (!preview && i == center_idx);
+                    TextLayout lay = layout_text(font, lx->lines[i], max_text_w, size,
+                                                 std::max(13.0f, size * 0.5f));
+                    draw_rows(dl, font, lay, ImVec2(focal.x, focal.y + d * pitch),
+                              is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
+                              alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
                 }
             }
         }

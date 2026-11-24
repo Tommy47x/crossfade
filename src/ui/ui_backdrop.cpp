@@ -1179,8 +1179,11 @@ static bool generate_hero_blur(const std::string &url)
 
 static bool generate_immersive_blur(const std::string &url)
 {
+    // The high-res texture used to keep the *same* visual softness as the
+    // hero card, which smears a full-screen backdrop into a featureless wash.
+    // Half the radius keeps the art recognisable while still hiding detail.
     return generate_blur(url, kImmersiveBlurSize,
-                         (float)kImmersiveBlurSize / (float)kHeroBlurSize,
+                         (float)kImmersiveBlurSize / (float)kHeroBlurSize * 0.45f,
                          g_immersive_ready, g_immersive_order, kImmersiveBlurCacheMax);
 }
 } // namespace
