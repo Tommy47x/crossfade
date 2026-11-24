@@ -33,7 +33,7 @@ void draw_youtube_panel(AppState &state)
     // Settings instead of firing account-only fetches.
     if (backend_is_guest())
     {
-        if (ui_sign_in_state("Sign in to YouTube Music",
+        if (ui_sign_in_state("Guest mode \xE2\x80\x94 not signed in",
                              "Your account playlists need a signed-in session. "
                              "Search, albums, artists and radio work without one.") == 1)
         {

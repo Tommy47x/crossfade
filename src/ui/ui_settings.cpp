@@ -208,11 +208,13 @@ void save_settings(const Settings &settings)
         << "\"check_for_updates\":" << (settings.check_for_updates ? "true" : "false") << ","
         << "\"low_power\":" << (settings.low_power ? "true" : "false") << ","
         << "\"low_power_on_battery\":" << (settings.low_power_on_battery ? "true" : "false") << ","
+        << "\"low_memory_mode\":" << (settings.low_memory_mode ? "true" : "false") << ","
         << "\"glow_separators\":" << (settings.glow_separators ? "true" : "false") << ","
         << "\"glow_separator_strength\":" << settings.glow_separator_strength << ","
         << "\"backdrop_drift\":" << (settings.backdrop_drift ? "true" : "false") << ","
         << "\"download_cap_gb\":" << settings.download_cap_gb
         << ",\"warm_stream_resolver\":" << (settings.warm_stream_resolver ? "true" : "false")
+        << ",\"aggressive_prefetch\":" << (settings.aggressive_prefetch ? "true" : "false")
         << ",\"playback_speed\":" << settings.playback_speed
         << ",\"eq_enabled\":" << (settings.eq_enabled ? "true" : "false")
         << ",\"eq_layout\":" << std::max(0, std::min(4, settings.eq_layout))
@@ -311,6 +313,8 @@ Settings load_settings()
         // Default is ON; only a written "false" turns it off.
         if (json.find("\"warm_stream_resolver\"") != std::string::npos)
             s.warm_stream_resolver = get_bool("warm_stream_resolver");
+        if (json.find("\"aggressive_prefetch\"") != std::string::npos)
+            s.aggressive_prefetch = get_bool("aggressive_prefetch");
         if (json.find("\"playback_speed\"") != std::string::npos)
             s.playback_speed = get_float("playback_speed");
         if (s.playback_speed < 0.5f)
@@ -498,6 +502,8 @@ Settings load_settings()
             s.low_power = get_bool("low_power");
         if (json.find("\"low_power_on_battery\"") != std::string::npos)
             s.low_power_on_battery = get_bool("low_power_on_battery");
+        if (json.find("\"low_memory_mode\"") != std::string::npos)
+            s.low_memory_mode = get_bool("low_memory_mode");
         if (json.find("\"glow_separators\"") != std::string::npos)
             s.glow_separators = get_bool("glow_separators");
         if (json.find("\"glow_separator_strength\"") != std::string::npos)
@@ -715,6 +721,11 @@ static bool s_xfer_confirm_open = false;
 static bool s_auth_paste_open = false;
 static std::string s_auth_headers;
 static bool s_auth_probe_started = false;
+static bool s_auth_import_fallback = false;
+// The helper's exit code only says it wrote a file. The success toast waits
+// for the restarted backend, whose ready handshake is the authoritative
+// "YouTube accepted this session" answer.
+static bool s_auth_verify_pending = false;
 static std::chrono::steady_clock::time_point s_auth_started{};
 
 static std::string auth_helper_script()
@@ -845,6 +856,10 @@ static void auth_start(AppState &state, std::vector<std::string> args)
     state.auth_login_exit = -1;
     state.auth_login_log.clear();
     state.auth_login_running.store(true);
+    // A fresh run is never a continuation of the browser fallback unless the
+    // caller says so right after spawning (the code-3 branch does).
+    s_auth_import_fallback = false;
+    s_auth_verify_pending = false;
     s_auth_started = std::chrono::steady_clock::now();
     state.repaint_requested = true;
     if (!auth_spawn(full, log))
@@ -902,6 +917,40 @@ static void auth_probe_start(AppState &state)
     });
 }
 
+static std::string auth_probe_string(const std::string &json, size_t from,
+                                     const char *key)
+{
+    const std::string needle = std::string("\"") + key + "\":\"";
+    const size_t at = json.find(needle, from);
+    if (at == std::string::npos)
+        return {};
+    std::string out;
+    for (size_t i = at + needle.size(); i < json.size(); ++i)
+    {
+        const char c = json[i];
+        if (c == '\\' && i + 1 < json.size())
+        {
+            out += json[++i];
+            continue;
+        }
+        if (c == '"')
+            break;
+        out += c;
+    }
+    return out;
+}
+
+static bool auth_probe_available(const std::string &json, const char *id)
+{
+    const std::string needle = std::string("\"id\":\"") + id + "\"";
+    const size_t at = json.find(needle);
+    if (at == std::string::npos)
+        return false;
+    const size_t available = json.find("\"available\":", at);
+    return available != std::string::npos && available + 16 <= json.size() &&
+           json.compare(available + 12, 4, "true") == 0;
+}
+
 static std::string auth_probe_engine(const std::string &json, const char *id,
                                      const char *name)
 {
@@ -909,23 +958,44 @@ static std::string auth_probe_engine(const std::string &json, const char *id,
     const size_t at = json.find(needle);
     if (at == std::string::npos)
         return std::string(name) + ": not reported";
-    const size_t available = json.find("\"available\":", at);
-    const bool on = available != std::string::npos && available + 16 <= json.size() &&
-                    json.compare(available + 12, 4, "true") == 0;
-    if (!on)
-        return std::string(name) + ": unavailable";
-    const size_t label = json.find("\"label\":\"", at);
-    if (label == std::string::npos)
-        return std::string(name) + ": available";
-    const size_t start = label + 9;
-    const size_t end = json.find('"', start);
-    if (end == std::string::npos)
-        return std::string(name) + ": available";
-    return std::string(name) + ": " + json.substr(start, end - start);
+    if (!auth_probe_available(json, id))
+    {
+        // The helper names the missing piece (WebKitGTK not installed, no
+        // PyGObject, ...) so the panel explains why there is no window.
+        const std::string reason = auth_probe_string(json, at, "reason");
+        return std::string(name) + ": not available" +
+               (reason.empty() ? std::string() : " — " + reason);
+    }
+    const std::string label = auth_probe_string(json, at, "label");
+    return std::string(name) + ": " + (label.empty() ? "available" : label);
 }
 
 void ui_auth_poll(AppState &state)
 {
+    // A successful helper run replaced the auth file and asked the main loop
+    // to restart the backend. Only the restarted backend knows whether YouTube
+    // accepted the session, so the toast waits one frame for that handshake:
+    // an import that produced a signed-out file must never say "Signed in".
+    if (s_auth_verify_pending && !state.auth_login_running.load() &&
+        !state.auth_refresh_requested)
+    {
+        s_auth_verify_pending = false;
+        if (backend_is_guest())
+        {
+            s_auth_paste_open = true;
+            ui_notify(UiNotifyType::Warning, "Still in guest mode",
+                      "YouTube Music did not accept that session. Sign in at "
+                      "music.youtube.com in your browser, then import it again.",
+                      9.0f);
+        }
+        else
+        {
+            ui_notify(UiNotifyType::Success, "Signed in",
+                      "The YouTube Music session was updated.", 4.0f);
+        }
+        state.repaint_requested = true;
+    }
+
     if (!state.auth_login_running.load())
         return;
 
@@ -944,6 +1014,7 @@ void ui_auth_poll(AppState &state)
         {
             state.auth_login_running.store(false);
             state.repaint_requested = true;
+            s_auth_import_fallback = false;
             s_auth_paste_open = true;
             ui_notify(UiNotifyType::Error, "Sign-in timed out",
                       "The helper did not report a result. Use the paste panel.", 8.0f);
@@ -963,32 +1034,58 @@ void ui_auth_poll(AppState &state)
 
     if (code == 0)
     {
+        s_auth_import_fallback = false;
         state.auth_refresh_requested = true;
         s_auth_headers.clear();
         s_auth_paste_open = false;
-        ui_notify(UiNotifyType::Success, "Signed in",
-                  "The YouTube Music session was updated.", 4.0f);
+        // The toast is raised by the pending check above once the restarted
+        // backend reports whether the session is real.
+        s_auth_verify_pending = true;
     }
     else if (code == 4)
     {
+        s_auth_import_fallback = false;
         ui_notify(UiNotifyType::Info, "Sign-in canceled",
                   "No session was changed.", 4.0f);
     }
     else if (code == 3)
     {
-        s_auth_paste_open = true;
-        ui_notify(UiNotifyType::Warning, "No sign-in window available",
-                  "Use the paste panel below: open YouTube Music in any browser "
-                  "and copy its request headers.", 9.0f);
+        // No embedded webview on this system (Fedora, Debian and Arch do not
+        // ship WebKitGTK by default, and Qt WebEngine needs Python bindings).
+        // Try a signed-in browser session first: when one verifies, sign in
+        // without opening anything. The browser is only opened when there is
+        // nothing to import.
+        s_auth_paste_open = false;
+        auth_start(state, {"--import-cookies", "auto"});
+        s_auth_import_fallback = true;
+    }
+    else if (code == 5 && s_auth_import_fallback)
+    {
+        // No browser session to import. Open YouTube Music so the user can
+        // sign in there; the toast points at the button that finishes the job.
+        s_auth_import_fallback = false;
+        s_auth_paste_open = false;
+        if (!ui_open_external_url("https://music.youtube.com/"))
+            ui_notify(UiNotifyType::Warning, "Could not open a browser",
+                      "Open music.youtube.com manually, then press \"Import session "
+                      "from this browser\" in Settings.", 9.0f);
+        else
+            ui_notify(UiNotifyType::Info, "Sign in in your browser",
+                      "No signed-in browser session was found, so YouTube Music was "
+                      "opened. Log in there, then press \"Import session from this "
+                      "browser\" (set the right browser under Cookie browser first).",
+                      9.0f);
     }
     else if (code == 6)
     {
+        s_auth_import_fallback = false;
         s_auth_paste_open = true;
         ui_notify(UiNotifyType::Warning, "Google blocked the sign-in window",
                   "Use the paste panel below with your normal browser.", 9.0f);
     }
     else
     {
+        s_auth_import_fallback = false;
         s_auth_paste_open = true;
         ui_notify(UiNotifyType::Error, "Sign-in failed",
                   "See the details in Settings -> YouTube Music.", 8.0f);
@@ -2621,8 +2718,9 @@ void draw_settings_panel(AppState &state)
     }
     settings_gap();
     settings_row_label("Sign-in method", "Browser cookies",
-                       "crossfade opens its own sign-in window (WebKitGTK, Qt WebEngine or "
-                       "Windows WebView2). If none is available, paste request headers below.");
+                       "crossfade opens its own sign-in window when WebKitGTK, Qt WebEngine "
+                       "or Windows WebView2 is present. Otherwise it imports your browser "
+                       "session, and only opens YouTube Music if there is none to import.");
     if (state.settings.auth_mode == "oauth")
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1.0f));
@@ -2643,10 +2741,25 @@ void draw_settings_panel(AppState &state)
     }
 
     settings_gap();
+    {
+        // State the mode the backend is actually in, not what the last helper
+        // run claimed. A rejected import leaves the app in guest mode, and the
+        // card has to say so.
+        const bool guest = backend_is_guest();
+        ImGui::PushStyleColor(ImGuiCol_Text, guest ? ImVec4(0.95f, 0.72f, 0.35f, 1.0f)
+                                                   : ui_c().accent_text);
+        ImGui::TextUnformatted(guest ? "Guest mode — not signed in"
+                                     : "Signed in to YouTube Music");
+        ImGui::PopStyleColor();
+    }
     settings_help(backend_is_guest()
-        ? "Browsing as guest: search, albums, artists, radio and podcasts work. "
-          "Sign in to unlock personalized recommendations and your library."
-        : "Signed in to YouTube Music.");
+        ? (state.auth_login_exit == 5
+               ? "The last session was rejected or has expired. Search, albums, "
+                 "artists, radio and podcasts still work; sign in to unlock your "
+                 "library."
+               : "Search, albums, artists, radio and podcasts work. Sign in to "
+                 "unlock personalized recommendations and your library.")
+        : "Personalized recommendations and your YouTube Music library are active.");
 
     if (ui_primary_button("Sign in", ImVec2(170.0f * m.layout_scale, m.button_h)))
         auth_start(state, {"--signin", "auto"});
@@ -2668,11 +2781,29 @@ void draw_settings_panel(AppState &state)
     settings_help("Import is a one-click snapshot and is verified before replacing the "
                   "current session; if it has expired, nothing changes.");
 
+    // Most Linux desktops do not ship a webview engine, so "Sign in" falls
+    // back to the user's browser plus this import. Say so up front instead of
+    // letting the button look broken.
+    {
+        const std::string probe = auth_probe_snapshot(state);
+        if (!state.auth_probe_running.load() && !probe.empty() &&
+            probe.rfind("Sign-in detection failed", 0) != 0 &&
+            !auth_probe_available(probe, "webkit") &&
+            !auth_probe_available(probe, "qt") &&
+            !auth_probe_available(probe, "webview2"))
+            settings_help("No embedded sign-in window is available on this system. "
+                          "\"Sign in\" imports an existing browser session and only "
+                          "opens YouTube Music when there is none, so no extra packages "
+                          "are needed.");
+    }
+
     if (state.auth_login_running.load())
     {
         ImGui::Dummy(ImVec2(0.0f, m.space_1));
-        ImGui::TextColored(ui_c().accent_text,
-                           "Signing in... close the sign-in window to cancel.");
+        ImGui::TextColored(ui_c().accent_text, "%s",
+                           s_auth_import_fallback
+                               ? "Signing in... checking your browser session."
+                               : "Signing in... close the sign-in window to cancel.");
     }
     if (!state.auth_login_log.empty())
     {
@@ -2749,9 +2880,14 @@ void draw_settings_panel(AppState &state)
             ImGui::TextUnformatted(probe.c_str());
         else
         {
-            ImGui::TextUnformatted(auth_probe_engine(probe, "webkit", "WebKitGTK").c_str());
-            ImGui::TextUnformatted(auth_probe_engine(probe, "qt", "Qt WebEngine").c_str());
-            ImGui::TextUnformatted(auth_probe_engine(probe, "webview2", "WebView2").c_str());
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_w);
+            ImGui::TextWrapped("%s",
+                               auth_probe_engine(probe, "webkit", "WebKitGTK").c_str());
+            ImGui::TextWrapped("%s",
+                               auth_probe_engine(probe, "qt", "Qt WebEngine").c_str());
+            ImGui::TextWrapped("%s",
+                               auth_probe_engine(probe, "webview2", "WebView2").c_str());
+            ImGui::PopTextWrapPos();
             const size_t b = probe.find("\"browsers\":[");
             if (b != std::string::npos)
             {
@@ -2780,6 +2916,15 @@ void draw_settings_panel(AppState &state)
         set_warm_stream_resolver(state.settings.warm_stream_resolver);
         save = true;
     }
+
+    settings_gap();
+    if (settings_toggle_row("##aggressive_prefetch", "Prefetch the world",
+                            &state.settings.aggressive_prefetch,
+                            "Warm stream URLs for the whole visible list in the background, "
+                            "not just the row under the pointer, so clicks and the search "
+                            "top result start instantly. Costs bandwidth and can trip "
+                            "YouTube rate limits."))
+        save = true;
 
     // Read-only snapshot: taking the error here would steal it from the
     // fetch workers and silently suppress their toasts. Workers clear the
@@ -3032,6 +3177,11 @@ void draw_settings_panel(AppState &state)
         if (settings_toggle_row("##low_power_battery", "Enable on battery",
                                 &state.settings.low_power_on_battery,
                                 "Turn low power mode on automatically when the system reports it is running on battery."))
+            save = true;
+
+        if (settings_toggle_row("##low_memory_mode", "Low memory mode",
+                                &state.settings.low_memory_mode,
+                                "Run one concurrent backend process instead of four. Saves a few hundred MB; background warmups and lyrics share the main channel. Takes effect after a restart."))
             save = true;
 
         const char *state_label = power::low_power()

@@ -406,7 +406,13 @@ void draw_sidebar(AppState &state)
     ImGui::SetCursorScreenPos(ImVec2(logo_pos.x, logo_pos.y + logo_h + m.space_2));
     ImGui::Dummy(ImVec2(0, 0));
 
-    const float bottom_reserve = m.control_h * 2.0f + m.space_5 + m.space_2;
+    // The expanded sidebar shows a guest chip above the theme/settings row;
+    // reserve its height so the nav list cannot slide underneath it.
+    const float guest_row = (!rail && backend_is_guest())
+                                ? m.control_h + m.space_2
+                                : 0.0f;
+    const float bottom_reserve =
+        m.control_h * 2.0f + m.space_5 + m.space_2 + guest_row;
     const float body_h = std::max(0.0f, ImGui::GetContentRegionAvail().y - bottom_reserve);
     ImGui::BeginChild("##sidebar_scroll", ImVec2(0, body_h), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground);
@@ -458,9 +464,38 @@ void draw_sidebar(AppState &state)
                                          bottom_y - m.control_h));
         if (ui_icon_button("##settings", UiIcon::Settings, m.control_h, state.current_tab == Tab::Settings, 0, "Settings"))
             activate_tab(state, Tab::Settings);
+        // Rail mode has no room for the chip: a dot on the settings icon keeps
+        // guest mode visible (the tooltip names it) without stealing clicks.
+        if (backend_is_guest())
+        {
+            const ImVec2 mn = ImGui::GetItemRectMin();
+            const ImVec2 mx = ImGui::GetItemRectMax();
+            const float r = std::max(3.0f, 4.0f * m.layout_scale);
+            dl->AddCircleFilled(ImVec2(mx.x - r - 2.0f, mn.y + r + 2.0f), r,
+                                ui_accent_u32(1.0f), 12);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Guest mode — not signed in");
+        }
     }
     else
     {
+        const float side_w = ImGui::GetWindowSize().x - m.space_3 * 2.0f;
+        if (backend_is_guest())
+        {
+            ImGui::SetCursorScreenPos(
+                ImVec2(ImGui::GetWindowPos().x + m.space_3,
+                       bottom_y - m.control_h * 3.0f - m.space_2 * 2.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1.0f));
+            const bool open = ui_ghost_button("Guest mode \xC2\xB7 Sign in",
+                                              ImVec2(side_w, m.control_h));
+            ImGui::PopStyleColor();
+            if (open)
+            {
+                state.settings_focus_auth = true;
+                state.current_tab = Tab::Settings;
+                state.repaint_requested = true;
+            }
+        }
         // Theme toggle centered above the settings button.
         ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x + (ImGui::GetWindowSize().x - m.control_h) * 0.5f,
                                          bottom_y - m.control_h * 2.0f - m.space_2));

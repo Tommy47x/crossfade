@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -231,19 +232,59 @@ def _write_private_json(path, value):
         raise
 
 
+def _first_error_line(error):
+    text = str(error).strip()
+    return text.splitlines()[0][:300] if text else "unknown error"
+
+
+def server_login_state(yt):
+    """Whether YouTube really sees this session as signed in.
+
+    Returns True/False when the server answers and None when the check could
+    not run. A YTMusic object built from dead or mixed cookies silently sends
+    anonymous requests, and get_library_playlists() then returns [] instead of
+    raising -- which made every broken import report success.
+    """
+    try:
+        response = yt._send_request("account/account_menu", {})
+        tracking = response.get("responseContext", {}).get("serviceTrackingParams", [])
+    except Exception:
+        return None
+    for service in tracking:
+        if service.get("service") != "GFEEDBACK":
+            continue
+        for param in service.get("params", []):
+            if param.get("key") == "logged_in":
+                return str(param.get("value")) == "1"
+    return None
+
+
 def verify_auth_file(path):
-    """Check a candidate auth file against the real library. Returns (ok, msg)."""
+    """Check a candidate auth file against the real account. Returns (ok, msg)."""
     try:
         from ytmusicapi import YTMusic
     except Exception as e:
         return False, f"ytmusicapi is not available ({e})"
     try:
         yt = YTMusic(path)
-        yt.get_library_playlists(limit=1)
-        return True, "Signed in to YouTube Music."
     except Exception as e:
-        msg = str(e).strip().splitlines()[0][:300] if str(e) else "unknown error"
-        return False, f"YouTube Music rejected the session: {msg}"
+        return False, f"Could not load the session: {_first_error_line(e)}"
+
+    state = server_login_state(yt)
+    if state is False:
+        return False, ("YouTube Music reports this session as signed out. Sign in "
+                       "at music.youtube.com in the browser, then import again.")
+    if state is True:
+        return True, "Signed in to YouTube Music."
+    # The account check could not run (network or an API change). An empty
+    # library reply is not proof of a session, so this path only succeeds when
+    # the library call itself works, and it says so.
+    try:
+        yt.get_library_playlists(limit=1)
+    except Exception as e:
+        return False, ("Could not verify the session (network or API error): "
+                       + _first_error_line(e))
+    return True, "Signed in to YouTube Music (verified against the library)."
 
 
 def _commit(tmp, dest):
@@ -348,43 +389,96 @@ def _firefox_cookie_dbs(root):
     return [db for db in dbs if os.path.exists(db)]
 
 
-def cookies_from_firefox(profile_root=None):
-    """Read a Firefox-family profile's plaintext cookie DB. Returns a dict."""
+def _youtube_cookie_host(host):
+    return (host or "").lower().lstrip(".").endswith("youtube.com")
+
+
+def prefer_youtube_cookies(rows):
+    """Merge (host, name, value) rows into one map, youtube.com winning.
+
+    Google sets different HSID/SSID/SIDCC/__Secure-*PSIDTS values per cookie
+    domain. A request to music.youtube.com only accepts that host's copies, so
+    mixing .google.com values in -- in any order -- makes the API treat the
+    whole session as anonymous. Youtube values therefore always win; google
+    values are only kept for names youtube does not have.
+    """
+    google, youtube = {}, {}
+    for host, name, value in rows:
+        if name not in AUTH_COOKIE_NAMES or not value:
+            continue
+        if _youtube_cookie_host(host):
+            youtube[name] = value
+        else:
+            google[name] = value
+    google.update(youtube)
+    return google
+
+
+def _read_firefox_cookies(db):
+    """Read one cookie DB, including the live WAL sidecar.
+
+    Firefox keeps fresh cookies in cookies.sqlite-wal while it runs, so
+    copying only the main file can miss the session the user just created.
+    """
     import sqlite3
-    roots = [profile_root] if profile_root else _firefox_roots()
-    dbs = []
-    for root in roots:
-        dbs += _firefox_cookie_dbs(root)
-    if not dbs:
-        raise RuntimeError("No Firefox profile with cookies.sqlite was found")
-    last_error = None
-    for db in dbs:
-        fd, tmp = tempfile.mkstemp(prefix="crossfade-cookies-", suffix=".sqlite")
-        os.close(fd)
-        try:
-            import shutil
-            shutil.copy2(db, tmp)
-            con = sqlite3.connect(tmp)
+    fd, tmp = tempfile.mkstemp(prefix="crossfade-cookies-", suffix=".sqlite")
+    os.close(fd)
+    copies = [tmp]
+    try:
+        shutil.copy2(db, tmp)
+        for suffix in ("-wal", "-shm"):
+            src = db + suffix
+            if not os.path.exists(src):
+                continue
             try:
-                rows = con.execute(
-                    "select name,value from moz_cookies "
-                    "where host like '%youtube.com' or host like '%google.com'"
-                ).fetchall()
-            finally:
-                con.close()
-            cookies = {name: value for name, value in rows
-                       if name in AUTH_COOKIE_NAMES and value}
-            if cookies:
-                return cookies
-            last_error = "that Firefox profile has no signed-in YouTube session"
-        except Exception as e:
-            last_error = str(e)
-        finally:
-            try:
-                os.unlink(tmp)
+                shutil.copy2(src, tmp + suffix)
+                copies.append(tmp + suffix)
             except OSError:
                 pass
-    raise RuntimeError(last_error or "No signed-in Firefox session was found")
+        con = sqlite3.connect(tmp)
+        try:
+            rows = con.execute(
+                "select host,name,value from moz_cookies "
+                "where host like '%youtube.com' or host like '%google.com'"
+            ).fetchall()
+        finally:
+            con.close()
+        return prefer_youtube_cookies(rows)
+    finally:
+        for path in copies:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def firefox_sessions(profile_root=None):
+    """[(profile_dir, cookies)] for every Firefox profile with a session.
+
+    Several profiles are common (a dedicated one for crossfade, the daily one,
+    ...) and only one may still be valid. Verification happens per profile in
+    the caller, so returning all of them is what lets an expired first profile
+    fall through to a working one.
+    """
+    roots = [profile_root] if profile_root else _firefox_roots()
+    sessions = []
+    for root in roots:
+        for db in _firefox_cookie_dbs(root):
+            try:
+                cookies = _read_firefox_cookies(db)
+            except Exception:
+                continue
+            if cookies:
+                sessions.append((os.path.dirname(db), cookies))
+    return sessions
+
+
+def cookies_from_firefox(profile_root=None):
+    """Read a Firefox-family profile's plaintext cookie DB. Returns a dict."""
+    sessions = firefox_sessions(profile_root)
+    if not sessions:
+        raise RuntimeError("No signed-in Firefox session was found")
+    return sessions[0][1]
 
 
 class _QuietYtdlpLogger:
@@ -422,13 +516,13 @@ def cookies_from_ytdlp_browser(browser, profile=None):
                 "Quit the browser completely, including background processes, "
                 "and retry — or use Paste request headers in Settings.") from e
         raise
-    cookies = {}
+    rows = []
     for cookie in jar:
         domain = (getattr(cookie, "domain", "") or "").lower()
         if "google.com" not in domain and "youtube.com" not in domain:
             continue
-        if cookie.name in AUTH_COOKIE_NAMES and cookie.value:
-            cookies[cookie.name] = cookie.value
+        rows.append((domain, cookie.name, cookie.value))
+    cookies = prefer_youtube_cookies(rows)
     if not cookies:
         raise RuntimeError(f"{browser} has no signed-in YouTube session")
     return cookies

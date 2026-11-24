@@ -99,11 +99,14 @@ struct BackendLogEntry
 {
     uint64_t seq = 0;      // monotonic, per command
     int64_t ts_ms = 0;     // steady-clock milliseconds at completion
-    std::string channel;   // "main" / "play" / "prefetch"
+    std::string channel;   // "main" / "play" / "prefetch" / "meta"
     std::string command;   // the command line (clipped)
-    uint64_t ms = 0;       // round-trip duration
+    uint64_t ms = 0;       // round-trip duration (queue + processing)
+    uint64_t queue_ms = 0; // time spent waiting for the channel
+    size_t pending = 0;    // commands already waiting when this one queued
     bool error = false;    // response carried an error / backend died
     size_t bytes = 0;      // response payload size
+    std::string detail;    // "error" message, "timed out", … (clipped)
 };
 
 struct BackendChannelStats
@@ -115,6 +118,8 @@ struct BackendChannelStats
     uint64_t commands = 0;
     uint64_t errors = 0;
     uint64_t last_ms = 0;
+    uint64_t max_ms = 0;
+    size_t pending = 0;
 };
 
 struct BackendDebugSnapshot
@@ -487,11 +492,11 @@ std::string fetch_stream_url(const std::string &video_id);
 // backend channel, so it competes with neither a user click's resolve nor a
 // search/metadata request on the main channel.
 std::string fetch_stream_url_prefetch(const std::string &video_id);
-// Resolve several ids in one round trip on the prefetch channel. The backend
-// resolves them in parallel (four workers), so a whole page of rows warms in
-// seconds instead of one resolve per command. Failed ids are omitted.
+// Resolve several ids in one round trip. `background` routes the batch to the
+// meta worker (lyrics/background prefetch) so the hover/hero workspaces keep
+// the fast channel to themselves. Failed ids are omitted.
 std::unordered_map<std::string, std::string> fetch_stream_urls_prefetch(
-    const std::vector<std::string> &video_ids);
+    const std::vector<std::string> &video_ids, bool background = false);
 // Same, but bypass and replace the backend's cached URL (used after a
 // player-side load failure, which often means the googlevideo URL expired).
 std::string fetch_stream_url_fresh(const std::string &video_id);

@@ -8,10 +8,17 @@ APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")/..}"
 export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 VENV="${HOME}/.local/share/crossfade/venv"
 REQ="$APPDIR/usr/share/crossfade/requirements.txt"
+RUNTIME="${HOME}/.local/share/crossfade/runtime"
 
 if [ ! -x "$VENV/bin/python" ] && command -v python3 >/dev/null 2>&1; then
     mkdir -p "$(dirname "$VENV")"
     "$APPDIR/usr/share/crossfade/scripts/bootstrap-venv.sh" "$VENV" "$REQ" \
+        >/dev/null 2>&1 || true
+fi
+# The AppImage is read-only, so the JavaScript runtime yt-dlp needs for
+# YouTube lives next to the venv. Provision it once on first run.
+if [ ! -x "$RUNTIME/deno" ] && command -v python3 >/dev/null 2>&1; then
+    "$APPDIR/usr/share/crossfade/scripts/fetch-js-runtime.sh" "$RUNTIME" \
         >/dev/null 2>&1 || true
 fi
 if [ -x "$VENV/bin/python" ]; then

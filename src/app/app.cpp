@@ -651,7 +651,8 @@ int app_run(int argc, char **argv)
         });
     };
     if (!defer_backend)
-        start_backend_async(start_hidden && warm_keep == 1);
+        start_backend_async((start_hidden && warm_keep == 1) ||
+                            g_state.settings.low_memory_mode);
 
     // SQLite + saved-data loading runs in parallel with SDL/GL window setup.
     // It costs ~160 ms and does not touch UI or graphics state.
@@ -943,6 +944,9 @@ int app_run(int argc, char **argv)
 #ifndef P100_WINDOWS
     std::signal(SIGTERM, handle_quit_signal);
     std::signal(SIGINT, handle_quit_signal);
+    // A backend worker that dies leaves its stdin pipe with no reader; a
+    // later command write would deliver SIGPIPE and take the whole app down.
+    std::signal(SIGPIPE, SIG_IGN);
     // No SA_RESTART: the signal must interrupt SDL_WaitEventTimeout() so the
     // recolour lands on the next iteration instead of after the idle tick.
     {
@@ -1023,7 +1027,8 @@ int app_run(int argc, char **argv)
         if (want_start)
         {
             set_backend_deferred(false);
-            start_backend_async(warm_keep == 1);
+            start_backend_async((warm_keep == 1) ||
+                                g_state.settings.low_memory_mode);
             backend_boot_reported = false;
             {
                 std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
@@ -2135,13 +2140,34 @@ int app_run(int argc, char **argv)
                     g_state.hovered_track_id.clear(); // pointer left the list
                 static std::string s_hover_warmed;
                 const std::string &hovered = g_state.hovered_track_id;
-                if (!hovered.empty() && hovered != s_hover_warmed &&
-                    ImGui::GetTime() - g_state.hovered_track_since >= 0.15)
+                if (hovered.empty())
+                    s_hover_warmed.clear(); // re-hovering may retry a failed warm
+                else if (hovered != s_hover_warmed &&
+                         ImGui::GetTime() - g_state.hovered_track_since >= 0.15)
                 {
-                    s_hover_warmed = hovered;
+                    // prefetch_hovered_track() queues the id when another
+                    // resolve is running, so nothing is lost here.
                     prefetch_hovered_track(hovered);
+                    s_hover_warmed = hovered;
                 }
             }
+
+            // Search hero: warm the intent match as soon as it is published,
+            // without waiting for a hover. Deduplicated by id.
+            {
+                auto top = std::atomic_load(&g_state.search_top);
+                static std::string s_top_prefetched;
+                if (top && top->kind == TopKind::Song && !top->id.empty() &&
+                    top->id != s_top_prefetched)
+                {
+                    s_top_prefetched = top->id;
+                    prefetch_hovered_track(top->id);
+                }
+            }
+
+            // "Prefetch the world": warm the whole visible list, not just the
+            // hovered row, on the background meta channel.
+            prefetch_visible_list_if_aggressive();
             if (g_state.auth_refresh_requested)
             {
                 g_state.auth_refresh_requested = false;
@@ -2262,15 +2288,22 @@ int app_run(int argc, char **argv)
                     g_state.lyrics_dirty = false;
                     want = true;
                 }
+                // One fetch per track: track starts, panel opens and crossfade
+                // midpoints can all queue the same id in the same second; the
+                // slow provider cascade must not be paid four times.
+                static std::string s_lyrics_inflight;
+                const bool same_inflight =
+                    g_state.lyrics_loading && s_lyrics_inflight == g_state.lyrics_requested_id;
                 if (want && !g_state.lyrics_requested_id.empty())
                 {
                     auto snap = std::atomic_load(&g_state.lyrics);
                     bool have = snap && snap->track_id == g_state.lyrics_requested_id && snap->lyrics.ok;
-                    if (!have)
+                    if (!have && !same_inflight)
                     {
                         g_state.lyrics_seq++;
                         g_state.lyrics_loading = true;
                         const std::string lyrics_id = g_state.lyrics_requested_id;
+                        s_lyrics_inflight = lyrics_id;
                         const int lyrics_seq = (int)g_state.lyrics_seq;
                         tasks::spawn("lyrics", [lyrics_id, lyrics_seq]() {
                             load_lyrics_worker(lyrics_id, lyrics_seq);

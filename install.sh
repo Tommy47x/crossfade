@@ -51,6 +51,20 @@ if [ -d "$ROOT/wheels" ]; then
     echo "Installing Python dependencies from $WHEELS"
 fi
 "$ROOT/scripts/bootstrap-venv.sh" "$VENV" "$ROOT/requirements.txt" "$WHEELS"
+
+# yt-dlp needs a JavaScript runtime (Deno) to solve YouTube's challenges;
+# without it most songs resolve to "Requested format is not available". The
+# script is pinned + checksummed, skips when the binary is already there, and
+# supports a pre-placed zip for offline installs.
+if [ "${P100_SKIP_JS_RUNTIME:-0}" != "1" ]; then
+    if ! "$ROOT/scripts/fetch-js-runtime.sh" "$PREFIX/share/crossfade/runtime"; then
+        cat >&2 <<'EOF'
+warning: the Deno runtime could not be installed, so playback may fail with
+         "Requested format is not available". Re-run ./install.sh when online,
+         or place the deno binary in $PREFIX/share/crossfade/runtime/deno.
+EOF
+    fi
+fi
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
 fi

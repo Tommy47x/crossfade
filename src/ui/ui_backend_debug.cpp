@@ -5,10 +5,11 @@
 #include <cstdio>
 
 // ----------------------------------------------------------------------
-// Backend debug window: shows the three backend channels (main / play /
-// prefetch) with their counters, plus a live, scrollable log of every command
-// sent to the backend (search, lyrics, meta, prefetch, …), its duration, the
-// response size and whether it errored. Semi-transparent and freely movable.
+// Backend debug window: shows the backend channels (main / play / prefetch /
+// meta) with their counters, plus a live, scrollable log of every command
+// sent to the backend (search, lyrics, meta, prefetch, …), how long it waited
+// for the channel, its duration, the response size, whether it errored and the
+// error text. Semi-transparent and freely movable.
 // ----------------------------------------------------------------------
 
 namespace
@@ -54,10 +55,13 @@ void draw_backend_debug(AppState &state)
                                         : (c.ready ? ui_c().accent : ui_c().text_muted);
         ImGui::TextColored(state_col, "%-9s", c.name.c_str());
         ImGui::SameLine();
-        ImGui::TextColored(ui_c().text_dim, "%s  pid=%zu  %llu cmds  %llu err  last %llums",
+        ImGui::TextColored(ui_c().text_dim,
+                           "%s  pid=%zu  %llu cmds  %llu err  pending %zu  "
+                           "last %llums  max %llums",
                            state_str, (size_t)c.pid,
                            (unsigned long long)c.commands, (unsigned long long)c.errors,
-                           (unsigned long long)c.last_ms);
+                           c.pending, (unsigned long long)c.last_ms,
+                           (unsigned long long)c.max_ms);
     }
 
     ImGui::Spacing();
@@ -90,9 +94,16 @@ void draw_backend_debug(AppState &state)
         std::string line = fmt_rel_time(e.ts_ms) + "  ";
         line += "#" + std::to_string(e.seq) + "  ";
         line += "[" + e.channel + "]  ";
-        line += std::to_string(e.ms) + "ms  ";
+        line += std::to_string(e.ms) + "ms";
+        if (e.queue_ms > 0 || e.pending > 0)
+            line += " (queued " + std::to_string(e.queue_ms) + "ms" +
+                    (e.pending ? ", " + std::to_string(e.pending) + " ahead" : "") +
+                    ")";
+        line += "  ";
         line += std::to_string(e.bytes) + "B  ";
         line += e.command;
+        if (!e.detail.empty())
+            line += "  -> " + e.detail;
         ImGui::TextColored(col, "%s", line.c_str());
     }
     ImGui::EndChild();

@@ -406,7 +406,7 @@ void draw_sidebar(AppState &state);
 // channel); pass `cancel_search_id` to abort remaining entries when search_id
 // moves on.
 void prefetch_urls_for(const std::vector<Track> &tracks, size_t count,
-                       int cancel_search_id = 0);
+                       int cancel_search_id = 0, size_t batch = 0);
 // Serial variant: one backend request at a time, cancelled when `cancel_token`
 // no longer equals `token`. Used by Radio so speculative warming never puts a
 // long queue in front of the user's next station request.

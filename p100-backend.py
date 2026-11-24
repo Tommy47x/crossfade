@@ -95,7 +95,13 @@ def main():
     print(json.dumps({"status": "ready", "guest": guest},
                      separators=(",", ":")))
     sys.stdout.flush()
-    run_command_loop(yt, guest=guest)
+
+    # Each concurrent command worker needs its own YTMusic (ytmusicapi's
+    # requests session is not thread-safe). Guest workers browse anonymously.
+    def _session_factory():
+        return YTMusic() if guest else YTMusic(AUTH_FILE)
+
+    run_command_loop(yt, guest=guest, session_factory=_session_factory)
 
 
 if __name__ == "__main__":

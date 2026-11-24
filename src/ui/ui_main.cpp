@@ -738,9 +738,9 @@ static void draw_guest_home_landing(AppState &state)
     const ImVec2 start = ImGui::GetCursorScreenPos();
     const float field_w = std::min(std::max(avail.x, 1.0f), 620.0f * m.layout_scale);
     const float field_h = std::max(m.control_h, 46.0f * m.layout_scale);
-    const char *hint = "Search works without an account.";
+    const char *hint = "You're browsing as a guest.";
     const ImVec2 hint_ts = ImGui::CalcTextSize(hint);
-    const char *hint2 = "Log in to see YouTube's feed.";
+    const char *hint2 = "Search works; sign in to see YouTube's feed.";
     const ImVec2 hint2_ts = ImGui::CalcTextSize(hint2);
     const char *sign_in = "Sign in";
     const ImVec2 sign_ts = ImGui::CalcTextSize(sign_in);
