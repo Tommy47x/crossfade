@@ -108,6 +108,8 @@ void rebuild_stats(AppState &state);
 void draw_stats_panel(AppState &state);
 void draw_queue_panel(AppState &state);
 void draw_party_panel(AppState &state);
+// Room correction: measurement flow, curve review and applying the filters.
+void draw_room_eq_panel(AppState &state);
 void draw_podcasts_panel(AppState &state);
 void close_podcast_show(AppState &state);
 void load_podcast_library(AppState &state);

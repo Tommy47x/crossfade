@@ -72,6 +72,10 @@ set(SOURCES
     src/playback/mpvplayer.cpp
     src/playback/video_surface.cpp
     src/playback/local_audio.cpp
+    src/dsp/fft.cpp
+    src/dsp/room_eq.cpp
+    src/eq/eq_server.cpp
+    src/eq/calibration.cpp
     src/ui/ui_helpers.cpp
     src/ui/format.cpp
     src/ui/playlists_io.cpp
@@ -95,6 +99,7 @@ set(SOURCES
     src/ui/ui_settings.cpp
     src/ui/ui_stats.cpp
     src/ui/ui_party.cpp
+    src/ui/ui_room_eq.cpp
     src/ui/ui_podcasts.cpp
     src/ui/ui_studio.cpp
     src/ui/ui_backend_debug.cpp
@@ -161,6 +166,8 @@ target_include_directories(crossfade PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
     ${CMAKE_CURRENT_SOURCE_DIR}/src/party
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/eq
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data
     ${CMAKE_CURRENT_SOURCE_DIR}/src/net
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
@@ -206,6 +213,19 @@ else()
     )
 endif()
 
+# ---- Optional TLS for room correction ----
+# Browsers only expose the microphone on a secure origin, so the measurement
+# page is served over HTTPS with a throwaway self-signed certificate when
+# OpenSSL is available. Without it the page still loads over HTTP and the
+# feature remains usable through the PC microphone or an imported recording.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_compile_definitions(crossfade PRIVATE
+        P100_HAVE_OPENSSL
+        CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(crossfade OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 # ---- Install ----
 include(GNUInstallDirs)
 
@@ -240,6 +260,8 @@ if(CROSSFADE_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core
             ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
             ${CMAKE_CURRENT_SOURCE_DIR}/src/party
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/eq
             ${CMAKE_CURRENT_SOURCE_DIR}/src/data
             ${CMAKE_CURRENT_SOURCE_DIR}/src/net
             ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
@@ -324,6 +346,10 @@ if(CROSSFADE_BUILD_TESTS)
         src/net/version_compare.cpp)
     p100_test(test_version_compare)
     add_test(NAME version_compare COMMAND test_version_compare)
+    add_executable(test_room_eq tests/test_room_eq.cpp
+        src/dsp/fft.cpp src/dsp/room_eq.cpp)
+    p100_test(test_room_eq)
+    add_test(NAME room_eq COMMAND test_room_eq)
 
     add_executable(test_sha256 tests/test_sha256.cpp src/net/sha256.cpp)
     p100_test(test_sha256)
@@ -389,7 +415,8 @@ if(CROSSFADE_BUILD_TESTS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         foreach(tgt test_party_link test_party_queue test_party_util test_library
                     test_crossfade test_cache test_json test_session test_playlists
-                    test_settings test_studio_project test_version_compare test_sha256)
+                    test_settings test_studio_project test_version_compare test_sha256
+                    test_room_eq)
             target_compile_options(${tgt} PRIVATE ${CROSSFADE_WARNINGS})
         endforeach()
     endif()

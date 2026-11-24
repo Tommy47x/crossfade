@@ -127,6 +127,21 @@ int main()
     check(both.find("loudnorm") == 0, "filter normalization first");
     check(both.find(",equalizer=f=20.0") != std::string::npos, "filter eq after comma");
 
+    // Room correction: a separate band set applied after the manual EQ, with
+    // its headroom trim first in the chain.
+    {
+        Settings r;
+        r.room_eq_enabled = true;
+        r.room_eq_preamp = -2.5f;
+        r.room_eq_bands.push_back({100.0f, -4.0f, 2.0f});
+        const std::string f = crossfade::audio_filter(r);
+        check(f.rfind("volume=volume=-2.50dB,", 0) == 0, "room eq preamp first");
+        check(f.find("equalizer=f=100.0:t=q:w=2.000:g=-4.00") != std::string::npos,
+              "room eq band");
+        r.room_eq_enabled = false;
+        check(crossfade::audio_filter(r).empty(), "room eq off is silent");
+    }
+
     if (testutil::failures == 0)
         std::printf("crossfade: all checks passed\n");
     return testutil::failures == 0 ? 0 : 1;

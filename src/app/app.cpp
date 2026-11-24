@@ -53,6 +53,7 @@
 #include "warm_start.h"
 #include "data_transfer.h"
 #include "session.h"
+#include "calibration.h"
 
 // ---- libnotify (Linux) / toast notifications (Windows) ----
 #ifndef P100_WINDOWS
@@ -729,6 +730,8 @@ int app_run(int argc, char **argv)
     diagnostics::mark("sdl");
     party_init();
     party_set_wake(party_wake_event);
+    roomeq::init();
+    roomeq::set_wake(party_wake_event);
     updater::init(party_wake_event,
                   []() { g_state.quit_requested.store(true); },
                   g_state.settings.check_for_updates && !safe_mode && !power::low_power());
@@ -2516,6 +2519,10 @@ int app_run(int argc, char **argv)
                 party_tick(g_state, party_pos, party_dur, !g_state.playing.load());
             }
 
+            // Room correction: plays the calibration sweep, collects the
+            // recording and runs the filter design. Cheap no-op when idle.
+            roomeq::tick(g_state, *g_player);
+
             // ---- Rendering decision ----
             // Housekeeping above runs on its own cadence; the full ImGui
             // layout + GL swap only happens when something is actually
@@ -2733,6 +2740,7 @@ int app_run(int argc, char **argv)
     DLOG("shutdown: party stop");
     warm_start::stop_server();
     party_stop();
+    roomeq::cancel();
     DLOG("shutdown: backend stop");
     cancel_backend_startup();
     if (backend_boot_thread.joinable())

@@ -1,0 +1,73 @@
+#pragma once
+
+#include "room_eq.h"
+
+#include <string>
+#include <vector>
+
+class MpvPlayer;
+struct AppState;
+
+// Room-correction calibration: owns the measurement session, the phone server,
+// the sweep playback and the analysis job. All functions except the setters
+// marked otherwise are main-thread only.
+namespace roomeq
+{
+enum class Stage
+{
+    Idle,
+    Waiting,   // session open, waiting for the phone (or the sweep to start)
+    Measuring, // sweep is playing / being recorded
+    Analyzing, // recording received, designing filters
+    Ready,
+    Error,
+};
+
+struct Status
+{
+    Stage stage = Stage::Idle;
+    std::string message;
+    std::string url; // QR target while waiting
+    bool secure = false;
+    bool pc_mic = false;
+    bool has_result = false;
+    int sample_rate = 48000;
+
+    double residual_before_db = 0.0;
+    double residual_after_db = 0.0;
+
+    std::vector<double> hz;
+    std::vector<double> measured_db;  // smoothed, mic-corrected
+    std::vector<double> target_db;
+    std::vector<double> corrected_db; // measured + predicted filters
+    std::vector<dsp::Band> bands;
+};
+
+void init();
+void set_wake(void (*fn)());
+
+// Main loop. Plays the sweep, collects the recording, runs the analysis.
+void tick(AppState &state, const MpvPlayer &player);
+
+// Starts a phone measurement and returns the URL in status().url().
+bool start_phone(AppState &state, std::string &error);
+// Records with a PC microphone (PulseAudio/PipeWire via parec).
+bool start_pc_mic(AppState &state, const std::string &device, std::string &error);
+// Plays the sweep once so an external recorder can capture it.
+bool play_sweep(AppState &state, std::string &error);
+
+void cancel();
+Status status();
+
+bool apply(AppState &state);
+void forget(AppState &state);
+// Drops the pending (unapplied) measurement so a new one can start cleanly.
+void reset_result();
+// Persists a REW-style .cal file and selects it as the microphone profile.
+bool import_cal(AppState &state, const std::string &path, std::string &error);
+std::string cal_file_path();
+
+// PulseAudio/PipeWire source names, "Default device" first. Empty when the
+// platform has no capture helper.
+std::vector<std::string> input_devices();
+} // namespace roomeq

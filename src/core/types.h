@@ -311,6 +311,22 @@ struct Settings
         {14000.0f, 0.0f, 1.0f},
     };
 
+    // Room correction measured at the listening position. Applied *after* the
+    // manual equalizer as another block of peaking filters, so the two never
+    // overwrite each other. Bands come from the calibration UI.
+    bool room_eq_enabled = false;
+    std::vector<EqBand> room_eq_bands;
+    // Headroom for boosted bands; <= 0 dB. Applied as a volume trim.
+    float room_eq_preamp = 0.0f;
+    // Microphone profile: "" (flat), "phone_generic", "galaxy_s24", "custom".
+    std::string room_eq_mic;
+    // Correction target: "flat" or "warm".
+    std::string room_eq_target = "flat";
+    // Free-form label of the last successful calibration.
+    std::string room_eq_label;
+    // Residual deviation from the target after correction, dB RMS.
+    float room_eq_residual_db = 0.0f;
+
     // Discord Rich Presence: application client id (empty = off). Also
     // overridable via P100_DISCORD_CLIENT_ID.
     std::string discord_client_id;
@@ -361,6 +377,12 @@ struct Settings
                playback_speed == o.playback_speed && eq_enabled == o.eq_enabled &&
                eq_bands == o.eq_bands && eq_layout == o.eq_layout &&
                eq_preset == o.eq_preset &&
+               room_eq_enabled == o.room_eq_enabled &&
+               room_eq_bands == o.room_eq_bands &&
+               room_eq_preamp == o.room_eq_preamp && room_eq_mic == o.room_eq_mic &&
+               room_eq_target == o.room_eq_target &&
+               room_eq_label == o.room_eq_label &&
+               room_eq_residual_db == o.room_eq_residual_db &&
                discord_client_id == o.discord_client_id &&
                server_sync == o.server_sync && party == o.party;
     }

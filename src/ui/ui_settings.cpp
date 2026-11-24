@@ -227,6 +227,21 @@ void save_settings(const Settings &settings)
     for (size_t i = 0; i < settings.eq_bands.size(); ++i)
         out << (i ? "," : "") << settings.eq_bands[i].q;
     out << "]"
+        << ",\"rq_enabled\":" << (settings.room_eq_enabled ? "true" : "false")
+        << ",\"rq_preamp\":" << settings.room_eq_preamp
+        << ",\"rq_mic\":\"" << json_escape(settings.room_eq_mic) << "\""
+        << ",\"rq_target\":\"" << json_escape(settings.room_eq_target) << "\""
+        << ",\"rq_label\":\"" << json_escape(settings.room_eq_label) << "\""
+        << ",\"rq_residual\":" << settings.room_eq_residual_db << ",\"rq_freq\":[";
+    for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
+        out << (i ? "," : "") << settings.room_eq_bands[i].freq;
+    out << "],\"rq_gain\":[";
+    for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
+        out << (i ? "," : "") << settings.room_eq_bands[i].gain;
+    out << "],\"rq_q\":[";
+    for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
+        out << (i ? "," : "") << settings.room_eq_bands[i].q;
+    out << "]"
         << ",\"discord_client_id\":\"" << settings.discord_client_id << "\""
         << ",\"server_sync\":" << (settings.server_sync ? "true" : "false")
         << ",\"notes\":\"" << json_escape(settings.notes) << "\""
@@ -383,7 +398,38 @@ Settings load_settings()
                 s.eq_bands.resize(32);
             if (s.eq_bands.empty())
                 s.eq_bands = Settings().eq_bands;
+
+            // Room correction: same array encoding as the equalizer.
+            std::vector<float> rf, rg, rq;
+            const bool have_rf = parse_float_array("rq_freq", rf);
+            parse_float_array("rq_gain", rg);
+            parse_float_array("rq_q", rq);
+            s.room_eq_bands.clear();
+            if (have_rf)
+            {
+                for (size_t i = 0; i < rf.size(); ++i)
+                {
+                    EqBand b;
+                    b.freq = std::max(20.0f, std::min(20000.0f, rf[i]));
+                    b.gain = i < rg.size() ? std::max(-15.0f, std::min(15.0f, rg[i])) : 0.0f;
+                    b.q = i < rq.size() ? std::max(0.1f, std::min(10.0f, rq[i])) : 1.0f;
+                    s.room_eq_bands.push_back(b);
+                }
+            }
+            std::sort(s.room_eq_bands.begin(), s.room_eq_bands.end(),
+                      [](const EqBand &a, const EqBand &b) { return a.freq < b.freq; });
+            if (s.room_eq_bands.size() > 32)
+                s.room_eq_bands.resize(32);
         }
+        if (json.find("\"rq_enabled\"") != std::string::npos)
+            s.room_eq_enabled = get_bool("rq_enabled");
+        s.room_eq_preamp = std::max(-24.0f, std::min(0.0f, get_float("rq_preamp")));
+        s.room_eq_mic = get_str("rq_mic");
+        s.room_eq_target = get_str("rq_target");
+        if (s.room_eq_target != "warm")
+            s.room_eq_target = "flat";
+        s.room_eq_label = get_str("rq_label");
+        s.room_eq_residual_db = get_float("rq_residual");
         s.discord_client_id = get_str("discord_client_id");
         if (json.find("\"server_sync\"") != std::string::npos)
             s.server_sync = get_bool("server_sync");
@@ -679,6 +725,7 @@ enum SettingsCategory
 {
     SC_APPEARANCE = 0,
     SC_PLAYBACK,
+    SC_ROOM_EQ,
     SC_PARTY,
     SC_LYRICS,
     SC_YOUTUBE,
@@ -1062,6 +1109,7 @@ struct SettingsNavEntry
 static const SettingsNavEntry kSettingsNav[] = {
     {SC_APPEARANCE, UiIcon::Equalizer, "Appearance", "PERSONALISE"},
     {SC_PLAYBACK, UiIcon::Play, "Playback", nullptr},
+    {SC_ROOM_EQ, UiIcon::Qr, "Room correction", nullptr},
     {SC_LYRICS, UiIcon::Lyrics, "Lyrics", nullptr},
     {SC_PARTY, UiIcon::Party, "Party", "CONNECT"},
     {SC_YOUTUBE, UiIcon::Playlist, "YouTube Music", nullptr},
@@ -2156,6 +2204,11 @@ void draw_settings_panel(AppState &state)
             }
         }
     }
+    if (s_settings_category == SC_ROOM_EQ)
+    {
+        draw_room_eq_panel(state);
+    }
+
     if (s_settings_category == SC_PLAYBACK)
     {
         SettingsCard card("Playback", "Crossfade, speed and audio.", UiIcon::Play);

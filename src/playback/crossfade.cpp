@@ -61,6 +61,11 @@ Gains gains(double progress)
 std::string audio_filter(const Settings &s)
 {
     std::string af;
+    auto add = [&af](const char *filter) {
+        if (!af.empty())
+            af += ',';
+        af += filter;
+    };
     if (s.volume_normalization)
     {
         char norm[96];
@@ -70,18 +75,29 @@ std::string audio_filter(const Settings &s)
                       (double)tunable("playback.normalize_lra"));
         af = norm;
     }
+    auto add_band = [&](const EqBand &b) {
+        if (std::fabs(b.gain) < 0.05f || b.freq < 20.0f || b.freq > 20000.0f)
+            return; // flat bands cost nothing
+        char band[80];
+        std::snprintf(band, sizeof(band), "equalizer=f=%.1f:t=q:w=%.3f:g=%.2f",
+                      (double)b.freq, (double)b.q, (double)b.gain);
+        add(band);
+    };
     if (s.eq_enabled)
-    {
         for (const EqBand &b : s.eq_bands)
+            add_band(b);
+    if (s.room_eq_enabled)
+    {
+        // Trim first so boosted room filters cannot clip the output.
+        if (s.room_eq_preamp < -0.05f)
         {
-            if (std::fabs(b.gain) < 0.05f || b.freq < 20.0f || b.freq > 20000.0f)
-                continue; // flat bands cost nothing
-            char band[80];
-            std::snprintf(band, sizeof(band), "%sequalizer=f=%.1f:t=q:w=%.3f:g=%.2f",
-                          af.empty() ? "" : ",", (double)b.freq, (double)b.q,
-                          (double)b.gain);
-            af += band;
+            char trim[48];
+            std::snprintf(trim, sizeof(trim), "volume=volume=%.2fdB",
+                          (double)s.room_eq_preamp);
+            add(trim);
         }
+        for (const EqBand &b : s.room_eq_bands)
+            add_band(b);
     }
     return af;
 }
