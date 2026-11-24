@@ -131,6 +131,7 @@ set(SOURCES
     src/ui/ui_podcasts.cpp
     src/ui/ui_studio.cpp
     src/ui/ui_backend_debug.cpp
+    src/ui/ui_native_backend.cpp
     src/net/texture.cpp
     src/data/writeback.cpp
     src/party/party.cpp

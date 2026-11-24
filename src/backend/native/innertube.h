@@ -13,6 +13,7 @@ namespace native
 struct ResolveTrace
 {
     std::string video_id;
+    long long epoch_ms = 0;
     std::string client = "VISIONOS";
     std::string status;
     std::string reason;

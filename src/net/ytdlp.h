@@ -488,6 +488,12 @@ std::string get_cached_audio_path(const std::string &video_id);
 void save_cached_track_metadata(const Track &track, const std::string &audio_path);
 // Resolve a direct streaming URL via the backend ("yt-dlp -g").
 std::string fetch_stream_url(const std::string &video_id);
+
+// Native backend switch. The environment variable P100_BACKEND=python always
+// wins (useful for bug reports and CI); otherwise this runtime flag decides
+// whether the native resolver is tried before the Python backend.
+void set_native_backend_enabled(bool enabled);
+bool native_backend_enabled();
 // Speculative variant for background warming: uses a dedicated prefetch
 // backend channel, so it competes with neither a user click's resolve nor a
 // search/metadata request on the main channel.

@@ -213,6 +213,9 @@ bool attempt(const std::string &video_id, StreamResult &out, bool refresh)
 {
     ResolveTrace &trace = out.trace;
     trace.video_id = video_id;
+    trace.epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
     const auto total_start = std::chrono::steady_clock::now();
 
     if (refresh || !session_fresh(g_session))

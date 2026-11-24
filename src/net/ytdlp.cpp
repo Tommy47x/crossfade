@@ -3631,19 +3631,25 @@ std::string get_cached_audio_path(const std::string &video_id)
 
 // Resolve a direct streaming URL (yt-dlp -g) so playback can start
 // almost immediately instead of waiting for a full file download.
-static bool native_backend_preferred()
+static std::atomic<int> g_native_backend{1};
+
+void set_native_backend_enabled(bool enabled)
 {
-    // P100_BACKEND=python forces the old path; anything else tries native
-    // first and silently falls back if it cannot resolve.
+    g_native_backend.store(enabled ? 1 : 0);
+}
+
+bool native_backend_enabled()
+{
+    // P100_BACKEND=python forces the old path; anything else uses the switch.
     const char *env = getenv("P100_BACKEND");
     if (env && *env)
         return std::string(env) != "python";
-    return true;
+    return g_native_backend.load() != 0;
 }
 
 static std::string try_native_stream(const std::string &video_id)
 {
-    if (!native_backend_preferred() || !native::http_available())
+    if (!native_backend_enabled() || !native::http_available())
         return "";
     native::StreamResult r = native::resolve_audio(video_id);
     return r.ok ? r.url : "";
