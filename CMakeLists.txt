@@ -69,6 +69,12 @@ target_include_directories(crossfade_native PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/external
 )
 target_link_libraries(crossfade_native PUBLIC Threads::Threads)
+if(WIN32)
+    # cpp-httplib compiles winsock calls into the static library. The app used
+    # to link these itself, but every test target that pulls in ytdlp.cpp also
+    # pulls the native library, so make the dependency part of the library.
+    target_link_libraries(crossfade_native PUBLIC ws2_32 crypt32 iphlpapi)
+endif()
 if(OpenSSL_FOUND)
     target_compile_definitions(crossfade_native PUBLIC
         P100_HAVE_OPENSSL
