@@ -3669,6 +3669,12 @@ static bool native_handle_command(const std::string &cmd, std::string &out)
         if (native::fetch_meta(arg, out, error))
             return true;
     }
+    if (word == "search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search(arg, 20, out, error))
+            return true;
+    }
     return false;
 }
 

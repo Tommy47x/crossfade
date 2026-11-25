@@ -70,6 +70,128 @@ std::string json_escape(const std::string &s)
     return out;
 }
 
+std::string trim_str(const std::string &s)
+{
+    std::size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\n' || s[a] == '\r' || s[a] == 0xC2))
+        ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r'))
+        --b;
+    // A leading UTF-8 non-breaking space (C2 A0) survives the byte checks above.
+    if (a + 1 < b && (unsigned char)s[a] == 0xC2 && (unsigned char)s[a + 1] == 0xA0)
+        a += 2;
+    return s.substr(a, b - a);
+}
+
+int parse_duration(const std::string &s)
+{
+    int parts[3] = {0, 0, 0};
+    int n = 0, value = 0;
+    bool any = false;
+    for (char c : s)
+    {
+        if (c >= '0' && c <= '9')
+        {
+            value = value * 10 + (c - '0');
+            any = true;
+        }
+        else if (c == ':')
+        {
+            if (n < 2)
+                parts[n++] = value;
+            value = 0;
+        }
+    }
+    if (!any)
+        return 0;
+    if (n == 0)
+        return value;
+    if (n == 1)
+        return parts[0] * 60 + value;
+    return parts[0] * 3600 + parts[1] * 60 + value;
+}
+
+// Manifest text of a runs array ("a", " • ", "b" -> "a • b").
+std::string runs_text(const jsonv::Value &runs)
+{
+    std::string out;
+    if (!runs.is_array())
+        return out;
+    for (std::size_t i = 0; i < runs.size(); ++i)
+        out += runs.at(i).str("text");
+    return out;
+}
+
+// Split a subtitle's runs into segments at the " • " separators.
+std::vector<std::string> split_runs(const jsonv::Value &runs)
+{
+    std::vector<std::string> out(1);
+    if (!runs.is_array())
+        return out;
+    for (std::size_t i = 0; i < runs.size(); ++i)
+    {
+        const std::string t = runs.at(i).str("text");
+        if (t.find("\xE2\x80\xA2") != std::string::npos) // UTF-8 bullet
+        {
+            out.push_back(std::string());
+            continue;
+        }
+        out.back() += t;
+    }
+    for (std::string &s : out)
+        s = trim_str(s);
+    return out;
+}
+
+void collect_rows(const jsonv::Value &node, std::vector<const jsonv::Value *> &out,
+                  int depth)
+{
+    if (depth > 64)
+        return;
+    if (node.is_object())
+    {
+        const jsonv::Value &r = node["musicResponsiveListItemRenderer"];
+        if (!r.is_null())
+            out.push_back(&r);
+        for (const auto &kv : node.members())
+            collect_rows(kv.second, out, depth + 1);
+    }
+    else if (node.is_array())
+    {
+        for (std::size_t i = 0; i < node.size(); ++i)
+            collect_rows(node.at(i), out, depth + 1);
+    }
+}
+
+std::string row_title(const jsonv::Value &r)
+{
+    const jsonv::Value &runs =
+        r["flexColumns"].at(0)["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+    return trim_str(runs_text(runs));
+}
+
+std::vector<std::string> row_subtitle(const jsonv::Value &r)
+{
+    const jsonv::Value &runs =
+        r["flexColumns"].at(1)["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+    return split_runs(runs);
+}
+
+std::string row_thumb(const jsonv::Value &r)
+{
+    const jsonv::Value &th =
+        r["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"];
+    std::string best;
+    if (th.is_array())
+        for (std::size_t i = 0; i < th.size(); ++i)
+        {
+            const std::string u = th.at(i).str("url");
+            if (!u.empty())
+                best = u;
+        }
+    return best;
+}
+
 long long age_seconds(const Session &s)
 {
     if (!s.valid)
@@ -364,6 +486,133 @@ StreamResult resolve_audio(const std::string &video_id)
         out.error = out.trace.error;
     record(out.trace);
     return out;
+}
+
+bool search(const std::string &query, int limit, std::string &json,
+            std::string &error)
+{
+    if (query.empty())
+    {
+        error = "Missing query";
+        return false;
+    }
+    if (!http_available())
+    {
+        error = "native backend needs TLS (OpenSSL)";
+        return false;
+    }
+    ResolveTrace trace;
+    trace.client = "WEB_REMIX";
+    trace.epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    const auto start = std::chrono::steady_clock::now();
+    if (!session_fresh(g_session))
+    {
+        if (!refresh_session(trace))
+        {
+            error = trace.error;
+            record(trace);
+            return false;
+        }
+    }
+    else
+        trace.session_hit = true;
+
+    std::string cookies, visitor;
+    {
+        std::lock_guard<std::mutex> lock(g_session_mutex);
+        cookies = g_session.cookies;
+        visitor = g_session.visitor;
+    }
+    std::string body;
+    body += "{\"context\":{\"client\":{";
+    body += "\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20241104.01.00\",";
+    body += "\"hl\":\"en\",\"gl\":\"US\",\"visitorData\":\"" + visitor + "\"";
+    body += "}},\"query\":\"" + json_escape(query) + "\",";
+    // Songs filter (ytmusicapi's "songs" params).
+    body += "\"params\":\"EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D\"}";
+
+    std::vector<HttpHeader> headers = {
+        {"User-Agent", kPageUa},
+        {"X-YouTube-Client-Name", "67"},
+        {"X-YouTube-Client-Version", "1.20241104.01.00"},
+        {"X-Goog-Visitor-Id", visitor},
+        {"Origin", "https://music.youtube.com"},
+        {"Referer", "https://music.youtube.com/"},
+        {"Accept-Language", "en"},
+    };
+    const HttpResult res = http_post_json(
+        "https://music.youtube.com/youtubei/v1/search?prettyPrint=false", body, headers,
+        cookies);
+    trace.player_ms = res.ms;
+    trace.player_bytes = res.bytes;
+    if (!res.ok)
+    {
+        trace.error = "search: " + res.error;
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+    jsonv::Value root;
+    std::string parse_error;
+    if (!jsonv::Value::parse(res.body, root, parse_error))
+    {
+        trace.error = "search json: " + parse_error;
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+    std::vector<const jsonv::Value *> rows;
+    collect_rows(root, rows, 0);
+
+    std::string out = "[";
+    int found = 0;
+    std::vector<std::string> seen;
+    const int cap = limit > 0 ? std::min(limit, 50) : 20;
+    for (const jsonv::Value *row : rows)
+    {
+        if (found >= cap)
+            break;
+        const std::string id = trim_str(row->get("playlistItemData").str("videoId"));
+        if (id.size() != 11)
+            continue;
+        if (std::find(seen.begin(), seen.end(), id) != seen.end())
+            continue;
+        const std::string title = row_title(*row);
+        if (title.empty())
+            continue;
+        const std::vector<std::string> sub = row_subtitle(*row);
+        const std::string artist = sub.empty() ? std::string() : sub[0];
+        const std::string album = sub.size() > 1 ? sub[1] : std::string();
+        const int duration = sub.size() > 2 ? parse_duration(sub[2]) : 0;
+        std::string thumb = row_thumb(*row);
+        if (thumb.empty())
+            thumb = "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg";
+        seen.push_back(id);
+        if (found++)
+            out += ",";
+        out += "{\"id\":\"" + json_escape(id) + "\",\"title\":\"" + json_escape(title);
+        out += "\",\"artist\":\"" + json_escape(artist) + "\",\"artist_id\":\"\"";
+        out += ",\"album\":\"" + json_escape(album) + "\",\"album_id\":\"\"";
+        out += ",\"track_number\":0,\"thumbnail_url\":\"" + json_escape(thumb) + "\"";
+        out += ",\"duration_sec\":" + std::to_string(duration);
+        out += ",\"url\":\"https://www.youtube.com/watch?v=" + id + "\"}";
+    }
+    out += "]";
+    trace.status = "SEARCH";
+    trace.formats = found;
+    trace.total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    record(trace);
+    if (found == 0)
+    {
+        error = "No results";
+        return false;
+    }
+    json = out;
+    return true;
 }
 
 bool fetch_meta(const std::string &video_id, std::string &json, std::string &error)

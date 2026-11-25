@@ -57,6 +57,11 @@ struct SessionInfo
 // prefetch pool.
 StreamResult resolve_audio(const std::string &video_id);
 
+// Song search. Produces the Python backend's track-array JSON (id, title,
+// artist, album, thumbnail_url, duration_sec, url). Returns false to fall back.
+bool search(const std::string &query, int limit, std::string &json,
+            std::string &error);
+
 // Metadata-only lookup (title/artist/duration/thumbnail) from the same player
 // response, no stream selection. Produces the Python backend's "meta" JSON
 // shape. Returns false when the caller should fall back to Python.
