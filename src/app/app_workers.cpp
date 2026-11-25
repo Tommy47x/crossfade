@@ -453,6 +453,20 @@ void search_suggest_and_update(const std::string &query, int expect_id)
     g_state.repaint_requested = true;
 }
 
+void prefetch_lyrics(const std::vector<std::string> &track_ids)
+{
+    for (const std::string &id : track_ids)
+    {
+        if (id.empty())
+            continue;
+        Lyrics lx;
+        if (load_lyrics_cache(id, lx))
+            continue;
+        if (fetch_lyrics(id, lx))
+            save_lyrics_cache(id, lx);
+    }
+}
+
 void load_lyrics_worker(std::string track_id, int expect_seq)
 {
     Lyrics lx;

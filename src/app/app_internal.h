@@ -173,6 +173,8 @@ void prefetch_hovered_track(const std::string &video_id);
 void prefetch_visible_list_if_aggressive();
 void search_suggest_and_update(const std::string &query, int expect_id);
 void load_lyrics_worker(std::string track_id, int expect_seq);
+// Warm the lyrics cache for upcoming queue rows without touching the panel.
+void prefetch_lyrics(const std::vector<std::string> &track_ids);
 
 // ---- Touch / wheel input (app_input.cpp) ----
 void reset_wheel_scroll();

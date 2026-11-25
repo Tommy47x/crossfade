@@ -2409,6 +2409,26 @@ int app_run(int argc, char **argv)
                         });
                     }
                 }
+                // Warm the next few queue rows while the current song plays,
+                // so the immersive transition does not wait for a provider.
+                static std::string s_prefetch_for;
+                if (!g_state.current_track_id.empty() &&
+                    g_state.current_track_id != s_prefetch_for)
+                {
+                    s_prefetch_for = g_state.current_track_id;
+                    std::vector<std::string> upcoming;
+                    for (const Track &t : g_state.play_queue)
+                    {
+                        if (t.id.empty() || t.id == g_state.current_track_id)
+                            continue;
+                        upcoming.push_back(t.id);
+                        if (upcoming.size() >= 3)
+                            break;
+                    }
+                    if (!upcoming.empty())
+                        tasks::spawn("lyrics-prefetch",
+                                     [upcoming]() { prefetch_lyrics(upcoming); });
+                }
             }
 
             // Studio: the in-Studio YouTube beat search has its own query and

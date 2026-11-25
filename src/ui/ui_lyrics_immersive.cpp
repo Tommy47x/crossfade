@@ -217,6 +217,8 @@ struct ImmersiveAnim
     double active_since = 0.0;
     double view_start = 0.0;
     double switch_start = -100.0;
+    Track prev_display;
+    Track current_display;
     float enter = 0.0f;
     float pulse = 0.0f;
     bool exiting = false;
@@ -598,13 +600,14 @@ bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
 // show the cover, title and artist instead of an empty message. The blurred
 // cover already lives in the backdrop; this is the sharp card on top.
 void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
-                     float w, float h, float alpha)
+                     float w, float h, float alpha, float y_shift = 0.0f)
 {
     if (alpha <= 0.003f)
         return;
     const float s = std::min(w, h);
+    const ImVec2 fc(focal.x, focal.y + y_shift);
     const float art = std::min(s * 0.48f, std::min(w * 0.44f, 520.0f));
-    const ImVec2 p0(focal.x - art * 0.5f, focal.y - art * 0.62f);
+    const ImVec2 p0(fc.x - art * 0.5f, fc.y - art * 0.62f);
     const ImVec2 p1(p0.x + art, p0.y + art);
     const float rounding = std::max(8.0f, art * 0.035f);
     dl->AddRectFilled(ImVec2(p0.x + 8.0f, p0.y + 14.0f), ImVec2(p1.x + 8.0f, p1.y + 14.0f),
@@ -632,7 +635,7 @@ void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
                                            w * 0.78f);
     const float tw = measure(g_ui_fonts.semibold, title_size, title);
     dl->AddText(g_ui_fonts.semibold, title_size,
-                ImVec2(focal.x - tw * 0.5f, ty),
+                ImVec2(fc.x - tw * 0.5f, ty),
                 ui_with_alpha(ui_text_u32(), 0.94f * alpha), title.c_str());
     ty += title_size * 1.35f;
     if (!display.artist.empty())
@@ -640,7 +643,7 @@ void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
         const float as = std::max(14.0f, title_size * 0.52f);
         const std::string ar = ui_ellipsize(g_ui_fonts.body, as, display.artist, w * 0.72f);
         const float aw = measure(g_ui_fonts.body, as, ar);
-        dl->AddText(g_ui_fonts.body, as, ImVec2(focal.x - aw * 0.5f, ty),
+        dl->AddText(g_ui_fonts.body, as, ImVec2(fc.x - aw * 0.5f, ty),
                     ui_with_alpha(ui_text_dim_u32(), 0.80f * alpha), ar.c_str());
     }
 }
@@ -648,12 +651,13 @@ void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
 // The artwork column kept from the immersive experiment: wide windows put the
 // sharp cover on the left and the existing line-timed lyrics on the right.
 void draw_cover_column(ImDrawList *dl, const Track &display, ImVec2 centre,
-                       float col_w, float h, float alpha)
+                       float col_w, float h, float alpha, float y_shift = 0.0f)
 {
     if (alpha <= 0.003f)
         return;
+    const ImVec2 cc(centre.x, centre.y + y_shift);
     const float art = std::min(std::min(col_w * 0.86f, h * 0.56f), 560.0f);
-    const ImVec2 p0(centre.x - art * 0.5f, centre.y - art * 0.55f);
+    const ImVec2 p0(cc.x - art * 0.5f, cc.y - art * 0.55f);
     const ImVec2 p1(p0.x + art, p0.y + art);
     const float rounding = std::max(8.0f, art * 0.035f);
     dl->AddRectFilled(ImVec2(p0.x + 10.0f, p0.y + 18.0f), ImVec2(p1.x + 10.0f, p1.y + 18.0f),
@@ -681,7 +685,7 @@ void draw_cover_column(ImDrawList *dl, const Track &display, ImVec2 centre,
                                            col_w * 0.92f);
     const float tw = measure(g_ui_fonts.semibold, title_size, title);
     dl->AddText(g_ui_fonts.semibold, title_size,
-                ImVec2(centre.x - tw * 0.5f, ty),
+                ImVec2(cc.x - tw * 0.5f, ty),
                 ui_with_alpha(ui_text_u32(), 0.94f * alpha), title.c_str());
     ty += title_size * 1.35f;
     if (!display.artist.empty())
@@ -689,7 +693,7 @@ void draw_cover_column(ImDrawList *dl, const Track &display, ImVec2 centre,
         const float as = std::max(14.0f, title_size * 0.52f);
         const std::string ar = ui_ellipsize(g_ui_fonts.body, as, display.artist, col_w * 0.88f);
         const float aw = measure(g_ui_fonts.body, as, ar);
-        dl->AddText(g_ui_fonts.body, as, ImVec2(centre.x - aw * 0.5f, ty),
+        dl->AddText(g_ui_fonts.body, as, ImVec2(cc.x - aw * 0.5f, ty),
                     ui_with_alpha(ui_text_dim_u32(), 0.80f * alpha), ar.c_str());
     }
 }
@@ -860,8 +864,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             if (had_track)
             {
                 // Songs change while the takeover stays open. Keep the view
-                // fully opaque and mask the hand-off for a moment instead of
-                // fading the whole takeover through the app behind it.
+                // fully opaque; the cover slide and background crossfade use
+                // the previous display snapshot below.
+                g_imm.prev_display = g_imm.current_display;
                 g_imm.enter = 1.0f;
                 g_imm.switch_start = now;
             }
@@ -875,6 +880,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.prev_size = 0.0f;
             g_imm.prev_since = -100.0;
         }
+        g_imm.current_display = display;
 
         if (motion && g_imm.enter < 1.0f)
         {
@@ -884,17 +890,17 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (!motion)
             g_imm.enter = 1.0f;
         const float view_a = ease_out(g_imm.enter) * exit_a;
-        float switch_a = 0.0f;
+        float switch_p = 1.0f;
         if (motion && g_imm.switch_start > 0.0)
         {
             const double age = now - g_imm.switch_start;
-            const double dur = 0.50;
+            const double dur = 0.65;
             if (age < dur)
-            {
-                switch_a = 1.0f - ease_out((float)(age / dur));
+                switch_p = ease_out((float)(age / dur));
+            if (age < dur + 0.35)
                 animating = true;
-            }
         }
+        const bool transitioning = switch_p < 0.999f && !g_imm.prev_display.id.empty();
 
         // Seek target survives the chrome fading out mid-drag.
         static float s_seek = -1.0f;
@@ -991,11 +997,45 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     const float hh = (v1 - v0) * 0.5f / zoom;
                     const float drift = reactive ? 0.004f * std::sin((float)now * 0.17f)
                                                  : 0.0f;
-                    const float a = (0.34f - 0.14f * day) * (0.85f + 0.35f * energy) * view_a;
+                    const float a = (0.34f - 0.14f * day) * (0.85f + 0.35f * energy) *
+                                    view_a * (transitioning ? switch_p : 1.0f);
                     dl->AddImage((ImTextureID)(intptr_t)blur, wp,
                                  ImVec2(wp.x + w, wp.y + h),
                                  ImVec2(cx - hw + drift, cy - hh),
                                  ImVec2(cx + hw + drift, cy + hh),
+                                 IM_COL32(255, 255, 255,
+                                          (int)(clampf(a, 0.0f, 1.0f) * 255.0f)));
+                }
+            }
+        }
+
+        // Morph the backdrop: the outgoing track's blurred cover fades over
+        // the incoming one during the cover slide.
+        if (transitioning && !g_imm.prev_display.thumbnail_url.empty())
+        {
+            const std::string ohi = texture_highres_url(
+                g_imm.prev_display.thumbnail_url, g_imm.prev_display.id);
+            ui_immersive_blur_request(ohi);
+            GLuint oblur = ui_immersive_blur_texture(ohi);
+            int ow = 0, oh = 0;
+            bool have_old = oblur != 0 && ui_immersive_blur_size(ohi, ow, oh);
+            if (!have_old && ohi != g_imm.prev_display.thumbnail_url)
+            {
+                ui_immersive_blur_request(g_imm.prev_display.thumbnail_url);
+                oblur = ui_immersive_blur_texture(g_imm.prev_display.thumbnail_url);
+                have_old = oblur != 0 &&
+                           ui_immersive_blur_size(g_imm.prev_display.thumbnail_url, ow, oh);
+            }
+            if (have_old)
+            {
+                float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+                const TextureInfo info{oblur, ow, oh};
+                if (cover_uv(info, w, h, u0, v0, u1, v1))
+                {
+                    const float a = (0.34f - 0.14f * day) * (1.0f - switch_p) * view_a;
+                    dl->AddImage((ImTextureID)(intptr_t)oblur, wp,
+                                 ImVec2(wp.x + w, wp.y + h), ImVec2(u0, v0),
+                                 ImVec2(u1, v1),
                                  IM_COL32(255, 255, 255,
                                           (int)(clampf(a, 0.0f, 1.0f) * 255.0f)));
                 }
@@ -1115,8 +1155,20 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         }
 
         if (split && !display.id.empty())
-            draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
-                              cover_col_w, h, view_a);
+        {
+            if (transitioning)
+            {
+                draw_cover_column(dl, g_imm.prev_display,
+                                  ImVec2(cover_col_w * 0.5f, h * 0.43f), cover_col_w, h,
+                                  view_a * (1.0f - switch_p), -h * 0.12f * switch_p);
+                draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
+                                  cover_col_w, h, view_a * switch_p,
+                                  h * 0.12f * (1.0f - switch_p));
+            }
+            else
+                draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
+                                  cover_col_w, h, view_a);
+        }
 
         // ---- Lyrics ----
         ImFont *font = g_ui_fonts.semibold;
@@ -1154,7 +1206,17 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (draw_cover)
         {
             if (!split)
-                draw_cover_card(dl, display, focal, w, h, view_a);
+            {
+                if (transitioning)
+                {
+                    draw_cover_card(dl, g_imm.prev_display, focal, w, h,
+                                    view_a * (1.0f - switch_p), -h * 0.10f * switch_p);
+                    draw_cover_card(dl, display, focal, w, h, view_a * switch_p,
+                                    h * 0.10f * (1.0f - switch_p));
+                }
+                else
+                    draw_cover_card(dl, display, focal, w, h, view_a);
+            }
             if (!note.empty())
             {
                 const float ns = std::max(12.0f, std::min(16.0f, h * 0.016f));
@@ -1336,8 +1398,18 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     // "coming into focus" as the scroll passes it.
                     const float focus = clampf(1.0f - std::fabs(d) * 0.55f, 0.0f, 1.0f);
                     const float f2 = focus * focus;
-                    const float alpha =
+                    float alpha =
                         (preview ? 0.60f : 1.0f) * (0.08f + 0.92f * f2) * view_a;
+                    float reveal = 1.0f;
+                    if (transitioning)
+                    {
+                        const int order = std::max(0, i - center_idx);
+                        reveal = clampf((float)((now - g_imm.switch_start -
+                                                 (double)order * 0.045) /
+                                                0.35),
+                                        0.0f, 1.0f);
+                        alpha *= reveal;
+                    }
                     const bool is_active = (!preview && i == center_idx);
                     // The size cap is measured once at the focal font size and
                     // does not depend on the current focus. Fitting against a
@@ -1355,7 +1427,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                                          : layout_text(font, lx->lines[i], max_text_w, size,
                                                        std::max(13.0f, size * 0.5f));
                     bool drew_words = false;
-                    const ImVec2 line_center(focal.x, focal.y + d * pitch);
+                    const ImVec2 line_center(focal.x,
+                                             focal.y + d * pitch +
+                                                 (1.0f - reveal) * ui_px(16.0f));
                     if (is_active && i < (int)lx->rich.size())
                         drew_words = draw_words_app(
                             dl, font, size, line_center, max_text_w, lx->rich[(size_t)i],
@@ -1585,10 +1659,6 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             ui_audio_stop();
             g_imm.exiting = false;
         }
-
-        if (switch_a > 0.001f)
-            dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
-                              ui_with_alpha(ui_col(ui_c().bg), switch_a * view_a));
 
         if (animating)
         {
