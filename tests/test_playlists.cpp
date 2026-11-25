@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "test_util.h"
+#include "ytdlp.h"
 using testutil::write_file;
 using testutil::check;
 #include "paths.h"
@@ -95,6 +96,27 @@ int main()
               "xspf escaped location");
         check(xspf.find("<duration>120000</duration>") != std::string::npos,
               "xspf duration");
+    }
+
+    {
+        // Native backend replies call the video field "id", while the Python
+        // fallback emits ytmusicapi's "videoId". Both shapes must parse, and
+        // the playlist's own top-level id must not become a track.
+        const std::string native_reply =
+            "{\"id\":\"PLtest\",\"title\":\"List\",\"trackCount\":2,\"tracks\":["
+            "{\"id\":\"a1\",\"title\":\"First\"},"
+            "{\"id\":\"b2\",\"title\":\"Second\"}]}";
+        auto native_tracks = parse_youtube_playlist_tracks_response(native_reply);
+        check(native_tracks.size() == 2, "native playlist tracks parsed");
+        check(native_tracks[0].id == "a1", "native playlist first id");
+        check(native_tracks[1].title == "Second", "native playlist second title");
+
+        const std::string python_reply =
+            "{\"id\":null,\"trackCount\":1,\"tracks\":["
+            "{\"videoId\":\"c3\",\"title\":\"Third\"}]}";
+        auto python_tracks = parse_youtube_playlist_tracks_response(python_reply);
+        check(python_tracks.size() == 1, "python playlist tracks parsed");
+        check(python_tracks[0].id == "c3", "python playlist id");
     }
 
     fs::remove_all(root, ec);

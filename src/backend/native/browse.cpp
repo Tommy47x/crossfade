@@ -377,28 +377,34 @@ std::string find_continuation(const jsonv::Value &root)
     return !item_token.empty() ? item_token : section_token;
 }
 
-void append_shelf_rows(const jsonv::Value &root, std::vector<Row> &rows,
-                       std::vector<std::string> &seen, std::size_t cap)
+// The page's own track list. Playlist and artist-songs pages put it in a
+// musicPlaylistShelfRenderer; albums use the first musicShelfRenderer. Related
+// carousels and recommendation shelves must not leak into the list.
+const jsonv::Value *main_track_shelf(const jsonv::Value &root)
 {
     std::vector<const jsonv::Value *> shelves;
-    collect_all(root, "musicShelfRenderer", shelves);
-    collect_all(root, "musicPlaylistShelfRenderer", shelves);
-    for (const jsonv::Value *shelf : shelves)
+    util::collect_renderer(root, "musicPlaylistShelfRenderer", shelves);
+    if (shelves.empty())
+        util::collect_renderer(root, "musicShelfRenderer", shelves);
+    return shelves.empty() ? nullptr : shelves.front();
+}
+
+void append_shelf_rows(const jsonv::Value &shelf, std::vector<Row> &rows,
+                       std::vector<std::string> &seen, std::size_t cap)
+{
+    std::vector<const jsonv::Value *> renderers;
+    util::collect_renderer(shelf, "musicResponsiveListItemRenderer", renderers);
+    for (const jsonv::Value *r : renderers)
     {
-        std::vector<const jsonv::Value *> renderers;
-        util::collect_renderer(*shelf, "musicResponsiveListItemRenderer", renderers);
-        for (const jsonv::Value *r : renderers)
-        {
-            if (rows.size() >= cap)
-                return;
-            Row t;
-            if (!util::parse_row(*r, t))
-                continue;
-            if (std::find(seen.begin(), seen.end(), t.id) != seen.end())
-                continue;
-            seen.push_back(t.id);
-            rows.push_back(std::move(t));
-        }
+        if (rows.size() >= cap)
+            return;
+        Row t;
+        if (!util::parse_row(*r, t))
+            continue;
+        if (std::find(seen.begin(), seen.end(), t.id) != seen.end())
+            continue;
+        seen.push_back(t.id);
+        rows.push_back(std::move(t));
     }
 }
 
@@ -410,8 +416,16 @@ bool browse_all_rows(const std::string &browse_id, std::size_t cap,
     if (!web_call("browse", "\"browseId\":\"" + escape(browse_id) + "\"", reply, error))
         return false;
     std::vector<std::string> seen;
-    append_shelf_rows(reply.root, rows, seen, cap);
-    std::string continuation = find_continuation(reply.root);
+    std::string continuation;
+    if (const jsonv::Value *shelf = main_track_shelf(reply.root))
+    {
+        append_shelf_rows(*shelf, rows, seen, cap);
+        // Only the track shelf's continuation continues this list. The page
+        // also carries unrelated "start radio"/recommendation continuations
+        // that would otherwise append a whole different set of songs (a
+        // one-track playlist could grow to hundreds of rows).
+        continuation = find_continuation(*shelf);
+    }
     int pages = 0;
     while (!continuation.empty() && rows.size() < cap && pages < 20)
     {

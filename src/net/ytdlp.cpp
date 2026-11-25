@@ -2724,6 +2724,31 @@ std::vector<Track> parse_youtube_playlist_tracks_response(const std::string &res
         pos += 1;
         guard++;
     }
+    if (tracks.empty())
+    {
+        // The native backend emits ytmusicapi-shaped tracks but names the
+        // video field "id" (it has no ytmusicapi to copy "videoId" from).
+        // Skip the playlist's own top-level id so the root object is not
+        // mistaken for a track.
+        const std::string playlist_id = json_get_string(response, "id");
+        pos = 0;
+        guard = 0;
+        while ((pos = response.find("\"id\":", pos)) != std::string::npos && guard < 2000)
+        {
+            std::string obj = json_find_object(response, pos);
+            if (obj.empty())
+            {
+                pos += 5;
+                continue;
+            }
+            Track t;
+            parse_track_object(obj, t);
+            if (!t.id.empty() && t.id != playlist_id && !t.title.empty())
+                tracks.push_back(std::move(t));
+            pos += 5;
+            guard++;
+        }
+    }
     return tracks;
 }
 
