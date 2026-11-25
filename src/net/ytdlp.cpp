@@ -3579,6 +3579,55 @@ std::string playable_track_url(const std::string &id, const std::string &url)
     return url;
 }
 
+// Download the audio stream the native resolver already picked. This avoids
+// the yt-dlp/deno signature dance entirely for the common case (and keeps
+// working when the account is in the SABR experiment, where yt-dlp's web
+// clients fail). ffmpeg only remuxes; no re-encode.
+static std::string native_download_audio(const std::string &video_id,
+                                         const std::string &dir)
+{
+    if (!native_backend_enabled() || !native::http_available())
+        return "";
+    const native::StreamResult stream = native::resolve_audio(video_id);
+    if (!stream.ok || stream.url.empty())
+        return "";
+    std::string ext = "webm";
+    if (stream.mime.find("mp4") != std::string::npos)
+        ext = "m4a";
+    else if (stream.mime.find("ogg") != std::string::npos)
+        ext = "ogg";
+    const std::string path = dir + "/" + video_id + "." + ext;
+    const std::string tmp = path + ".part";
+    const char *ffmpeg_env = getenv("P100_FFMPEG");
+    const std::string ffmpeg = ffmpeg_env && *ffmpeg_env ? ffmpeg_env : "ffmpeg";
+    const std::string cmd = shell_quote(ffmpeg) + " -v error -y -user_agent " +
+                            shell_quote(native::web_user_agent()) + " -i " +
+                            shell_quote(stream.url) + " -vn -c:a copy " +
+                            shell_quote(tmp);
+    std::string output;
+    const int rc = run_capture(cmd, output);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(tmp, ec);
+    if (rc != 0 || ec || size == 0)
+    {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        return "";
+    }
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp, path, rename_ec);
+    if (rename_ec)
+    {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        return "";
+    }
+    Track t = fetch_track_metadata(video_id);
+    if (!t.title.empty())
+        save_metadata(t, path);
+    return path;
+}
+
 std::string get_cached_audio_path(const std::string &video_id)
 {
     if (video_id.empty())
@@ -3594,6 +3643,10 @@ std::string get_cached_audio_path(const std::string &video_id)
     std::string cached = find_audio_in(dir, video_id);
     if (!cached.empty())
         return cached;
+
+    if (std::string native_path = native_download_audio(video_id, dir);
+        !native_path.empty())
+        return native_path;
 
     const std::string url = "https://www.youtube.com/watch?v=" + video_id;
     const std::string output = " -o \"" + dir + "/" + video_id + ".%(ext)s\" ";

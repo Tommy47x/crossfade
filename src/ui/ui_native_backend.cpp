@@ -65,7 +65,7 @@ void draw_native_backend_window(AppState &state)
 {
     if (!state.show_native_backend_debug)
         return;
-    ImGui::SetNextWindowSize(ImVec2(980.0f, 640.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(1220.0f, 880.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Native backend", &state.show_native_backend_debug,
                      ImGuiWindowFlags_NoCollapse))
         draw_native_backend_panel(state);
@@ -175,7 +175,7 @@ void draw_native_backend_panel(AppState &state)
 
     // ---- per-resolve table ----------------------------------------------
     ImGui::SeparatorText("Recent resolves");
-    if (ImGui::BeginChild("##native_traces", ImVec2(0.0f, 300.0f * m.layout_scale),
+    if (ImGui::BeginChild("##native_traces", ImVec2(0.0f, 430.0f * m.layout_scale),
                           true, ImGuiWindowFlags_HorizontalScrollbar))
     {
         ImGui::TextColored(ImVec4(ui_c().text_muted.x, ui_c().text_muted.y,

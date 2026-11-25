@@ -226,7 +226,13 @@ inline bool is_noise(const std::string &s)
         return true;
     if (s == "Song" || s == "Video" || s == "Album" || s == "Single" || s == "EP" ||
         s == "Playlist" || s == "Podcast" || s == "Episode" || s == "Artist" ||
-        s == "Top result")
+        s == "Top result" || s == "Podcasts")
+        return true;
+    if (s.find(" plays") != std::string::npos ||
+        s.find(" views") != std::string::npos ||
+        s.find("audience") != std::string::npos ||
+        s.find("subscriber") != std::string::npos ||
+        s.find("monthly") != std::string::npos)
         return true;
     // "1.2B plays", "30M views", "2026", "13 songs".
     bool only_meta = true;

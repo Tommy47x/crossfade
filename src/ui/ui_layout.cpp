@@ -4,6 +4,8 @@
 #include "ui_theme.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 static float clampf(float v, float lo, float hi)
 {
@@ -35,12 +37,17 @@ AppLayout ui_compute_layout(const AppState &state, const ImGuiIO &io)
     l.bottom_h = std::max(m.bottom_h, std::max(m.row_art + m.space_4 * 1.6f, body_line * 2.0f + m.space_3 * 2.0f));
     l.bottom_h = std::min(l.bottom_h, l.window_h * 0.28f);
 
-    // Some desktop shells (notably dash-to-dock with autohide) keep an
-    // invisible input region along the screen edge. A maximised window puts
-    // the transport buttons right inside it, so every click goes to the shell
-    // instead of the app. Reserve a configurable band above that edge; the
-    // window still paints it, it just has no interactive controls.
-    l.bottom_safe = state.window_at_screen_bottom
+    // GNOME's dash-to-dock (and a few similar shells) keep an invisible input
+    // region along the screen edge even when the dock autohides. A maximised
+    // window puts the transport buttons inside it, so clicks go to the shell.
+    // Reserve an unpainted band above that edge only on those shells: KDE and
+    // most others reserve their panels in the work area, and padding there
+    // just looked like the player bar had doubled in height.
+    const char *desktop = std::getenv("XDG_CURRENT_DESKTOP");
+    const bool edge_autohide_shell =
+        desktop && (std::strstr(desktop, "GNOME") || std::strstr(desktop, "Unity") ||
+                    std::strstr(desktop, "Pantheon"));
+    l.bottom_safe = (state.window_at_screen_bottom && edge_autohide_shell)
                         ? tunable("layout.bottom_safe_area") * m.layout_scale
                         : 0.0f;
     const float usable_h = std::max(0.0f, l.window_h - l.bottom_h - l.bottom_safe);
@@ -54,7 +61,9 @@ AppLayout ui_compute_layout(const AppState &state, const ImGuiIO &io)
     l.body_pos = ImVec2(l.content_pos.x, l.content_pos.y + l.header_size.y);
     l.body_size = ImVec2(l.content_size.x, std::max(0.0f, l.content_size.y - l.header_size.y));
     l.bottom_pos = ImVec2(0.0f, usable_h);
-    l.bottom_size = ImVec2(l.window_w, l.bottom_h + l.bottom_safe);
+    // Never grow the player bar itself: the safe band is left as page
+    // background above the screen edge, so the bar keeps one fixed height.
+    l.bottom_size = ImVec2(l.window_w, l.bottom_h);
     l.gap = m.space_3;
 
     // The lyrics drawer is available on every tab now (settings, album and

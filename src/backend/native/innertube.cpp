@@ -936,6 +936,16 @@ bool get_session(std::string &cookies, std::string &visitor, std::string &error)
     return true;
 }
 
+bool peek_session(std::string &cookies, std::string &visitor)
+{
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    if (!session_fresh(g_session))
+        return false;
+    cookies = g_session.cookies;
+    visitor = g_session.visitor;
+    return true;
+}
+
 void record_trace(const ResolveTrace &trace)
 {
     record(trace);

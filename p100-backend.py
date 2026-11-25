@@ -61,6 +61,14 @@ def main():
     if os.path.exists(AUTH_FILE):
         secure_auth_file(AUTH_FILE)
         try:
+            # Stored SAPISIDHASH expires; recompute it from the cookies before
+            # ytmusicapi reads the file, otherwise a valid session looks
+            # signed out to the fallback backend.
+            try:
+                from cf_backend.login import refresh_auth_file
+                refresh_auth_file(AUTH_FILE)
+            except Exception:
+                pass
             yt = YTMusic(AUTH_FILE)
             # A cookie file can construct a YTMusic object and still be
             # anonymous (expired/incomplete cookies). Verify the account flag so

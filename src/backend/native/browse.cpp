@@ -207,15 +207,12 @@ bool web_call(const std::string &endpoint, const std::string &fields, WebReply &
                                .count();
     const auto start = std::chrono::steady_clock::now();
 
+    // Browse/search work anonymously (and do not need VISITOR_DATA), so use
+    // an already-open watch-page session when there is one and never open a
+    // new one just for a browse request: that would add ~1 s to the first
+    // search/album click after launch.
     std::string session_cookies, visitor;
-    std::string session_error;
-    reply.trace.session_hit = session_info().valid;
-    if (!get_session(session_cookies, visitor, session_error))
-    {
-        // Browse endpoints still work without visitor data; keep going.
-        session_cookies.clear();
-        visitor.clear();
-    }
+    reply.trace.session_hit = peek_session(session_cookies, visitor);
     const WebAuth auth = load_auth();
     std::string cookie_jar = auth.cookie.empty() ? session_cookies : auth.cookie;
 
@@ -490,12 +487,40 @@ bool suggest(const std::string &query, std::string &json, std::string &error)
             if (row.is_null())
                 continue;
             Row t;
-            if (!util::parse_row(row, t))
+            bool parsed = util::parse_row(row, t);
+            const std::string row_title = trim(runs_text(
+                row["flexColumns"].at(0)["musicResponsiveListItemFlexColumnRenderer"]["text"]
+                    ["runs"]));
+            const std::vector<Part> parts = runs_parts(
+                row["flexColumns"].at(1)["musicResponsiveListItemFlexColumnRenderer"]["text"]
+                    ["runs"]);
+            const std::string browse =
+                trim(row["navigationEndpoint"]["browseEndpoint"].str("browseId"));
+            if (!parsed)
+            {
+                // Artist/album suggestions have a browse id but no video id.
+                if (row_title.empty() || browse.empty())
+                    continue;
+                t.title = row_title;
+                t.thumb = util::renderer_thumb(row);
+                for (const Part &p : parts)
+                {
+                    if (p.browse_id.rfind("UC", 0) == 0 && t.artist.empty())
+                    {
+                        t.artist = p.browse_id == browse ? p.text : p.text;
+                        t.artist_id = p.browse_id;
+                    }
+                }
+                if (browse.rfind("UC", 0) == 0)
+                    t.kind = "Artist";
+                else if (browse.rfind("MPREb", 0) == 0)
+                    t.kind = "Album";
+                parsed = true;
+            }
+            if (!parsed)
                 continue;
             std::string id = t.id;
             std::string kind = t.kind;
-            const std::string browse =
-                row["navigationEndpoint"]["browseEndpoint"].str("browseId");
             if (!browse.empty())
             {
                 id = browse;
@@ -563,6 +588,12 @@ bool album(const std::string &browse_id, std::string &json, std::string &error)
         return false;
     }
     const std::string artist = field_text(*header, "straplineTextOne");
+    // Individual album rows often omit the artist entirely; ytmusicapi fills
+    // it from the header, and so must we (otherwise the queue and the lyrics
+    // panel show "Unknown artist").
+    const std::string artist_id = trim(
+        (*header)["straplineTextOne"]["runs"].at(0)["navigationEndpoint"]
+            ["browseEndpoint"].str("browseId"));
     std::string year;
     {
         const std::vector<Part> parts = runs_parts((*header)["subtitle"]["runs"]);
@@ -613,6 +644,11 @@ bool album(const std::string &browse_id, std::string &json, std::string &error)
             tracks += ",";
         first = false;
         Row t = row;
+        if (t.artist.empty())
+        {
+            t.artist = artist;
+            t.artist_id = artist_id;
+        }
         if (t.track_number == 0)
             t.track_number = ++number;
         else
@@ -1005,6 +1041,45 @@ bool home(int limit, std::string &json, std::string &error)
     collect_all(reply.root, "musicResponsiveListItemRenderer", renderers);
     std::vector<Row> rows;
     util::append_tracks(renderers, rows, (std::size_t)cap);
+    // Signed-in Home renders "Quick picks", "Listen again" and the community
+    // shelf as musicTwoRowItemRenderer cards whose watchEndpoint carries the
+    // song id (albums there have a browseEndpoint instead, and are skipped).
+    std::vector<const jsonv::Value *> cards;
+    collect_all(reply.root, "musicTwoRowItemRenderer", cards);
+    for (const jsonv::Value *card : cards)
+    {
+        if (rows.size() >= (std::size_t)cap)
+            break;
+        Row t;
+        t.id = (*card)["navigationEndpoint"]["watchEndpoint"].str("videoId");
+        if (t.id.size() != 11)
+            continue;
+        t.title = trim(runs_text((*card)["title"]["runs"]));
+        if (t.title.empty())
+            continue;
+        const std::vector<Part> parts = runs_parts((*card)["subtitle"]["runs"]);
+        for (const Part &p : parts)
+        {
+            if (p.browse_id.rfind("UC", 0) == 0 && t.artist.empty())
+            {
+                t.artist = p.text;
+                t.artist_id = p.browse_id;
+            }
+            else if (t.artist.empty() && !util::is_noise(p.text) &&
+                     p.text != "Song" && p.text != "Video")
+                t.artist = p.text;
+        }
+        t.thumb = util::renderer_thumb(*card);
+        bool dup = false;
+        for (const Row &seen : rows)
+            if (seen.id == t.id)
+            {
+                dup = true;
+                break;
+            }
+        if (!dup)
+            rows.push_back(std::move(t));
+    }
     if (rows.empty())
     {
         finish_trace(reply, "HOME", 0);
@@ -1179,24 +1254,22 @@ std::string search_top(const jsonv::Value &root)
         }
     for (char &c : kind)
         c = (char)std::tolower((unsigned char)c);
-    if (kind == "video")
-        kind = "video";
-    else if (kind == "song")
-        kind = "song";
-    else
-        return {}; // only songs/videos are used as the top card
+    if (kind.empty())
+        return {};
 
     const jsonv::Value &title_run = (*card)["title"]["runs"].at(0);
-    std::string id = title_run["navigationEndpoint"]["watchEndpoint"].str("videoId");
-    if (id.empty())
-        id = (*card)["onTap"]["watchEndpoint"].str("videoId");
-    if (id.empty())
-        return {};
-    std::string artist, artist_id, duration;
+    std::string video_id = title_run["navigationEndpoint"]["watchEndpoint"].str("videoId");
+    std::string browse_id = title_run["navigationEndpoint"]["browseEndpoint"].str("browseId");
+    if (video_id.empty() && browse_id.empty())
+    {
+        video_id = (*card)["onTap"]["watchEndpoint"].str("videoId");
+        browse_id = (*card)["onTap"]["browseEndpoint"].str("browseId");
+    }
+    std::string artist, artist_id, duration, year, subscribers;
     int duration_sec = 0;
     for (const Part &p : parts)
     {
-        if (p.browse_id.rfind("UC", 0) == 0)
+        if (p.browse_id.rfind("UC", 0) == 0 && artist.empty())
         {
             artist = p.text;
             artist_id = p.browse_id;
@@ -1206,15 +1279,32 @@ std::string search_top(const jsonv::Value &root)
             duration = p.text;
             duration_sec = parse_duration(p.text);
         }
+        if (p.text.size() == 4 &&
+            std::all_of(p.text.begin(), p.text.end(),
+                        [](char c) { return c >= '0' && c <= '9'; }))
+            year = p.text;
+        if (p.text.find("audience") != std::string::npos ||
+            p.text.find("subscriber") != std::string::npos)
+            subscribers = p.text;
     }
+    if ((kind == "song" || kind == "video") && video_id.empty())
+        return {};
+    if ((kind == "album" || kind == "artist") && browse_id.empty())
+        return {};
+    const std::string id = video_id.empty() ? browse_id : video_id;
     const std::string thumb = util::renderer_thumb(*card);
+    const bool is_artist = kind == "artist";
+    const bool is_album = kind == "album";
     return "{\"kind\":\"" + kind + "\",\"video\":" +
            (kind == "video" ? "true" : "false") + ",\"id\":\"" + escape(id) +
-           "\",\"title\":\"" + escape(title) + "\",\"artist\":\"" + escape(artist) +
-           "\",\"artist_id\":\"" + escape(artist_id) + "\",\"album\":\"\","
-           "\"album_id\":\"\",\"year\":\"\",\"duration\":\"" + escape(duration) +
-           "\",\"duration_sec\":" + std::to_string(duration_sec) +
-           ",\"subscribers\":\"\",\"thumbnail_url\":\"" + escape(thumb) + "\"}";
+           "\",\"title\":\"" + escape(title) + "\",\"artist\":\"" +
+           escape(is_artist ? title : artist) + "\",\"artist_id\":\"" +
+           escape(is_artist ? id : artist_id) + "\",\"album\":\"" +
+           escape(is_album ? title : "") + "\",\"album_id\":\"" +
+           escape(is_album ? id : "") + "\",\"year\":\"" + escape(year) +
+           "\",\"duration\":\"" + escape(duration) + "\",\"duration_sec\":" +
+           std::to_string(duration_sec) + ",\"subscribers\":\"" +
+           escape(subscribers) + "\",\"thumbnail_url\":\"" + escape(thumb) + "\"}";
 }
 
 bool search_all(const std::string &query, int limit, std::string &json, std::string &error)
@@ -1242,14 +1332,23 @@ bool search_all(const std::string &query, int limit, std::string &json, std::str
         collect_all(reply.root, "musicResponsiveListItemRenderer", renderers);
         for (const jsonv::Value *r : renderers)
         {
-            Row row;
-            if (!util::parse_row(*r, row))
+            const std::string title = trim(runs_text(
+                (*r)["flexColumns"].at(0)["musicResponsiveListItemFlexColumnRenderer"]
+                    ["text"]["runs"]));
+            if (title.empty())
                 continue;
-            const std::string browse =
+            std::string browse =
                 trim((*r)["navigationEndpoint"]["browseEndpoint"].str("browseId"));
             const std::vector<Part> parts = runs_parts(
                 (*r)["flexColumns"].at(1)["musicResponsiveListItemFlexColumnRenderer"]
                     ["text"]["runs"]);
+            const bool is_album_kind =
+                !parts.empty() && (parts[0].text == "Album" || parts[0].text == "Single" ||
+                                   parts[0].text == "EP");
+            const bool is_artist_kind = !parts.empty() && parts[0].text == "Artist";
+            if (browse.empty() || (!is_album_kind && !is_artist_kind))
+                continue;
+            const std::string thumb = util::renderer_thumb(*r);
             if (browse.rfind("MPREb", 0) == 0)
             {
                 if (std::find(seen_albums.begin(), seen_albums.end(), browse) !=
@@ -1270,9 +1369,9 @@ bool search_all(const std::string &query, int limit, std::string &json, std::str
                     albums += ",";
                 first_album = false;
                 albums += "{\"browse_id\":\"" + escape(browse) + "\",\"title\":\"" +
-                          escape(row.title) + "\",\"artist\":\"" + escape(artist) +
+                          escape(title) + "\",\"artist\":\"" + escape(artist) +
                           "\",\"year\":\"" + escape(year) + "\",\"thumbnail_url\":\"" +
-                          escape(row.thumb) + "\",\"track_count\":0}";
+                          escape(thumb) + "\",\"track_count\":0}";
             }
             else if (browse.rfind("UC", 0) == 0)
             {
@@ -1287,8 +1386,8 @@ bool search_all(const std::string &query, int limit, std::string &json, std::str
                     artists += ",";
                 first_artist = false;
                 artists += "{\"browse_id\":\"" + escape(browse) + "\",\"name\":\"" +
-                           escape(row.title) + "\",\"thumbnail_url\":\"" +
-                           escape(row.thumb) + "\",\"subscribers\":\"" +
+                           escape(title) + "\",\"thumbnail_url\":\"" +
+                           escape(thumb) + "\",\"subscribers\":\"" +
                            escape(subscribers) + "\"}";
             }
         }

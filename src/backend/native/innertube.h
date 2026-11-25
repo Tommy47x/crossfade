@@ -84,6 +84,10 @@ void reset_session();
 // the watch-page session's cookies and VISITOR_DATA, opening a session when
 // there is none. Returns false when the watch page could not be fetched.
 bool get_session(std::string &cookies, std::string &visitor, std::string &error);
+// Like get_session but never opens one: returns false when the current
+// watch-page session is missing or stale. Browse/search work anonymously, so
+// they use this to avoid paying for the watch-page fetch.
+bool peek_session(std::string &cookies, std::string &visitor);
 // Append a trace to the shared ring (used by commands that bypass
 // resolve_audio, e.g. browse requests).
 void record_trace(const ResolveTrace &trace);
