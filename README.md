@@ -955,8 +955,9 @@ fail fast in the background.
   (synced first) → lyrics.ovh. The first timestamped result wins; a plain result is kept
   only if nothing synced exists. The chosen payload is translated through Unison's
   auto-detecting endpoint, so even line-only providers carry translations. The data keeps
-  word timings, translations and romanization; the active line uses the word timings when
-  available (line-level providers fall back to even word distribution). The Python backend
+  word timings, translations and romanization; the active line uses the word/syllable
+  timings when the provider has them, otherwise it falls back to the normal line renderer.
+  The Python backend
   still has NetEase/Kugou for the rare miss and is used automatically when the native
   providers find nothing.
 - **Thumbnails** load asynchronously: curl download → stb_image decode → GPU upload on the

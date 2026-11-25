@@ -464,26 +464,7 @@ bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
         for (const LyricWord &w : line.words)
             words.push_back({w.text, w.start_ms / 1000.0, w.end_ms / 1000.0});
     if (words.empty())
-    {
-        std::string cur;
-        for (char c : line.text)
-        {
-            if (c == ' ' || c == '\t')
-            {
-                if (!cur.empty())
-                {
-                    words.push_back({cur, 0.0, 0.0});
-                    cur.clear();
-                }
-            }
-            else
-                cur += c;
-        }
-        if (!cur.empty())
-            words.push_back({cur, 0.0, 0.0});
-    }
-    if (words.empty())
-        return false;
+        return false; // line-only lyrics use the normal line renderer
     const double line_start = line.start_ms / 1000.0;
     double line_end = line.end_ms / 1000.0;
     if (line_end <= line_start && next_start > line_start)
@@ -568,11 +549,6 @@ bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
                 dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(accent, alpha),
                             w.text.c_str());
                 dl->PopClipRect();
-                if (p < 0.999f)
-                    dl->AddRectFilled(
-                        ImVec2(x + word_w * p - ui_px(0.5f), y - size * 0.05f),
-                        ImVec2(x + word_w * p + ui_px(0.5f), y + size * 1.02f),
-                        ui_with_alpha(accent, alpha * 0.22f));
             }
         }
 

@@ -1790,32 +1790,13 @@ bool parse_lyrics_json(const std::string &json, Lyrics &out)
                 word.start_ms = json_get_int(wobj, "s");
                 word.end_ms = json_get_int(wobj, "e");
                 word.text = json_get_string(wobj, "text");
-                if (!word.text.empty())
+                // Only provider-timed words count. Old caches synthesized
+                // words with 0/0 times; treating those as timed made the
+                // per-word renderer run on line-only lyrics.
+                if (!word.text.empty() && (word.start_ms > 0 || word.end_ms > 0))
                     rich.words.push_back(std::move(word));
                 wpos = wend + 1;
             }
-        }
-        if (rich.words.empty())
-        {
-            // Some providers time the line but not its words. Split it here so
-            // the immersive view can still light words (and the docked panel
-            // keeps using the plain string).
-            std::string current;
-            for (char c : rich.text)
-            {
-                if (c == ' ' || c == '\t')
-                {
-                    if (!current.empty())
-                    {
-                        rich.words.push_back({0, 0, std::move(current)});
-                        current.clear();
-                    }
-                }
-                else
-                    current += c;
-            }
-            if (!current.empty())
-                rich.words.push_back({0, 0, std::move(current)});
         }
         out.times.push_back(rich.start_ms / 1000);
         out.lines.push_back(rich.text);
