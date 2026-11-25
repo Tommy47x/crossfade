@@ -446,6 +446,143 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
     }
 }
 
+// Active-line word renderer in the app's own style: the words light up one by
+// one, with no bounce, particles or theme swap. The only extra is a very
+// subtle glow around the letter currently being sung.
+bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
+                    float max_w, const RichLyricLine &line, double t,
+                    double next_start, float alpha)
+{
+    struct W
+    {
+        std::string text;
+        double start;
+        double end;
+    };
+    std::vector<W> words;
+    if (!line.words.empty())
+        for (const LyricWord &w : line.words)
+            words.push_back({w.text, w.start_ms / 1000.0, w.end_ms / 1000.0});
+    if (words.empty())
+    {
+        std::string cur;
+        for (char c : line.text)
+        {
+            if (c == ' ' || c == '\t')
+            {
+                if (!cur.empty())
+                {
+                    words.push_back({cur, 0.0, 0.0});
+                    cur.clear();
+                }
+            }
+            else
+                cur += c;
+        }
+        if (!cur.empty())
+            words.push_back({cur, 0.0, 0.0});
+    }
+    if (words.empty())
+        return false;
+    const double line_start = line.start_ms / 1000.0;
+    double line_end = line.end_ms / 1000.0;
+    if (line_end <= line_start && next_start > line_start)
+        line_end = next_start;
+    if (line_end <= line_start)
+        line_end = line_start + 4.0;
+    if (words.size() > 1 && words.front().start <= 0.0)
+    {
+        double total = 0.0;
+        for (const W &w : words)
+            total += std::max(1, (int)w.text.size());
+        double at = line_start;
+        for (W &w : words)
+        {
+            const double share = (line_end - line_start) *
+                                 (std::max(1, (int)w.text.size()) / total);
+            w.start = at;
+            w.end = at + share;
+            at += share;
+        }
+    }
+    for (std::size_t i = 0; i < words.size(); ++i)
+    {
+        if (words[i].start <= 0.0)
+            words[i].start = line_start;
+        if (words[i].end <= words[i].start)
+            words[i].end = i + 1 < words.size() ? words[i + 1].start
+                                                : words[i].start + 0.4;
+    }
+
+    const float space_w = measure(font, size, " ");
+    std::vector<float> advance;
+    float total_w = 0.0f;
+    for (std::size_t i = 0; i < words.size(); ++i)
+    {
+        const float ww = measure(font, size, words[i].text);
+        const bool has_space = !words[i].text.empty() &&
+                               (words[i].text.back() == ' ' || words[i].text.back() == '\t');
+        const bool needs_gap = !has_space && i + 1 < words.size() &&
+                               line.text.find(' ') != std::string::npos;
+        advance.push_back(ww + (needs_gap ? space_w : 0.0f));
+        total_w += advance.back();
+    }
+    if (total_w > max_w)
+        return false;
+
+    float x = center.x - total_w * 0.5f;
+    const float y = center.y - size * 0.5f;
+    const ImU32 accent = ui_accent_text_u32();
+    const ImU32 dim = ui_text_dim_u32();
+    for (std::size_t wi = 0; wi < words.size(); ++wi)
+    {
+        const W &w = words[wi];
+        const bool sung = t >= w.start;
+        const bool current = t >= w.start && t < w.end;
+        dl->AddText(font, size, ImVec2(x, y),
+                    ui_with_alpha(sung ? accent : dim, alpha), w.text.c_str());
+
+        if (current && !w.text.empty())
+        {
+            // Progress within the word decides the active letter. The glow is
+            // intentionally faint: two offset copies, no halo or particles.
+            const double frac = clampf((float)((t - w.start) / std::max(0.05, w.end - w.start)),
+                                       0.0f, 1.0f);
+            std::string glyphs = w.text;
+            while (!glyphs.empty() && (glyphs.back() == ' ' || glyphs.back() == '\t'))
+                glyphs.pop_back();
+            if (!glyphs.empty())
+            {
+                const int n = std::max(1, count_cp(glyphs));
+                int idx = (int)(frac * n);
+                if (idx >= n)
+                    idx = n - 1;
+                const char *p = glyphs.c_str();
+                const char *end = p + glyphs.size();
+                int cp = 0;
+                while (p < end && cp < idx)
+                {
+                    p = next_cp(p, end);
+                    ++cp;
+                }
+                const char *q = next_cp(p, end);
+                const std::string prefix = glyphs.substr(0, (std::size_t)(p - glyphs.c_str()));
+                const std::string letter = glyphs.substr((std::size_t)(p - glyphs.c_str()),
+                                                         (std::size_t)(q - p));
+                const float lx = x + measure(font, size, prefix);
+                const float o = std::max(0.7f, ui_px(0.8f));
+                const float ga = alpha * 0.105f;
+                dl->AddText(font, size, ImVec2(lx - o, y), ui_with_alpha(accent, ga), letter.c_str());
+                dl->AddText(font, size, ImVec2(lx + o, y), ui_with_alpha(accent, ga), letter.c_str());
+                dl->AddText(font, size, ImVec2(lx, y - o), ui_with_alpha(accent, ga), letter.c_str());
+                dl->AddText(font, size, ImVec2(lx, y + o), ui_with_alpha(accent, ga), letter.c_str());
+            }
+        }
+        x += advance[wi];
+    }
+    return true;
+}
+
 // Artwork-only state: while lyrics are loading (or when a track has none),
 // show the cover, title and artist instead of an empty message. The blurred
 // cover already lives in the backdrop; this is the sharp card on top.
@@ -1140,6 +1277,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
                 const float pitch = active_pref * 1.92f;
                 const float up_floor = std::max(15.0f, active_pref * 0.34f);
+                const double tplay = lyrics_playback_time(state, player) -
+                                     state.settings.lyrics_offset;
                 const int lo = std::max(0, (int)std::floor(g_imm.scroll) - 3);
                 const int hi = std::min((int)lx->lines.size() - 1,
                                         (int)std::ceil(g_imm.scroll) + 3);
@@ -1171,9 +1310,18 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                                          ? cap_lay
                                          : layout_text(font, lx->lines[i], max_text_w, size,
                                                        std::max(13.0f, size * 0.5f));
-                    draw_rows(dl, font, lay, ImVec2(focal.x, focal.y + d * pitch),
-                              is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
-                              alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
+                    bool drew_words = false;
+                    const ImVec2 line_center(focal.x, focal.y + d * pitch);
+                    if (is_active && i < (int)lx->rich.size())
+                        drew_words = draw_words_app(
+                            dl, font, size, line_center, max_text_w, lx->rich[(size_t)i],
+                            tplay,
+                            (i + 1 < (int)lx->times.size()) ? (double)lx->times[i + 1] : 0.0,
+                            alpha);
+                    if (!drew_words)
+                        draw_rows(dl, font, lay, line_center,
+                                  is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
+                                  alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
                 }
             }
         }

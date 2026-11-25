@@ -35,7 +35,7 @@ Uncached tracks resolve in **~120 ms** on a warm session. Playlists, albums, rad
 - **It is genuinely fast.** A warm stream resolve is **111–126 ms** in the native backend. An album opens in **~350 ms**, 50 radio tracks in **~490 ms**, a 182-track playlist in **~1 s**. The first uncached track after a launch pays one ~1 s watch-page request and then stays warm for three hours.
 - **Native, not a browser in a trench coat.** One C++17 binary, SDL2 + OpenGL + Dear ImGui, libmpv for audio. Idle RAM is ~116 MB, not the 300–600 MB an Electron music client can occupy. No bundled Chromium, no Node runtime, no 500 MB of JavaScript.
 - **Offline is the default, not a mode.** Everything you play is cached as it streams. Explicit downloads now use the native resolver too and remux with `ffmpeg` (no yt-dlp JS dance), so an album download survives even when YouTube puts the account into its SABR-only experiment. Verified with the network fully blocked: the cached track still starts.
-- **Lyrics worth leaving on screen.** Word/syllable-timed lyrics from Unison/Better Lyrics (TTML and enhanced LRC), line-timed YouTube Music/LRCLIB/lyrics.ovh as fallback, automatic translations and romanization cached with every line, click-to-seek, and a full-screen immersive view with the album art as its stage. The current view renders line timing; the word-by-word presentation is the next pass. When a track has no lyrics, the takeover shows the cover and artist instead of an empty page.
+- **Lyrics worth leaving on screen.** Word/syllable-timed lyrics from Unison/Better Lyrics (TTML and enhanced LRC), line-timed YouTube Music/LRCLIB/lyrics.ovh as fallback, automatic translations and romanization cached with every line, click-to-seek, and a full-screen immersive view with the album art as its stage. The active line lights word by word from those timings, with a subtle glow on the letter being sung; surrounding lines keep the line-timed view. When a track has no lyrics, the takeover shows the cover and artist instead of an empty page.
 - **Room correction that actually measures your room.** Sweep with your phone, get a per-room correction curve, bind rooms to output devices, and let crossfade apply it in the player's audio chain. No extra driver, no external EQ app.
 - **Your library, actually yours.** Likes, saved albums and artists, playlists, local history, downloads and YouTube account playlists — mirrored locally, with write-back to YouTube Music.
 - **And real crossfade.** Two libmpv players blend tracks into each other — 0–20 s on natural ends, a shorter fade on skips, instant switches for uncached targets.
@@ -955,9 +955,10 @@ fail fast in the background.
   (synced first) → lyrics.ovh. The first timestamped result wins; a plain result is kept
   only if nothing synced exists. The chosen payload is translated through Unison's
   auto-detecting endpoint, so even line-only providers carry translations. The data keeps
-  word timings, translations and romanization for the next immersive pass; the current
-  view still renders line timing. The Python backend still has NetEase/Kugou for the rare
-  miss and is used automatically when the native providers find nothing.
+  word timings, translations and romanization; the active line uses the word timings when
+  available (line-level providers fall back to even word distribution). The Python backend
+  still has NetEase/Kugou for the rare miss and is used automatically when the native
+  providers find nothing.
 - **Thumbnails** load asynchronously: curl download → stb_image decode → GPU upload on the
   main thread, with a 60-second backoff for failed URLs.
 
