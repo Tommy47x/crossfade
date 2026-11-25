@@ -20,8 +20,10 @@ IUSE="webkit"
 RDEPEND="
 	dev-lang/python
 	dev-libs/glib:2
+	dev-libs/openssl:=
 	dev-python/ytmusicapi
 	media-libs/libsdl2
+	media-video/ffmpeg
 	media-video/mpv[libmpv]
 	net-misc/curl
 	net-misc/yt-dlp
