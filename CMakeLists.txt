@@ -60,6 +60,7 @@ target_link_libraries(imgui PUBLIC SDL2::SDL2 OpenGL::GL)
 add_library(crossfade_native STATIC
     src/core/json_value.cpp
     src/backend/native/http.cpp
+    src/backend/native/browse.cpp
     src/backend/native/innertube.cpp
 )
 target_include_directories(crossfade_native PUBLIC

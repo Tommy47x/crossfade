@@ -1,4 +1,5 @@
 #include "ytdlp.h"
+#include "backend/native/browse.h"
 #include "backend/native/innertube.h"
 #include "backend/native/http.h"
 #include "tunables.h"
@@ -3685,6 +3686,190 @@ static bool native_handle_command(const std::string &cmd, std::string &out)
     {
         std::string error;
         if (native::search_artists(arg, 20, out, error))
+            return true;
+    }
+    if (word == "suggest")
+    {
+        std::string error;
+        if (native::suggest(arg, out, error))
+            return true;
+    }
+    if (word == "album" && !arg.empty())
+    {
+        std::string error;
+        if (native::album(arg, out, error))
+            return true;
+    }
+    if (word == "album_of" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::album_of(arg, out, error))
+            return true;
+    }
+    if (word == "artist" && !arg.empty())
+    {
+        std::string error;
+        if (native::artist(arg, out, error))
+            return true;
+    }
+    if (word == "artist_of" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::artist_of(arg, out, error))
+            return true;
+    }
+    if (word == "artist_songs")
+    {
+        std::string id, off, cnt;
+        std::size_t a = arg.find(' ');
+        std::size_t b = a == std::string::npos ? std::string::npos : arg.find(' ', a + 1);
+        if (a != std::string::npos && b != std::string::npos)
+        {
+            id = arg.substr(0, a);
+            off = arg.substr(a + 1, b - a - 1);
+            cnt = arg.substr(b + 1);
+            std::string error;
+            if (!id.empty() &&
+                native::artist_songs(id, std::atoi(off.c_str()), std::atoi(cnt.c_str()), out,
+                                     error))
+                return true;
+        }
+    }
+    if (word == "playlist" && !arg.empty())
+    {
+        std::string error;
+        if (native::playlist(arg, out, error))
+            return true;
+    }
+    if (word == "radio" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::radio(arg, 50, out, error))
+            return true;
+    }
+    if (word == "recommendations")
+    {
+        std::string error;
+        const int limit = arg.empty() ? 40 : std::atoi(arg.c_str());
+        if (native::home(limit, out, error))
+            return true;
+    }
+    if (word == "search_all" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_all(arg, 20, out, error))
+            return true;
+    }
+    if (word == "library_playlists")
+    {
+        std::string error;
+        if (native::library_playlists(out, error))
+            return true;
+    }
+    if (word == "podcasts_library")
+    {
+        std::string error;
+        if (native::podcasts_library(out, error))
+            return true;
+    }
+    if (word == "podcasts_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::podcasts_search(arg, out, error))
+            return true;
+    }
+    if (word == "podcast" && !arg.empty())
+    {
+        std::string error;
+        if (native::podcast(arg, out, error))
+            return true;
+    }
+    if (word == "episodes_later")
+    {
+        std::string error;
+        if (native::episodes_later(out, error))
+            return true;
+    }
+    if (word == "prefetch")
+    {
+        std::vector<std::string> ids;
+        const std::string list = arg;
+        std::size_t pos = 0;
+        while (pos < list.size())
+        {
+            std::size_t end = list.find(' ', pos);
+            if (end == std::string::npos)
+                end = list.size();
+            if (end > pos)
+                ids.push_back(list.substr(pos, end - pos));
+            pos = end + 1;
+        }
+        std::string error;
+        if (!ids.empty() && native::prefetch_urls(ids, out, error))
+            return true;
+    }
+    if (word == "musicvideo" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::musicvideo(arg, out, error))
+            return true;
+    }
+    if (word == "lyrics" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::lyrics(arg, out, error))
+            return true;
+    }
+    if (word == "rate_song")
+    {
+        std::string error;
+        if (native::rate_song(arg, out, error))
+            return true;
+    }
+    if (word == "create_playlist")
+    {
+        std::string error;
+        if (native::create_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "delete_playlist")
+    {
+        std::string error;
+        if (native::delete_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "edit_playlist")
+    {
+        std::string error;
+        if (native::edit_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "add_playlist_items")
+    {
+        std::string error;
+        if (native::add_playlist_items(arg, out, error))
+            return true;
+    }
+    if (word == "remove_playlist_items")
+    {
+        std::string error;
+        if (native::remove_playlist_items(arg, out, error))
+            return true;
+    }
+    if (word == "play_video" || word == "play_video_fast" ||
+        word == "play_video_fresh")
+    {
+        std::string id = arg;
+        int height = 720;
+        const std::size_t sp2 = arg.find(' ');
+        if (sp2 != std::string::npos)
+        {
+            id = arg.substr(0, sp2);
+            height = std::atoi(arg.c_str() + sp2 + 1);
+        }
+        std::string error;
+        if (id.size() == 11 &&
+            native::resolve_video(id, height, word == "play_video_fresh", out, error))
             return true;
     }
     return false;

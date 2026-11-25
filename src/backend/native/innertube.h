@@ -71,8 +71,24 @@ bool search_artists(const std::string &query, int limit, std::string &json,
 // shape. Returns false when the caller should fall back to Python.
 bool fetch_meta(const std::string &video_id, std::string &json, std::string &error);
 
+// Resolve a muxed video + audio pair from the same VISIONOS player reply.
+// Produces {"video":"...","audio":"..."} (audio omitted for progressive
+// formats) matching the Python play_video* reply.
+bool resolve_video(const std::string &video_id, int max_height, bool fresh,
+                   std::string &json, std::string &error);
+
 SessionInfo session_info();
 void reset_session();
+
+// Internal, used by the other native command modules (browse, library):
+// the watch-page session's cookies and VISITOR_DATA, opening a session when
+// there is none. Returns false when the watch page could not be fetched.
+bool get_session(std::string &cookies, std::string &visitor, std::string &error);
+// Append a trace to the shared ring (used by commands that bypass
+// resolve_audio, e.g. browse requests).
+void record_trace(const ResolveTrace &trace);
+// Chrome user agent used for music.youtube.com requests.
+const char *web_user_agent();
 
 // Most recent traces, newest first (bounded).
 std::vector<ResolveTrace> recent_traces();

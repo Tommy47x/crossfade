@@ -81,10 +81,11 @@ void draw_native_backend_panel(AppState &state)
 
     ImGui::PushID("native_backend");
 
-    small_hint("The native resolver talks to YouTube directly: one watch-page "
-               "request to open a session, then the InnerTube player call with the "
-               "JSLess VISIONOS client. No Python, yt-dlp, deno or PoToken is involved. "
-               "Every failure falls back to the Python backend.");
+    small_hint("Every native command talks to YouTube directly: the JSLess VISIONOS "
+               "client for streams, WEB_REMIX for search, browse, radio, lyrics and "
+               "library writes. No Python, yt-dlp, deno or PoToken is involved. Any "
+               "failure falls back to the Python backend, so the log below shows only "
+               "requests the native path answered.");
 
     ImGui::Dummy(ImVec2(0.0f, m.space_2));
 
@@ -116,7 +117,7 @@ void draw_native_backend_panel(AppState &state)
     std::vector<long long> totals, players;
     for (const native::ResolveTrace &t : traces)
     {
-        if (t.error.empty() && !t.status.empty() && t.status == "OK")
+        if (t.error.empty())
             ++ok;
         else
             ++failed;
@@ -186,7 +187,7 @@ void draw_native_backend_panel(AppState &state)
             small_hint("No resolves yet. Play an uncached track.");
         for (const native::ResolveTrace &t : traces)
         {
-            const bool ok_row = t.error.empty() && t.status == "OK";
+            const bool ok_row = t.error.empty();
             ImGui::Text("%s  %-11s  %-6s  %4d  %4d  %-7s  %5lld  %6lld  %5lld  %s",
                         fmt_clock(t.epoch_ms).c_str(), t.video_id.c_str(),
                         t.status.empty() ? "-" : t.status.c_str(), t.itag,

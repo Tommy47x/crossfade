@@ -775,6 +775,117 @@ bool fetch_meta(const std::string &video_id, std::string &json, std::string &err
     return true;
 }
 
+bool resolve_video(const std::string &video_id, int max_height, bool fresh,
+                   std::string &json, std::string &error)
+{
+    if (video_id.size() != 11)
+    {
+        error = "Invalid video id";
+        return false;
+    }
+    if (!http_available())
+    {
+        error = "native backend needs TLS (OpenSSL)";
+        return false;
+    }
+    if (max_height <= 0)
+        max_height = 720;
+    ResolveTrace trace;
+    jsonv::Value root;
+    if (!player_call(video_id, fresh, root, trace))
+    {
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+    if (trace.status != "OK")
+    {
+        trace.error = trace.reason.empty() ? ("playability " + trace.status)
+                                           : trace.reason;
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+
+    const jsonv::Value &adaptive = root["streamingData"]["adaptiveFormats"];
+    std::string video_url, audio_url, video_mime;
+    long long best_height = -1, best_audio = -1;
+    bool best_video_avc = false;
+    int formats = 0;
+    for (std::size_t i = 0; adaptive.is_array() && i < adaptive.size(); ++i)
+    {
+        const jsonv::Value &f = adaptive.at(i);
+        const std::string url = f.str("url");
+        if (url.empty())
+            continue;
+        const std::string mime = f.str("mimeType");
+        if (mime.rfind("video/", 0) == 0)
+        {
+            ++formats;
+            const long long h = f["height"].as_int();
+            const bool avc = mime.find("avc1") != std::string::npos;
+            if (h > max_height)
+                continue;
+            if (h > best_height || (h == best_height && avc && !best_video_avc))
+            {
+                best_height = h;
+                best_video_avc = avc;
+                video_url = url;
+                video_mime = mime;
+                trace.itag = (int)f["itag"].as_int();
+                trace.bitrate = (int)f["bitrate"].as_int();
+            }
+        }
+        else if (mime.rfind("audio/", 0) == 0)
+        {
+            ++trace.audio_formats;
+            const long long rate = f["bitrate"].as_int();
+            if (rate > best_audio)
+            {
+                best_audio = rate;
+                audio_url = url;
+            }
+        }
+    }
+    // Progressive muxed formats (rare on music.youtube.com, common on the
+    // main site) carry both tracks; use one when there is no adaptive video.
+    if (video_url.empty())
+    {
+        const jsonv::Value &progressive = root["streamingData"]["formats"];
+        for (std::size_t i = 0; progressive.is_array() && i < progressive.size(); ++i)
+        {
+            const jsonv::Value &f = progressive.at(i);
+            const std::string url = f.str("url");
+            if (url.empty())
+                continue;
+            const long long h = f["height"].as_int();
+            if (h > 0 && h <= max_height && h > best_height)
+            {
+                best_height = h;
+                video_url = url;
+                video_mime = f.str("mimeType");
+                trace.itag = (int)f["itag"].as_int();
+            }
+        }
+        if (!video_url.empty())
+            audio_url.clear();
+    }
+    trace.formats = formats;
+    if (video_url.empty())
+    {
+        trace.error = "no video format";
+        error = trace.error;
+        record(trace);
+        return false;
+    }
+    json = "{\"video\":\"" + json_escape(video_url) + "\"";
+    if (!audio_url.empty())
+        json += ",\"audio\":\"" + json_escape(audio_url) + "\"";
+    json += "}";
+    record(trace);
+    return true;
+}
+
 SessionInfo session_info()
 {
     std::lock_guard<std::mutex> lock(g_session_mutex);
@@ -806,5 +917,32 @@ std::vector<ResolveTrace> recent_traces()
 {
     std::lock_guard<std::mutex> lock(g_trace_mutex);
     return g_traces;
+}
+
+bool get_session(std::string &cookies, std::string &visitor, std::string &error)
+{
+    if (!session_fresh(g_session))
+    {
+        ResolveTrace trace;
+        if (!refresh_session(trace))
+        {
+            error = trace.error.empty() ? "could not open a YouTube session" : trace.error;
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    cookies = g_session.cookies;
+    visitor = g_session.visitor;
+    return true;
+}
+
+void record_trace(const ResolveTrace &trace)
+{
+    record(trace);
+}
+
+const char *web_user_agent()
+{
+    return kPageUa;
 }
 } // namespace native
