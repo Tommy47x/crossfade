@@ -537,9 +537,9 @@ bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
     for (std::size_t wi = 0; wi < words.size(); ++wi)
     {
         const W &w = words[wi];
-        const bool sung = t >= w.start;
+        const bool past = t >= w.end;
         const bool current = t >= w.start && t < w.end;
-        if (sung)
+        if (past)
         {
             dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(accent, alpha),
                         w.text.c_str());
