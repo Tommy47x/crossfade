@@ -539,8 +539,42 @@ bool draw_words_app(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
         const W &w = words[wi];
         const bool sung = t >= w.start;
         const bool current = t >= w.start && t < w.end;
-        dl->AddText(font, size, ImVec2(x, y),
-                    ui_with_alpha(sung ? accent : dim, alpha), w.text.c_str());
+        if (sung)
+        {
+            dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(accent, alpha),
+                        w.text.c_str());
+        }
+        else if (!current)
+        {
+            dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(dim, alpha),
+                        w.text.c_str());
+        }
+        else
+        {
+            // The word is a karaoke sweep, not a snap: keep the unsung text
+            // dim and reveal the accent fill from left to right.
+            dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(dim, alpha),
+                        w.text.c_str());
+            std::string glyphs = w.text;
+            while (!glyphs.empty() && (glyphs.back() == ' ' || glyphs.back() == '\t'))
+                glyphs.pop_back();
+            const float word_w = measure(font, size, glyphs);
+            const double span = std::max(0.05, w.end - w.start);
+            const float p = clampf((float)((t - w.start) / span), 0.0f, 1.0f);
+            if (!glyphs.empty() && p > 0.001f)
+            {
+                dl->PushClipRect(ImVec2(x, y - size * 0.25f),
+                                 ImVec2(x + word_w * p, y + size * 1.20f), true);
+                dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(accent, alpha),
+                            w.text.c_str());
+                dl->PopClipRect();
+                if (p < 0.999f)
+                    dl->AddRectFilled(
+                        ImVec2(x + word_w * p - ui_px(0.5f), y - size * 0.05f),
+                        ImVec2(x + word_w * p + ui_px(0.5f), y + size * 1.02f),
+                        ui_with_alpha(accent, alpha * 0.22f));
+            }
+        }
 
         if (current && !w.text.empty())
         {
