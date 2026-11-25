@@ -2201,6 +2201,13 @@ std::vector<RawLyricLine> parse_ttml(const std::string &xml)
     std::size_t pos = 0;
     while ((pos = xml.find("<p", pos)) != std::string::npos)
     {
+        // Do not mistake <parameter> or <person> for a lyric paragraph.
+        if (pos + 2 < xml.size() && xml[pos + 2] != ' ' && xml[pos + 2] != '>' &&
+            xml[pos + 2] != '\n' && xml[pos + 2] != '\r' && xml[pos + 2] != '\t')
+        {
+            pos += 2;
+            continue;
+        }
         const std::size_t tag_end = xml.find('>', pos);
         if (tag_end == std::string::npos)
             break;
