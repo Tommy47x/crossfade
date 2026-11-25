@@ -121,7 +121,7 @@ void plot_series(ImDrawList *dl, const ImVec2 &tl, const ImVec2 &br,
 const ImU32 kMeasuredCol = IM_COL32(236, 152, 74, 220); // orange
 const ImU32 kTargetCol = IM_COL32(118, 188, 240, 235);  // sky blue
 
-void draw_response_graph(const roomeq::Status &st)
+void draw_response_graph(const roomeq::Status &st, bool eq_only = false)
 {
     const UiMetrics &m = ui_m();
     const float avail_w = std::max(240.0f * m.layout_scale, ImGui::GetContentRegionAvail().x);
@@ -171,8 +171,9 @@ void draw_response_graph(const roomeq::Status &st)
     }
 
     // Untrusted parts stay visible but faded (a broken line read as "scarce").
-    plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db,
-                ui_overlay_u32(0.12f), 1.2f * m.layout_scale, nullptr);
+    if (!eq_only)
+        plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db,
+                    ui_overlay_u32(0.12f), 1.2f * m.layout_scale, nullptr);
 
     // The EQ's own response, drawn as a filled band around 0 dB. Without it a
     // small correction looks like "nothing happened" because the corrected
@@ -205,10 +206,13 @@ void draw_response_graph(const roomeq::Status &st)
         }
     }
 
-    plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, kMeasuredCol,
-                1.4f * m.layout_scale, &st.valid);
-    plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, kTargetCol,
-                1.2f * m.layout_scale, nullptr, true);
+    if (!eq_only)
+    {
+        plot_series(dl, tl, br, st.hz, st.measured_db, floor_db, ceil_db, kMeasuredCol,
+                    1.4f * m.layout_scale, &st.valid);
+        plot_series(dl, tl, br, st.hz, st.target_db, floor_db, ceil_db, kTargetCol,
+                    1.2f * m.layout_scale, nullptr, true);
+    }
     plot_series(dl, tl, br, st.hz, st.corrected_db, floor_db, ceil_db, ui_accent_u32(0.95f),
                 2.1f * m.layout_scale, &st.valid);
 
@@ -234,11 +238,17 @@ void draw_response_graph(const roomeq::Status &st)
         p.x += sample_w + 6.0f * m.layout_scale + ImGui::CalcTextSize(label).x +
                18.0f * m.layout_scale;
     };
-    legend("measured", kMeasuredCol, false);
-    legend("target", kTargetCol, true);
-    legend("corrected", ui_accent_u32(0.95f), false);
+    if (eq_only)
+        legend("applied EQ", ui_accent_u32(0.95f), false);
+    else
+    {
+        legend("measured", kMeasuredCol, false);
+        legend("target", kTargetCol, true);
+        legend("corrected", ui_accent_u32(0.95f), false);
+    }
 
     // Correction fill swatch + trusted range.
+    if (!eq_only)
     {
         const float y = p.y + line_h * 0.5f;
         const float x0 = p.x;
@@ -314,6 +324,32 @@ const char *mic_name(const std::string &id)
     if (id == "custom")
         return "imported .cal file";
     return "flat (calibrated mic)";
+}
+
+// Corrections applied before the curves were persisted only have their EQ
+// bands. Plot the summed response so the page still shows the calibrated
+// correction instead of going blank after a restart.
+void draw_applied_response_graph(const Settings &st)
+{
+    roomeq::Status s;
+    dsp::Grid grid;
+    grid.build();
+    std::vector<dsp::Band> bands;
+    bands.reserve(st.room_eq_bands.size());
+    for (const EqBand &b : st.room_eq_bands)
+        bands.push_back({(double)b.freq, (double)b.gain, (double)b.q});
+    s.hz = grid.hz;
+    s.corrected_db = dsp::response_db(grid, 48000, bands);
+    if (s.corrected_db.size() != s.hz.size())
+        return;
+    s.measured_db.assign(s.hz.size(), 0.0);
+    s.target_db.assign(s.hz.size(), 0.0);
+    s.valid.assign(s.hz.size(), 1);
+    s.bands = bands;
+    s.residual_after_db = st.room_eq_residual_db;
+    s.max_bands = st.room_eq_max_bands;
+    s.mic = st.room_eq_mic;
+    draw_response_graph(s, true);
 }
 } // namespace
 
@@ -645,6 +681,15 @@ void draw_room_eq_panel(AppState &state)
         }
         else
         {
+            if (!st.room_eq_bands.empty())
+            {
+                ImGui::SeparatorText("Applied correction");
+                draw_applied_response_graph(st);
+                room_help("This is the EQ response of the applied correction. The measured "
+                          "and target curves are stored for new calibrations; calibrate "
+                          "again to see the full room response.");
+                room_gap(0.6f);
+            }
             if (status.stage == roomeq::Stage::Error && !status.message.empty())
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.48f, 0.48f, 1.0f));
