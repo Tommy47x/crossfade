@@ -216,6 +216,7 @@ struct ImmersiveAnim
     float scroll = -1.0f;
     double active_since = 0.0;
     double view_start = 0.0;
+    double switch_start = -100.0;
     float enter = 0.0f;
     float pulse = 0.0f;
     bool exiting = false;
@@ -608,7 +609,9 @@ void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
     const float rounding = std::max(8.0f, art * 0.035f);
     dl->AddRectFilled(ImVec2(p0.x + 8.0f, p0.y + 14.0f), ImVec2(p1.x + 8.0f, p1.y + 14.0f),
                       ui_with_alpha(IM_COL32(0, 0, 0, 255), 0.30f * alpha), rounding);
-    TextureInfo ti = texture_info(display.thumbnail_url);
+    TextureInfo ti = texture_info(texture_highres_url(display.thumbnail_url, display.id));
+    if (ti.id == 0)
+        ti = texture_info(display.thumbnail_url);
     if (ti.id != 0)
     {
         float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -655,7 +658,9 @@ void draw_cover_column(ImDrawList *dl, const Track &display, ImVec2 centre,
     const float rounding = std::max(8.0f, art * 0.035f);
     dl->AddRectFilled(ImVec2(p0.x + 10.0f, p0.y + 18.0f), ImVec2(p1.x + 10.0f, p1.y + 18.0f),
                       ui_with_alpha(IM_COL32(0, 0, 0, 255), 0.34f * alpha), rounding);
-    TextureInfo ti = texture_info(display.thumbnail_url);
+    TextureInfo ti = texture_info(texture_highres_url(display.thumbnail_url, display.id));
+    if (ti.id == 0)
+        ti = texture_info(display.thumbnail_url);
     if (ti.id != 0)
     {
         float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -850,8 +855,18 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
         if (g_imm.track != display.id)
         {
+            const bool had_track = !g_imm.track.empty();
             g_imm.track = display.id;
-            g_imm.enter = motion ? 0.0f : 1.0f;
+            if (had_track)
+            {
+                // Songs change while the takeover stays open. Keep the view
+                // fully opaque and mask the hand-off for a moment instead of
+                // fading the whole takeover through the app behind it.
+                g_imm.enter = 1.0f;
+                g_imm.switch_start = now;
+            }
+            else
+                g_imm.enter = motion ? 0.0f : 1.0f;
             g_imm.view_start = now;
             g_imm.active = -2;
             g_imm.scroll = -1.0f;
@@ -869,6 +884,17 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (!motion)
             g_imm.enter = 1.0f;
         const float view_a = ease_out(g_imm.enter) * exit_a;
+        float switch_a = 0.0f;
+        if (motion && g_imm.switch_start > 0.0)
+        {
+            const double age = now - g_imm.switch_start;
+            const double dur = 0.50;
+            if (age < dur)
+            {
+                switch_a = 1.0f - ease_out((float)(age / dur));
+                animating = true;
+            }
+        }
 
         // Seek target survives the chrome fading out mid-drag.
         static float s_seek = -1.0f;
@@ -939,10 +965,18 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         // card's 128px one, which looks blocky when stretched over a window.
         if (!display.thumbnail_url.empty())
         {
-            ui_immersive_blur_request(display.thumbnail_url);
-            const GLuint blur = ui_immersive_blur_texture(display.thumbnail_url);
+            const std::string hi = texture_highres_url(display.thumbnail_url, display.id);
+            ui_immersive_blur_request(hi);
+            GLuint blur = ui_immersive_blur_texture(hi);
             int bw = 0, bh = 0;
-            if (blur != 0 && ui_immersive_blur_size(display.thumbnail_url, bw, bh))
+            bool have_blur = blur != 0 && ui_immersive_blur_size(hi, bw, bh);
+            if (!have_blur && hi != display.thumbnail_url)
+            {
+                ui_immersive_blur_request(display.thumbnail_url);
+                blur = ui_immersive_blur_texture(display.thumbnail_url);
+                have_blur = blur != 0 && ui_immersive_blur_size(display.thumbnail_url, bw, bh);
+            }
+            if (have_blur)
             {
                 float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
                 const TextureInfo info{blur, bw, bh};
@@ -1551,6 +1585,10 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             ui_audio_stop();
             g_imm.exiting = false;
         }
+
+        if (switch_a > 0.001f)
+            dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h),
+                              ui_with_alpha(ui_col(ui_c().bg), switch_a * view_a));
 
         if (animating)
         {

@@ -543,6 +543,49 @@ static bool enqueue_texture_load(const std::string &url)
 // -----------------------------------------------------------------------
 // Public functions
 // -----------------------------------------------------------------------
+std::string texture_highres_url(const std::string &url, const std::string &video_id)
+{
+    if (url.empty())
+    {
+        if (video_id.size() == 11)
+            return "https://i.ytimg.com/vi/" + video_id + "/maxresdefault.jpg";
+        return url;
+    }
+    // i.ytimg.com/vi/<id>/hqdefault.jpg -> maxresdefault.jpg
+    std::size_t at = std::string::npos;
+    const std::size_t vi = url.find("/vi/");
+    const std::size_t vw = url.find("/vi_webp/");
+    if (vi != std::string::npos)
+        at = vi + 4;
+    else if (vw != std::string::npos)
+        at = vw + 9;
+    if (at != std::string::npos)
+    {
+        const std::size_t slash = url.find('/', at);
+        if (slash != std::string::npos)
+        {
+            const std::string id = url.substr(at, slash - at);
+            if (id.size() == 11)
+                return "https://i.ytimg.com/vi/" + id + "/maxresdefault.jpg";
+        }
+    }
+    // Google album art with a =w60-h60 / =s192 size suffix.
+    if (url.find("googleusercontent.com") != std::string::npos ||
+        url.find("ggpht.com") != std::string::npos)
+    {
+        const std::size_t eq = url.rfind('=');
+        if (eq != std::string::npos && eq + 1 < url.size())
+        {
+            const char c = url[eq + 1];
+            if (c == 'w' || c == 'h')
+                return url.substr(0, eq) + "=w1080-h1080";
+            if (c == 's')
+                return url.substr(0, eq) + "=s1080";
+        }
+    }
+    return url;
+}
+
 TextureInfo texture_info(const std::string &url)
 {
     TextureInfo info;

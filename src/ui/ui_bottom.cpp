@@ -516,7 +516,10 @@ void draw_bottom_bar(AppState &state, MpvPlayer &player)
             return;
         const ImVec2 pmin(art_min.x, art_min.y + y_offset);
         const ImVec2 pmax(art_max.x, art_max.y + y_offset);
-        TextureInfo ti = url.empty() ? TextureInfo{} : texture_info(url);
+        TextureInfo ti = url.empty() ? TextureInfo{}
+                                     : texture_info(texture_highres_url(url));
+        if (ti.id == 0 && !url.empty())
+            ti = texture_info(url);
         if (ti.id)
         {
             float u0, v0, u1, v1;

@@ -27,6 +27,13 @@ struct TextureColor
     bool valid = false;
 };
 
+// Best-effort high-resolution version of a YouTube thumbnail URL: maxres for
+// i.ytimg.com, 1080px for googleusercontent album art. Returns the original
+// when it cannot be upgraded. Callers should fall back to the original if the
+// high-res texture does not exist.
+std::string texture_highres_url(const std::string &url,
+                                const std::string &video_id = std::string());
+
 // Returns id + pixel dimensions for a URL, kicking off a background load
 // if it isn't cached yet. id == 0 while loading / after a failed fetch.
 TextureInfo texture_info(const std::string &url);
