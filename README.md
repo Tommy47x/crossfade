@@ -128,10 +128,10 @@ native C++ client: it draws its own interface and hands audio to libmpv.
 **Credit where it is due:** [ytm-rs](https://github.com/grapedjuice/ytm-rs) is the other
 native YouTube Music client, and the reason this backend exists. Its work with the
 `visionOS` player showed that plain stream URLs were possible without a browser, a JS
-runtime or a signature puzzle. crossfade applies the same idea in C++ and adds a different
-set of things — two-player crossfade, phone-measured room correction, a LAN party queue and
-a native browse/lyrics/podcast layer with a Python fallback. It is also excellent; if you
-prefer Rust/egui, use it. If you want the feature set above, use crossfade.
+runtime or a signature puzzle. It is excellent — Rust/egui, karaoke-style lyrics, themes,
+jams, downloads and crossfade. crossfade is a different stack with a different set of
+extras: phone-measured room correction, a LAN party queue, a native browse/lyrics/podcast
+layer and a Python fallback. Try both; use the one that fits you.
 
 ## Common questions
 
@@ -143,11 +143,11 @@ One-time, about 30 seconds: import your browser session with `crossfade-login`. 
 
 **How is this different from ytm-rs?**
 ytm-rs is a great native client and the direct inspiration for this backend: it showed the
-`visionOS` player could hand back plain URLs. ytm-rs is Rust/egui, with karaoke-style
-word-by-word lyrics, themes and jams. crossfade is C++/ImGui, with real two-player
-crossfade, phone-measured room EQ, a native browse/lyrics/podcast layer and a Python
-backend as a permanent fallback. Different stacks, different feature sets — use the one
-that fits you.
+`visionOS` player could hand back plain URLs. It is Rust/egui, with karaoke-style
+word-by-word lyrics, themes, jams, downloads and crossfade. crossfade is C++/ImGui and
+focuses on phone-measured room correction, a LAN party queue, a native browse/lyrics/
+podcast layer and a Python backend as a permanent fallback. Different stacks and different
+extras — use the one that fits you.
 
 **Is this allowed?**
 It talks to YouTube Music with your own account, using the same public web endpoints the site uses. Not affiliated with or endorsed by Google. GPL-3.0. No telemetry, no server; requests go to YouTube and nowhere else.
