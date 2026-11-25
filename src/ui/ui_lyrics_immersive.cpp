@@ -229,6 +229,7 @@ struct ImmersiveAnim
     double switch_start = -100.0;
     Track prev_display;
     Track current_display;
+    float unsynced_scroll = 0.0f;
     float enter = 0.0f;
     float pulse = 0.0f;
     bool exiting = false;
@@ -866,6 +867,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const Track display = lyrics_display_track(state);
         auto snap = std::atomic_load(&state.lyrics);
         const bool has_payload = snap && snap->track_id == display.id;
+        const bool no_lyrics_only =
+            has_payload && (snap->lyrics.none || snap->lyrics.lines.empty());
 
         if (g_imm.track != display.id)
         {
@@ -889,6 +892,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.prev_text.clear();
             g_imm.prev_size = 0.0f;
             g_imm.prev_since = -100.0;
+            g_imm.unsynced_scroll = 0.0f;
         }
         g_imm.current_display = display;
 
@@ -1164,7 +1168,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                           96, ui_px(1.5f));
         }
 
-        if (split && !display.id.empty())
+        if (split && !display.id.empty() && !no_lyrics_only)
         {
             if (transitioning)
             {
@@ -1217,30 +1221,40 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
         if (draw_cover)
         {
-            if (!split)
+            const bool centered_cover = !split || no_lyrics_only;
+            const ImVec2 cover_centre = no_lyrics_only && split
+                                            ? ImVec2(w * 0.5f, focal.y)
+                                            : focal;
+            if (centered_cover)
             {
                 if (transitioning)
                 {
-                    draw_cover_card(dl, g_imm.prev_display, focal, w, h,
+                    draw_cover_card(dl, g_imm.prev_display, cover_centre, w, h,
                                     view_a, -h * switch_p);
-                    draw_cover_card(dl, display, focal, w, h, view_a,
+                    draw_cover_card(dl, display, cover_centre, w, h, view_a,
                                     h * (1.0f - switch_p));
                 }
                 else
-                    draw_cover_card(dl, display, focal, w, h, view_a);
+                    draw_cover_card(dl, display, cover_centre, w, h, view_a);
             }
             if (!note.empty())
             {
                 const float ns = std::max(12.0f, std::min(16.0f, h * 0.016f));
                 const float nw = measure(g_ui_fonts.body, ns, note);
+                const ImVec2 note_centre = centered_cover
+                                               ? ImVec2(w * 0.5f, focal.y)
+                                               : focal;
                 dl->AddText(g_ui_fonts.body, ns,
-                            ImVec2(focal.x - nw * 0.5f,
-                                   focal.y + (split ? 0.0f : std::min(w, h) * 0.33f)),
+                            ImVec2(note_centre.x - nw * 0.5f,
+                                   note_centre.y +
+                                       (centered_cover ? std::min(w, h) * 0.33f : 0.0f)),
                             ui_with_alpha(ui_text_dim_u32(), 0.62f * view_a), note.c_str());
             }
             if (state.lyrics_loading.load() && motion)
             {
-                const float dot_y = focal.y + (split ? ui_px(32.0f) : std::min(w, h) * 0.37f);
+                const float dot_y = (split && !no_lyrics_only)
+                                        ? focal.y + ui_px(32.0f)
+                                        : focal.y + std::min(w, h) * 0.37f;
                 for (int i = 0; i < 3; ++i)
                 {
                     const float ph = (float)now * 2.6f - (float)i * 0.6f;
@@ -1298,14 +1312,19 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
             const float line_h = size * 1.26f;
             const bool overflow = total_h > avail_h;
-            float scroll = 0.0f;
-            if (overflow && motion)
+            const float max_scroll = overflow ? std::max(0.0f, total_h - avail_h) : 0.0f;
+            g_imm.unsynced_scroll = clampf(g_imm.unsynced_scroll, 0.0f, max_scroll);
+            // Unsynced lyrics are read at the listener's pace. No timer scroll:
+            // the wheel moves the block, and a change of track resets it.
+            if (overflow && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                io.MouseWheel != 0.0f)
             {
-                const float speed = std::max(12.0f, h * 0.018f);
-                scroll = std::min((float)(now - g_imm.view_start) * speed,
-                                  total_h - avail_h + ui_px(40.0f));
+                g_imm.unsynced_scroll = clampf(
+                    g_imm.unsynced_scroll - io.MouseWheel * ui_px(64.0f), 0.0f,
+                    max_scroll);
                 animating = true;
             }
+            const float scroll = g_imm.unsynced_scroll;
 
             float y = overflow ? (pad - scroll) : (h - total_h) * 0.5f;
             const float edge = std::max(ui_px(42.0f), h * 0.09f);
