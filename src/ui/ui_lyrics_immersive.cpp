@@ -665,6 +665,57 @@ void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
     }
 }
 
+// The split layout's cover column (the default immersive theme puts the cover
+// on the left with the title/artist beneath it, lyrics on the right).
+void draw_cover_column(ImDrawList *dl, const Track &display, ImVec2 centre,
+                       float col_w, float h, float alpha, float glow)
+{
+    if (alpha <= 0.003f)
+        return;
+    const float art = std::min(std::min(col_w * 0.86f, h * 0.56f), 560.0f);
+    const float x = centre.x - art * 0.5f;
+    const float y = centre.y - art * 0.55f;
+    const ImVec2 p0(x, y), p1(x + art, y + art);
+    const float rounding = std::max(8.0f, art * 0.035f);
+    dl->AddRectFilled(ImVec2(p0.x + 10.0f, p0.y + 18.0f), ImVec2(p1.x + 10.0f, p1.y + 18.0f),
+                      ui_with_alpha(IM_COL32(0, 0, 0, 255), 0.34f * alpha), rounding);
+    TextureInfo ti = texture_info(display.thumbnail_url);
+    if (ti.id != 0)
+    {
+        float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+        if (cover_uv(ti, art, art, u0, v0, u1, v1))
+            dl->AddImageRounded((ImTextureID)(intptr_t)ti.id, p0, p1, ImVec2(u0, v0),
+                                ImVec2(u1, v1), ui_with_alpha(IM_COL32_WHITE, alpha),
+                                rounding);
+    }
+    else
+    {
+        dl->AddRectFilled(p0, p1, ui_with_alpha(ui_accent_u32(0.22f), alpha), rounding);
+        dl->AddRect(p0, p1, ui_with_alpha(ui_accent_u32(0.35f), alpha), rounding, 0, 1.0f);
+    }
+    if (glow > 0.01f)
+        dl->AddRect(p0, p1, ui_with_alpha(ui_accent_u32(0.22f * glow), alpha), rounding, 0,
+                    std::max(1.0f, ui_px(1.0f)));
+
+    float ty = p1.y + std::max(20.0f, art * 0.065f);
+    const float title_size = std::max(22.0f, std::min(36.0f, art * 0.085f));
+    const std::string title = ui_ellipsize(g_ui_fonts.semibold, title_size,
+                                           display.title.empty() ? "Nothing playing" : display.title,
+                                           col_w * 0.92f);
+    const float tw = measure(g_ui_fonts.semibold, title_size, title);
+    dl->AddText(g_ui_fonts.semibold, title_size, ImVec2(centre.x - tw * 0.5f, ty),
+                ui_with_alpha(ui_text_u32(), 0.94f * alpha), title.c_str());
+    ty += title_size * 1.35f;
+    if (!display.artist.empty())
+    {
+        const float as = std::max(14.0f, title_size * 0.52f);
+        const std::string ar = ui_ellipsize(g_ui_fonts.body, as, display.artist, col_w * 0.88f);
+        const float aw = measure(g_ui_fonts.body, as, ar);
+        dl->AddText(g_ui_fonts.body, as, ImVec2(centre.x - aw * 0.5f, ty),
+                    ui_with_alpha(ui_text_dim_u32(), 0.80f * alpha), ar.c_str());
+    }
+}
+
 bool draw_transport_button(AppState &state, const char *id, UiIcon icon, ImVec2 centre,
                            float size, bool primary, float alpha, const char *tip)
 {
@@ -811,9 +862,15 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const float exit_a = g_imm.exiting ? (1.0f - ease_out(g_imm.exit)) : 1.0f;
 
         const float pad = std::max(ui_px(24.0f), std::min(w, h) * 0.045f);
-        const float max_text_w = std::min(w - pad * 2.0f, w * 0.84f);
+        // The default immersive layout is split: cover column on the left,
+        // lyrics on the right. Narrow windows keep the lyrics full width.
+        const bool split = w >= 1080.0f && w > h * 0.90f;
+        const float cover_col_w = split ? w * 0.40f : 0.0f;
+        const float lyrics_x = split ? cover_col_w : 0.0f;
+        const float lyrics_w = split ? w - cover_col_w : w;
+        const float max_text_w = std::min(lyrics_w - pad * 2.0f, lyrics_w * 0.90f);
         const float focal_y = h * 0.455f;
-        const ImVec2 focal(w * 0.5f, focal_y);
+        const ImVec2 focal(lyrics_x + lyrics_w * 0.5f, focal_y);
 
         // ---- Resolve the track + payload, exactly like the docked panel ----
         const Track display = lyrics_display_track(state);
@@ -1070,6 +1127,10 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                           96, ui_px(1.5f));
         }
 
+        if (split && !display.id.empty())
+            draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
+                              cover_col_w, h, view_a, g_imm.pulse);
+
         // ---- Lyrics ----
         ImFont *font = g_ui_fonts.semibold;
         const float active_pref = clampf(h * 0.075f * m.text_scale, 30.0f,
@@ -1107,18 +1168,20 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
         if (draw_cover)
         {
-            draw_cover_card(dl, display, focal, w, h, view_a, g_imm.pulse);
+            if (!split)
+                draw_cover_card(dl, display, focal, w, h, view_a, g_imm.pulse);
             if (!note.empty())
             {
                 const float ns = std::max(12.0f, std::min(16.0f, h * 0.016f));
                 const float nw = measure(g_ui_fonts.body, ns, note);
                 dl->AddText(g_ui_fonts.body, ns,
-                            ImVec2(focal.x - nw * 0.5f, focal.y + std::min(w, h) * 0.33f),
+                            ImVec2(focal.x - nw * 0.5f,
+                                   focal.y + (split ? 0.0f : std::min(w, h) * 0.33f)),
                             ui_with_alpha(ui_text_dim_u32(), 0.62f * view_a), note.c_str());
             }
             if (state.lyrics_loading.load() && motion)
             {
-                const float dot_y = focal.y + std::min(w, h) * 0.37f;
+                const float dot_y = focal.y + (split ? ui_px(32.0f) : std::min(w, h) * 0.37f);
                 for (int i = 0; i < 3; ++i)
                 {
                     const float ph = (float)now * 2.6f - (float)i * 0.6f;
