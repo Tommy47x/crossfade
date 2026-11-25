@@ -1158,12 +1158,14 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         {
             if (transitioning)
             {
+                // No opacity fade: the two covers travel as one vertical strip.
+                // The outgoing card leaves the top, the incoming one arrives
+                // from the bottom into exactly the same place.
                 draw_cover_column(dl, g_imm.prev_display,
                                   ImVec2(cover_col_w * 0.5f, h * 0.43f), cover_col_w, h,
-                                  view_a * (1.0f - switch_p), -h * 0.12f * switch_p);
+                                  view_a, -h * switch_p);
                 draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
-                                  cover_col_w, h, view_a * switch_p,
-                                  h * 0.12f * (1.0f - switch_p));
+                                  cover_col_w, h, view_a, h * (1.0f - switch_p));
             }
             else
                 draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
@@ -1210,9 +1212,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 if (transitioning)
                 {
                     draw_cover_card(dl, g_imm.prev_display, focal, w, h,
-                                    view_a * (1.0f - switch_p), -h * 0.10f * switch_p);
-                    draw_cover_card(dl, display, focal, w, h, view_a * switch_p,
-                                    h * 0.10f * (1.0f - switch_p));
+                                    view_a, -h * switch_p);
+                    draw_cover_card(dl, display, focal, w, h, view_a,
+                                    h * (1.0f - switch_p));
                 }
                 else
                     draw_cover_card(dl, display, focal, w, h, view_a);
