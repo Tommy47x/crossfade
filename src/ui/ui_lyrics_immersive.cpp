@@ -239,6 +239,20 @@ struct ImmersiveAnim
     ImVec2 last_mouse = ImVec2(-1.0f, -1.0f);
     float chrome = 1.0f;
     bool chrome_init = false;
+    struct Spark
+    {
+        ImVec2 pos;
+        ImVec2 vel;
+        double born;
+        double life;
+        float size;
+        ImU32 col;
+    };
+    std::vector<Spark> sparks;
+    long long spark_key = -1;
+    long long last_spark_key = -1;
+    ImVec2 spark_pos = ImVec2(0, 0);
+    float spark_size = 12.0f;
 };
 
 // Soft radial bloom used to carry the app's album-colour backdrop into the
@@ -462,7 +476,7 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
 // too wide to lay out on one row (the caller falls back to the wrapped wipe).
 bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
                      float max_w, const RichLyricLine &line, double t,
-                     double next_start, float alpha, float glow, bool focus)
+                     double next_start, double now, float alpha, float glow, bool focus)
 {
     struct W
     {
@@ -529,9 +543,20 @@ bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
                                                 : std::max(line_start + 0.4, words[i].start + 0.4);
     }
 
+    const float space_w = measure(font, size, " ");
+    std::vector<float> advance;
+    advance.reserve(words.size());
     float total_w = 0.0f;
-    for (const W &w : words)
-        total_w += measure(font, size, w.text);
+    for (std::size_t i = 0; i < words.size(); ++i)
+    {
+        const float ww = measure(font, size, words[i].text);
+        const bool has_space = !words[i].text.empty() &&
+                               (words[i].text.back() == ' ' || words[i].text.back() == '\t');
+        const bool needs_gap = !has_space && i + 1 < words.size() &&
+                               line.text.find(' ') != std::string::npos;
+        advance.push_back(ww + (needs_gap ? space_w : 0.0f));
+        total_w += advance.back();
+    }
     if (total_w > max_w)
         return false;
 
@@ -541,31 +566,47 @@ bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
                                           alpha * 0.96f);
     const ImU32 future_col = ui_with_alpha(ui_text_dim_u32(), alpha * 0.72f);
     const ImU32 glow_col = g_lyric_glow ? g_lyric_glow : ui_accent_text_u32();
-    for (const W &w : words)
+    for (std::size_t wi = 0; wi < words.size(); ++wi)
     {
+        const W &w = words[wi];
         const bool past = focus && t >= w.end;
         const bool current = focus && !past && t >= w.start;
         float draw_size = size;
         float dy = 0.0f;
-        if (current)
+        // A gentle per-letter wave across the line; the current word also
+        // bounces on its own start, like the Better Lyrics themes.
+        if (focus)
         {
-            draw_size = size * 1.035f;
-            dy = -size * 0.015f;
+            dy += std::sin((float)now * 2.4f + x * 0.018f) * size * 0.022f;
+            if (current)
+            {
+                draw_size = size * 1.055f;
+                dy += std::sin((float)(now - w.start) * 10.0f) * size * 0.030f;
+                g_imm.spark_key = (long long)line.start_ms * 1000 + (long long)wi;
+                const float ww = measure(font, size, w.text);
+                g_imm.spark_pos = ImVec2(x + ww * 0.5f, y + size * 0.55f);
+                g_imm.spark_size = size;
+            }
         }
         const ImU32 col = !focus ? future_col
                                  : (past ? sung_col
                                          : (current ? ui_with_alpha(sung_col, alpha) : future_col));
         if (current && glow > 0.01f)
         {
-            const float o = (1.2f + 1.6f * glow) * std::max(1.0f, size / 36.0f);
-            const float a = alpha * 0.10f * glow;
+            const ImVec4 ac = ImGui::ColorConvertU32ToFloat4(g_lyric_accent ? g_lyric_accent
+                                                                            : ui_accent_u32(1.0f));
+            soft_glow(dl, ImVec2(x + measure(font, size, w.text) * 0.5f,
+                                 y + draw_size * 0.55f),
+                      draw_size * 1.55f, ac, alpha * 0.20f * glow);
+            const float o = (1.2f + 2.2f * glow) * std::max(1.0f, size / 36.0f);
+            const float a = alpha * 0.16f * glow;
             dl->AddText(font, draw_size, ImVec2(x - o, y + dy), ui_with_alpha(glow_col, a), w.text.c_str());
             dl->AddText(font, draw_size, ImVec2(x + o, y + dy), ui_with_alpha(glow_col, a), w.text.c_str());
             dl->AddText(font, draw_size, ImVec2(x, y + dy - o), ui_with_alpha(glow_col, a), w.text.c_str());
             dl->AddText(font, draw_size, ImVec2(x, y + dy + o), ui_with_alpha(glow_col, a), w.text.c_str());
         }
         dl->AddText(font, draw_size, ImVec2(x, y + dy), col, w.text.c_str());
-        x += measure(font, size, w.text);
+        x += advance[wi];
     }
 
     // Translation and romanization, dim and smaller under the line.
@@ -613,6 +654,52 @@ void draw_translation(ImDrawList *dl, const RichLyricLine &line, ImVec2 center,
                     ui_with_alpha(ui_text_dim_u32(), alpha * 0.48f),
                     line.romanization.c_str());
     }
+}
+
+// Small sparks launched when a new word starts. Cheap point sprites, but they
+// give the same "the lyric is alive" feel as the Better Lyrics themes.
+void update_sparks(ImDrawList *dl, double now, double dt, float view_a, bool motion)
+{
+    if (!motion)
+    {
+        g_imm.sparks.clear();
+        return;
+    }
+    if (g_imm.spark_key >= 0 && g_imm.spark_key != g_imm.last_spark_key)
+    {
+        g_imm.last_spark_key = g_imm.spark_key;
+        const float base = std::max(9.0f, g_imm.spark_size * 0.65f);
+        for (int i = 0; i < 12; ++i)
+        {
+            const float ang = (float)(bg_rand() % 6283u) / 1000.0f;
+            const float speed = base * (0.35f + (float)(bg_rand() % 1000u) / 1000.0f);
+            ImmersiveAnim::Spark sp;
+            sp.pos = g_imm.spark_pos;
+            sp.vel = ImVec2(std::cos(ang) * speed * 0.75f,
+                            std::sin(ang) * speed * 0.55f - base * 0.35f);
+            sp.born = now;
+            sp.life = 0.45 + (double)(bg_rand() % 700u) / 1000.0;
+            sp.size = std::max(1.0f, base * (0.035f + (float)(bg_rand() % 60u) / 1000.0f));
+            sp.col = g_lyric_accent ? g_lyric_accent : ui_accent_text_u32();
+            g_imm.sparks.push_back(sp);
+        }
+    }
+    for (ImmersiveAnim::Spark &sp : g_imm.sparks)
+    {
+        sp.pos.x += sp.vel.x * (float)dt;
+        sp.pos.y += sp.vel.y * (float)dt;
+        sp.vel.y -= 34.0f * (float)dt;
+        const double age = now - sp.born;
+        if (age < 0.0 || age >= sp.life)
+            continue;
+        const float t = (float)(age / sp.life);
+        const float a = (1.0f - t) * (1.0f - t) * 0.75f * view_a;
+        dl->AddCircleFilled(sp.pos, sp.size * (1.0f - 0.5f * t), ui_with_alpha(sp.col, a), 8);
+    }
+    g_imm.sparks.erase(
+        std::remove_if(g_imm.sparks.begin(), g_imm.sparks.end(),
+                       [now](const ImmersiveAnim::Spark &sp) { return now - sp.born >= sp.life; }),
+        g_imm.sparks.end());
 }
 
 void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
@@ -890,6 +977,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.prev_text.clear();
             g_imm.prev_size = 0.0f;
             g_imm.prev_since = -100.0;
+            g_imm.sparks.clear();
+            g_imm.spark_key = -1;
+            g_imm.last_spark_key = -1;
         }
 
         if (motion && g_imm.enter < 1.0f)
@@ -1418,7 +1508,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                             drew_words = draw_word_lyric(
                                 dl, font, size, line_center, max_text_w, rich, tplay,
                                 (i + 1 < (int)lx->times.size()) ? (double)lx->times[i + 1] : 0.0,
-                                alpha, is_active ? 1.0f : 0.0f, is_active);
+                                now, alpha, is_active ? 1.0f : 0.0f, is_active);
                     }
                     if (!drew_words)
                     {
@@ -1435,6 +1525,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 }
             }
         }
+
+        update_sparks(dl, now, dt, view_a, motion);
 
         // ---- Auto-hiding chrome ----
         if (chrome_a > 0.003f)
