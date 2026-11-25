@@ -7,12 +7,31 @@ src/
   core/               public types, AppState, tracked workers, generated version
   playback/           crossfade decisions/state, mpv wrapper, session JSON
   data/               SQLite library, store/cache persistence, paths/config
-  net/                yt-dlp backend, textures, updater, Discord RPC
+  backend/native/     native InnerTube client: JSON, HTTP, player, browse/lyrics
+  net/                command router, yt-dlp fallback, textures, updater, Discord RPC
   party/              party API, server, queue/link helpers, guest page
   ui/                 ImGui panels, components, theme, formatting, playlist I/O
 external/             vendored ImGui, SQLite, httplib, qrcodegen
 py/cf_backend/        shared Python command loop for cookie/OAuth entry points
 ```
+
+## Native backend
+
+`src/backend/native/` is the fast path. `json_value.cpp` is a real JSON tree,
+`http.cpp` is a keep-alive OpenSSL client with a cookie jar, `innertube.cpp`
+opens a three-hour VISIONOS session and resolves streams (including video +
+audio pairs), and `browse.cpp` serves search, suggestions, albums, artists,
+playlists, radio, home, lyrics, podcasts and account writes through
+`WEB_REMIX`. `native_util.h` holds the row/JSON shaping shared by those
+commands.
+
+`src/net/ytdlp.cpp` routes every command through the native implementation
+first. A command is claimed only when the C++ call succeeds; otherwise it is
+sent to the Python backend exactly as before. `P100_BACKEND=python` forces the
+old path, the Settings → Developer page toggles it at runtime, and F3 shows
+per-request traces. Auth comes from `browser.json`; a fresh SAPISIDHASH is
+computed per request, and the Python backend refreshes the stored hash at
+startup so both paths agree.
 
 ## Data flow
 

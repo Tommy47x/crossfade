@@ -1,168 +1,173 @@
 <div align="center">
 
+<img src="assets/crossfade.svg" alt="crossfade" width="84"/>
+
 # crossfade
 
-**A native YouTube Music client for Linux and Windows. No Electron. No browser tab.**
+### YouTube Music, without the browser tax.
 
-Instant starts. Automatic offline cache. Synced lyrics, your real library, media keys,
-and real crossfade.
+**A native C++ YouTube Music client.** No Electron. No Chromium. No yt-dlp, deno, Python or PoToken on the hot path.
 
-C++17 · SDL2 + OpenGL + Dear ImGui · playback by `mpv` · music data by a Python backend (`ytmusicapi`)
+Uncached tracks resolve in **~120 ms** on a warm session. Playlists, albums, radio, search, lyrics, podcasts and your library are served by a native InnerTube client, with the Python backend kept as a safety net — not as the fast path.
 
-[Download](../../releases) · [Screenshots](#screens) · [How it works](#how-it-works)
+[![Release](https://img.shields.io/github/v/release/XBoom31/crossfade?style=flat-square&color=c3148c)](../../releases)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue?style=flat-square)](#platform-support)
+[![Build](https://img.shields.io/github/actions/workflow/status/XBoom31/crossfade/build.yml?style=flat-square&label=build)](../../actions)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square)](https://isocpp.org/)
 
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue)](#platform-support)
-[![Build](https://img.shields.io/badge/build-CMake%20%2B%20Make-green)](#install-linux)
-[![C++](https://img.shields.io/badge/C%2B%2B-17-blue)](https://isocpp.org/)
-[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+[**Download**](../../releases) · [Screenshots](#screenshots) · [Why crossfade](#why-crossfade) · [Performance](#performance) · [Install](#install-linux) · [How it works](#how-it-works)
 
 </div>
-
----
 
 <div align="center">
-<img src="docs/screenshots/home.png" alt="crossfade home" width="900"/>
+<a href="docs/screenshots/native-home.jpg"><img src="docs/screenshots/native-home.jpg" alt="crossfade Home with synced lyrics" width="100%"/></a>
 </div>
 
-> Native instead of a browser tab. Instant instead of buffering. Offline without even
-> thinking about it. Beautiful, light on your machine, and yours to customize — built for
-> people who live in YouTube Music and want better than the web app can give them.
+> **Two HTTPS requests. One C++ process. Your music starts before the web player has finished loading its first script.**
+>
+> crossfade talks to YouTube Music directly: a watch-page request opens a session, then the `VISIONOS` InnerTube client returns plain audio URLs — no signature challenge, no `deno`, no PoToken. Browse, search, radio, lyrics and library writes use the same session through `WEB_REMIX`. The Python backend is still shipped and still used when something fails; it is simply no longer what you wait for.
 
 ---
 
-## At a glance
+## Why crossfade
 
-Measured on the author's Linux desktop (performance power profile) with
-`./scripts/bench.sh` plus a cached-track playback run. Numbers are machine-dependent;
-the method is below.
+- **It is genuinely fast.** A warm stream resolve is **111–126 ms** in the native backend. An album opens in **~350 ms**, 50 radio tracks in **~490 ms**, a 182-track playlist in **~1 s**. The first uncached track after a launch pays one ~1 s watch-page request and then stays warm for three hours.
+- **Native, not a browser in a trench coat.** One C++17 binary, SDL2 + OpenGL + Dear ImGui, libmpv for audio. Idle RAM is ~116 MB, not the 300–600 MB an Electron music client can occupy. No bundled Chromium, no Node runtime, no 500 MB of JavaScript.
+- **Offline is the default, not a mode.** Everything you play is cached as it streams. Explicit downloads now use the native resolver too and remux with `ffmpeg` (no yt-dlp JS dance), so an album download survives even when YouTube puts the account into its SABR-only experiment. Verified with the network fully blocked: the cached track still starts.
+- **Lyrics worth leaving on screen.** Timed YouTube Music lyrics, LRCLIB, lyrics.ovh and friends, with click-to-seek, a Spotify-style side panel, and a full-screen immersive view that uses the album art as its stage.
+- **Room correction that actually measures your room.** Sweep with your phone, get a per-room correction curve, bind rooms to output devices, and let crossfade apply it in the player's audio chain. No extra driver, no external EQ app.
+- **Your library, actually yours.** Likes, saved albums and artists, playlists, local history, downloads and YouTube account playlists — mirrored locally, with write-back to YouTube Music.
+- **And real crossfade.** Two libmpv players blend tracks into each other — 0–20 s on natural ends, a shorter fade on skips, instant switches for uncached targets.
+- **Party mode, low power, stats, smart lists, M3U/XSPF, media keys, MPRIS/SMTC.** The features the web player forgot, in a window that idles at near-zero CPU.
 
-| Metric | crossfade |
+**If crossfade saves you a browser tab, a ⭐ helps other people find it.**
+
+## Performance
+
+Measured on the author's Linux desktop (Fedora, 16 threads, performance profile) against the native backend. Timings are wall-clock from the in-app Native Backend page (F3) and the direct resolver harness; each row is a warm session unless noted. Your network and machine will differ — the method is part of the point.
+
+| Operation | Native backend |
 |---|---:|
-| Warm start (resident window) | **0 s** |
+| Stream resolve, warm | **111–126 ms** |
+| Stream resolve, first after launch | **~1.2 s** (one watch-page request) |
+| Album page (13 tracks) | **~350–500 ms** |
+| Artist page (top songs + albums) | **~380–830 ms** |
+| Playlist, 182 tracks (all pages) | **~1.0–1.4 s** |
+| Radio station, 50 tracks | **~490 ms** |
+| Home feed, 40 tracks | **~320–870 ms** |
+| Search, 20 songs | **~400–800 ms** |
+| Download, 2.7 MB opus | **~1 s** |
+
+| App shell | crossfade |
+|---|---:|
 | Cold start → window painted | **~0.30 s** |
-| Cold start → first audio (cached session) | **~0.35 s** |
-| Idle RAM (paused, 5 s) | **~116 MB** |
-| Playing RAM (cached track) | **~128 MB** |
-| Idle CPU (all 16 threads) | **~0%** |
-| Playing CPU (all 16 threads) | **~0.23%** |
+| Cold start → first audio (cached) | **~0.35 s** |
+| Warm start (resident window) | **0 s** |
+| Idle RAM | **~116 MB** |
+| Playing RAM | **~128 MB** |
+| Idle CPU | **~0%** |
 | Binary + assets + backend package | **~7.9 MB** |
-| Source | **~51k lines** of C++/headers |
-
-All rows above are with **low power mode off**. Low power caps the UI at ~4 FPS,
-disables motion and speculative warming, and skips background downloads/sweeps;
-playback itself is unchanged. Measured separately with `--low-power`:
-
-| Low power mode | crossfade |
-|---|---:|
-| Cold start → window painted | **~0.35 s** |
-| Cold start → first audio (cached session) | **~0.41 s** |
-| Playing RAM (cached track) | **~125 MB** |
-| Playing CPU (all 16 threads) | **~0.17%** |
 
 <details>
 <summary>How these were measured</summary>
 
-- **Warm start is 0 s by design.** With warm start enabled the process, UI, backend
-  and caches stay resident; invoking `crossfade` only sends a show/raise command to
-  the existing instance, so there is no startup work to measure. The cold-start rows
-  below are a fresh process.
-- `./scripts/bench.sh` for binary/source/install size, unit tests, startup→window,
-  startup→ready, idle RSS/CPU, and (when a real config with a session exists) two
-  cached-playback passes: normal and `--low-power`. Each pass records startup→window,
-  startup→audio, playing RSS and playing CPU.
-- Startup timings are wall-clock from process start to the `boot: first frame` /
-  `boot: first audio` log lines. Three normal cached-playback runs: 0.345 s, 0.348 s,
-  0.349 s to audio; 0.319–0.322 s to the first painted window. Cold starts without
-  playback painted in 0.302–0.328 s. The three low-power runs started audio in
-  0.402–0.428 s and painted in 0.351–0.352 s.
-- RSS is `VmRSS` after 5 s idle or ~8 s of cached playback.
-- CPU is sampled from `/proc/<pid>/stat` over a 4 s window after an 8 s playback
-  settle (so backend startup is excluded), then divided by the 16 hardware threads
-  so it is a percentage of total machine CPU, not per-core. Low power uses the same
-  window and divisor.
-- Install size excludes the Python venv and the audio/thumbnail caches; packaged
-  AppImage/deb/rpm sizes are larger.
-
+- **Native rows** are from the F3 Native Backend page (p50/p95 over the traces) and direct `native::resolve_audio` / browse harnesses run against the live service. Cold resolve includes the watch-page fetch; warm rows reuse the 3-hour session. Album/artist/playlist/radio/home rows include the InnerTube request and JSON parse, not artwork downloads.
+- **Shell rows** come from `./scripts/bench.sh`: cold start to the `boot: first frame` / `boot: first audio` log lines, RSS from `VmRSS` after settling, CPU sampled over a 4 s window and divided by the 16 hardware threads.
+- Low power mode (Settings → System → Power, `--low-power`, `P100_LOW_POWER=1`) caps the UI at ~4 FPS, disables motion and speculative warming, and skips background downloads. Playback is unchanged.
 </details>
 
-### Source size
+## Screenshots
 
-Line counts (blank lines included) from the current tree:
+<a href="docs/screenshots/native-search.jpg"><img src="docs/screenshots/native-search.jpg" alt="Search with the native Top result card" width="49.5%"/></a>
+<a href="docs/screenshots/native-album.jpg"><img src="docs/screenshots/native-album.jpg" alt="Album page" width="49.5%"/></a>
+<a href="docs/screenshots/native-artist.jpg"><img src="docs/screenshots/native-artist.jpg" alt="Artist page with popular songs and albums" width="49.5%"/></a>
+<a href="docs/screenshots/native-downloads.jpg"><img src="docs/screenshots/native-downloads.jpg" alt="Offline downloads" width="49.5%"/></a>
+<a href="docs/screenshots/native-lyrics.jpg"><img src="docs/screenshots/native-lyrics.jpg" alt="Full-screen synced lyrics" width="49.5%"/></a>
+<a href="docs/screenshots/native-room-eq.jpg"><img src="docs/screenshots/native-room-eq.jpg" alt="Measured room correction" width="49.5%"/></a>
+<a href="docs/screenshots/native-backend.jpg"><img src="docs/screenshots/native-backend.jpg" alt="Native backend diagnostics (F3)" width="49.5%"/></a>
+<a href="docs/screenshots/native-settings.jpg"><img src="docs/screenshots/native-settings.jpg" alt="Settings" width="49.5%"/></a>
 
-| Area | Files | Lines |
-|---|---:|---:|
-| `src/ui` — widgets, panels, theming, ImGui layout | 34 | 23,044 |
-| `src/app` — init, main loop, input, playback, workers, diagnostics | 14 | 7,858 |
-| `src/net` — yt-dlp, thumbnails, updater, Discord RPC | 8 | 5,668 |
-| `src/party` — party server, queue, guest page, tunnels | 15 | 4,990 |
-| `src/data` — SQLite library, caches, paths, write-back | 13 | 4,201 |
-| `src/playback` — mpv, crossfade, video surface, session, MPRIS | 12 | 2,175 |
-| `src/core` — shared state, types, tasks, power, JSON | 10 | 1,855 |
-| `win32` — SMTC, WinRT toasts, Windows MPRIS, Discord stub | 7 | 1,688 |
-| `src/main.cpp` | 1 | 7 |
-| **C++ and headers total** | **114** | **51,486** |
-| Python backend (`py/cf_backend`, `p100-backend*.py`) | 5 | 3,864 |
-| Tests (`tests/`) | 19 | 2,565 |
-| Scripts (`scripts/`) | 7 | 1,085 |
+More: [search albums](docs/screenshots/native-search-albums.jpg).
 
-`external/` (Dear ImGui, stb) is vendored and excluded.
+## More screens
 
-## How it compares
+| Radio | Now playing / queue | Stats |
+|:---:|:---:|:---:|
+| ![Radio](docs/screenshots/radio.png) | ![Queue](docs/screenshots/queue.png) | ![Stats](docs/screenshots/stats.png) |
 
-| | Electron clients¹ | Native players² | **crossfade** |
-|---|:---:|:---:|:---:|
-| YouTube Music account & library | ✅ | ❌ | ✅ |
-| Real crossfade between tracks | ❌ | ✅ | ✅ |
-| Automatic offline cache | partial | ❌ | ✅ |
-| LAN party mode (phone queue) | ❌ | ❌ | ✅ |
-| Synced lyrics + click-to-seek | ✅ | mixed | ✅ |
-| Native C++ / no bundled Chromium | ❌ | ✅ | ✅ |
-| Media keys / MPRIS | ✅ | ✅ | ✅ |
-| Windows / macOS | ✅ | mixed | ✅ Windows, ❌ macOS |
+| Party mode | Smart lists | History |
+|:---:|:---:|:---:|
+| ![Party](docs/screenshots/party.png) | ![Smart](docs/screenshots/smart.png) | ![History](docs/screenshots/history.png) |
 
-¹ th-ch/youtube-music, ytmdesktop · ² Tauon, Feishin, Nuclear, mpv+yt-dlp
+| Saved albums | Playlists | Liked |
+|:---:|:---:|:---:|
+| ![Albums](docs/screenshots/albums.png) | ![Playlists](docs/screenshots/playlists.png) | ![Liked](docs/screenshots/liked.png) |
+
+## Where crossfade fits
+
+Most YouTube Music desktop apps are the website running inside Electron. crossfade is a
+native C++ client: it draws its own interface and hands audio to libmpv.
+
+| | Electron clients¹ | **crossfade** |
+|---|:---:|:---:|
+| Resolver | website in Chromium | **native C++ InnerTube** |
+| Hot-path dependencies | Node + Chromium | **none** (Python/deno optional fallback) |
+| Cold start → window | seconds | **~0.30 s** |
+| Idle RAM | 300–600 MB | **~116 MB** |
+| Real crossfade | ❌ | ✅ |
+| Automatic offline cache | partial | ✅ |
+| Measured room EQ | ❌ | ✅ |
+| LAN party mode (phone queue) | ❌ | ✅ |
+| Synced lyrics + click-to-seek | ✅ | ✅ |
+| Media keys / MPRIS / SMTC | ✅ | ✅ |
+| GPL-3.0 | mixed | ✅ |
+
+¹ th-ch/youtube-music, ytmdesktop.
+
+**Credit where it is due:** [ytm-rs](https://github.com/grapedjuice/ytm-rs) is the other
+native YouTube Music client, and the reason this backend exists. Its work with the
+`visionOS` player showed that plain stream URLs were possible without a browser, a JS
+runtime or a signature puzzle. crossfade applies the same idea in C++ and adds a different
+set of things — two-player crossfade, phone-measured room correction, a LAN party queue and
+a native browse/lyrics/podcast layer with a Python fallback. It is also excellent; if you
+prefer Rust/egui, use it. If you want the feature set above, use crossfade.
 
 ## Common questions
 
 **Do I need an account?**
-No. Without `browser.json` crossfade starts in guest mode: public browsing, playback,
-lyrics, radio, podcasts, downloads and local playlists work. Personalized
-recommendations and your YouTube Music playlists/library need a sign-in; the Home tab
-keeps a centred search field on the page itself (so an empty feed is never a dead end)
-and links straight to the sign-in settings while you are a guest.
+No. Guest mode gives you public search, albums, artists, radio, podcasts, lyrics, downloads and local playlists. Personalized Home, your YouTube playlists and write-back need a sign-in.
 
 **Isn't signing in annoying?**
-One-time, about 30 seconds: copy the request headers, run `crossfade-login`, done.
-Cookies expire every few weeks to months; re-running the same command fixes it. OAuth
-is available as an alternative.
+One-time, about 30 seconds: import your browser session with `crossfade-login`. The app refreshes the expiring request hash from the cookies at startup; when the cookies themselves expire (weeks to months), re-importing fixes it. OAuth remains available as an experimental alternative.
+
+**How is this different from ytm-rs?**
+ytm-rs is a great native client and the direct inspiration for this backend: it showed the
+`visionOS` player could hand back plain URLs. ytm-rs is Rust/egui, with karaoke-style
+word-by-word lyrics, themes and jams. crossfade is C++/ImGui, with real two-player
+crossfade, phone-measured room EQ, a native browse/lyrics/podcast layer and a Python
+backend as a permanent fallback. Different stacks, different feature sets — use the one
+that fits you.
 
 **Is this allowed?**
-It uses your own account through `ytmusicapi`/`yt-dlp`, the same tools other clients
-use. Not affiliated with or endorsed by Google. MIT licensed. No telemetry, no server;
-requests go to YouTube and nowhere else.
+It talks to YouTube Music with your own account, using the same public web endpoints the site uses. Not affiliated with or endorsed by Google. GPL-3.0. No telemetry, no server; requests go to YouTube and nowhere else.
 
 **Why not Electron?**
-Because the point was to stop a music player from using a gigabyte of RAM. One native
-binary, libmpv, no bundled browser.
+Because a music player should not ship a browser. One native binary, libmpv, no Chromium.
 
 **Linux or Windows?**
-Both are first-class. The same C++/OpenGL/ImGui app runs on Linux and Windows, with the
-same playback, crossfade, cache, lyrics, party mode and video features, and each has a
-one-click install: AppImage/deb/rpm/AUR and a source build on Linux, an MSYS2 UCRT64 build
-with a one-click PowerShell installer on Windows. Platform integration is native on both
-(MPRIS and libnotify on Linux; SMTC, WinRT toasts and a GUI-subsystem build on Windows).
-macOS is not started.
+Both are first-class: AppImage/deb/rpm/AUR and source builds on Linux; an MSYS2 UCRT64 build with a one-click PowerShell installer on Windows. macOS is not started.
 
 ---
 
 ## Contents
 
-- [At a glance](#at-a-glance)
-- [How it compares](#how-it-compares)
-- [Common questions](#common-questions)
 - [Why crossfade](#why-crossfade)
-- [Screens](#screens)
+- [Performance](#performance)
+- [Screenshots](#screenshots)
+- [Where crossfade fits](#where-crossfade-fits)
 - [Install (Linux)](#install-linux)
+- [Install on Windows](#install-on-windows-one-click)
 - [Sign in](#sign-in)
 - [A quick tour](#a-quick-tour)
 - [Everyday use](#everyday-use)
@@ -178,67 +183,7 @@ macOS is not started.
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 
-## Why crossfade
 
-- **It feels instant.** The first window is painted in about a third of a second, and a
-  cached track starts just after it. Click a song and it plays — search results are
-  URL-prefetched before you click, a dedicated play worker guarantees your click never
-  queues behind background work, and an optional in-process extractor removes the per-song
-  startup cost entirely. Repeat searches come back in milliseconds. No spinner purgatory.
-  With warm start on, closing the window parks the app resident, so the next launch is
-  **0 s of startup**: it only raises the existing window instead of paying the cold-start
-  cost again.
-- **Offline, automatically.** Every song you listen to is cached as it streams, so the
-  second play starts from your disk — no network, no wait. Want it explicit? Download whole
-  albums with one click. A configurable cache cap with least-listened-first eviction keeps
-  your disk honest.
-- **Beautiful.** Album artwork colours the entire interface with a soft, drifting glow.
-  Four animation levels, a light and a dark theme, an accent colour that follows your
-  desktop (or the calendar), and text/widget/layout scaling down to per-element fine-tuning.
-  It looks the way music should feel.
-- **Lightweight. Native. Quiet.** Plain C++17 and mpv — no Electron, no bundled Chromium,
-  no 500 MB of JavaScript. The render loop is demand-driven, so the app idles at
-  **near-zero CPU** and gets out of the way of your music.
-- **Everything the web player can't give you.** Karaoke-style synced lyrics you can click
-  to seek, media keys and MPRIS, a sleep timer, a multi-band EQ (5, 10, 15, 31 or custom
-  bands), volume normalization, playback speed, smart **On Repeat** lists, listening stats,
-  an endless radio, M3U/XSPF export, and a keyboard-first interface.
-- **Your library, actually yours.** Likes, saved albums/artists, local playlists, history,
-  and your YouTube account playlists — mirrored locally, with optional write-back to
-  YouTube Music.
-- **And real crossfade.** Two libmpv players blend tracks into each other — 0–20 s on
-  natural ends, a shorter fade on manual skips, instant switches for uncached targets. The
-  name is the feature; it's just not the only one.
-
-Press play once: session restore puts you back exactly where you were, the queue keeps
-flowing into endless radio, and every track lands in the cache on its way by. It just
-keeps going.
-
-## Screens
-
-| Home | Search | Album |
-|:---:|:---:|:---:|
-| ![Home](docs/screenshots/home.png) | ![Search](docs/screenshots/search.png) | ![Album](docs/screenshots/album.png) |
-
-| Lyrics | Radio | Stats |
-|:---:|:---:|:---:|
-| ![Lyrics](docs/screenshots/lyrics.png) | ![Radio](docs/screenshots/radio.png) | ![Stats](docs/screenshots/stats.png) |
-
-| Smart lists | Playlists | Liked |
-|:---:|:---:|:---:|
-| ![Smart](docs/screenshots/smart.png) | ![Playlists](docs/screenshots/playlists.png) | ![Liked](docs/screenshots/liked.png) |
-
-| History | Artists | Up Next |
-|:---:|:---:|:---:|
-| ![History](docs/screenshots/history.png) | ![Artists](docs/screenshots/artists.png) | ![Queue](docs/screenshots/queue.png) |
-
-| Saved albums | Track actions | Settings |
-|:---:|:---:|:---:|
-| ![Albums](docs/screenshots/albums.png) | ![Track actions](docs/screenshots/track-actions.png) | ![Settings](docs/screenshots/settings.png) |
-
-| Party | Present QR |
-|:---:|:---:|
-| ![Party](docs/screenshots/party.png) | ![Present QR](docs/screenshots/party-qr.png) |
 
 ## Install (Linux)
 
@@ -274,14 +219,16 @@ A handful of library headers, available in every mainstream distro:
 ```bash
 # Debian / Ubuntu / Mint
 sudo apt install build-essential cmake pkg-config libsdl2-dev libgl1-mesa-dev \
-                 libmpv-dev libglib2.0-dev libnotify-dev python3 python3-venv curl
+                 libmpv-dev libglib2.0-dev libnotify-dev libssl-dev ffmpeg \
+                 python3 python3-venv curl
 
 # Arch / Manjaro
-sudo pacman -S --needed base-devel cmake sdl2 mesa mpv glib2 libnotify python curl
+sudo pacman -S --needed base-devel cmake sdl2 mesa mpv glib2 libnotify openssl ffmpeg python curl
 
 # Fedora
 sudo dnf install @development-tools cmake SDL2-devel mesa-libGL-devel \
-                 mpv-devel glib2-devel libnotify-devel python3 python3-pip curl
+                 mpv-devel glib2-devel libnotify-devel openssl-devel ffmpeg \
+                 python3 python3-pip curl
 ```
 
 `./install.sh` also provisions the JavaScript runtime yt-dlp needs for
@@ -521,7 +468,9 @@ mixed set is rejected as anonymous), tries every Firefox profile, and verifies
 each one against the account with the same `logged_in` check the backend uses.
 A signed-out browser now reports "signed out" instead of a misleading success,
 and the Settings card and sidebar show **Guest mode** until the backend really
-has a session.
+has a session. The backend refreshes the expiring `SAPISIDHASH` from the imported
+cookies at startup, so a verified import keeps working instead of looking signed
+out a day later.
 
 Launch crossfade and everything — home feed, likes, playlists, lyrics — is yours.
 
@@ -595,7 +544,7 @@ The window has four persistent regions:
   “Liked Music”.
 - **Up Next** — the playback queue, with a **Nothing queued** empty state and instructions
   for adding tracks.
-- **Podcasts** — saved shows, catalogue search, episode playback, local show saving and offline downloads, powered by `ytmusicapi`.
+- **Podcasts** — saved shows, catalogue search, episode playback, local show saving and offline downloads, served by the native `WEB_REMIX` browse client.
 - **Settings** — a two-pane, card-based appearance, playback, lyrics, YouTube Music, cache, shortcuts, and a
   danger zone.
 
@@ -662,8 +611,12 @@ session; press **Library** again to return to YouTube search.
 
 ### Downloads and the cache
 
-- Tracks are cached **as they stream**, so the second play is instant.
+- Tracks are cached **as they stream**, so the second play is instant — with the network
+  completely blocked, the cached track still starts.
 - An album page has **Download** / **Download (n/m)** / **Delete download**.
+- Downloads use the native resolver and remux with `ffmpeg -c:a copy` (~1 s for a 2.7 MB
+  opus file), so they keep working when yt-dlp's web clients hit YouTube's SABR experiment.
+  yt-dlp remains the fallback if the native path cannot resolve.
 - **Settings → Download Cache** shows disk usage, a 0–20 GB cap (0 = unlimited), and
   **Clear cache**.
 - When the cap is reached, the **least-listened** tracks are evicted first; the currently
@@ -891,7 +844,10 @@ The scripts still work for scripted backups:
 |---|---|
 | `P100_CONFIG_DIR` | Move the whole data root |
 | `P100_ACCENT` | Hex accent colour override, e.g. `#6db2d0` |
-| `P100_YTDLP` / `P100_PYTHON` / `P100_BACKEND` | Pin `yt-dlp` / Python / backend script |
+| `P100_YTDLP` / `P100_PYTHON` / `P100_BACKEND` | Pin `yt-dlp` / Python / backend script (`P100_BACKEND=python` forces the old path) |
+| `P100_FFMPEG` | `ffmpeg` binary used by native downloads and DSP helpers |
+| `P100_WINDOW_SIZE` | Launch size, e.g. `1920x1080` (default `1280x820`) |
+| `P100_LOW_POWER` | Force low-power mode (`1`) |
 | `P100_AUTH_FILE` | Custom auth file path |
 | `P100_SHARE_DIR` / `P100_ASSETS` | Override installed data/asset directories |
 | `P100_DISCORD_CLIENT_ID` | Discord Rich Presence app ID (same as the Settings field) |
@@ -913,13 +869,15 @@ The scripts still work for scripted backups:
 
 ```text
 crossfade (C++17, SDL2 + OpenGL + ImGui)
+ ├── native core (C++): InnerTube client, no JS / no PoToken
+ │    ├── VISIONOS player         — stream URLs, video + audio pairs
+ │    ├── WEB_REMIX browse/search  — home, album, artist, playlist, radio, suggestions
+ │    ├── lyrics / podcasts       — timed lyrics, LRCLIB, lyrics.ovh, podcast shows
+ │    └── account writes          — likes, playlists (fresh SAPISIDHASH)
  ├── libmpv player A ─┐
  ├── libmpv player B ─┴── crossfade handoff (end-of-track + manual skips)
- ├── Python backend: main channel  — search, library, radio, browse
- ├── Python backend: play channel  — stream-URL resolves (clicks never wait)
- ├── Python backend: prefetch      — hover/hero stream warming only
- ├── Python backend: meta          — lyrics + background list warmups
- └── yt-dlp                        — in-process extractor or subprocess fallback
+ ├── Python backends (fallback): main / play / prefetch / meta
+ └── yt-dlp + deno (fallback)    — downloads, Spotify import, DSP helpers
 ```
 
 ### Playback and crossfade
@@ -930,63 +888,72 @@ manual skip, the incoming track starts on the second player, the outgoing player
 and the two swap roles when the fade completes. If the target track is not cached, the skip
 is instant instead of waiting for a resolve.
 
-### Backends and data flow
+### Native first, Python as the safety net
 
-The C++ process keeps **four long-lived Python backends** over stdin/stdout pipes. The
-**main channel is concurrent**: commands are id-tagged (`@17 album MPRE…`), answered by a
-four-thread pool with a per-thread `YTMusic` instance, and the C++ reader routes each reply
-back to its waiting caller. A slow album page therefore cannot delay a search or the
-suggestions that follow it. The play channel is the only one that handles a click's `play` /
-`play_fresh`; prefetch warms the hovered row and the search top result; meta runs lyrics and
-background list warmups. If an extra channel fails to start, its work falls back to the next
-one (and finally main, except for background batches, which wait rather than blocking main).
-A dead optional worker is marked unusable and restarted on demand.
+Every command the UI sends passes through a native router before it reaches a pipe. The
+router claims a command only when the C++ implementation succeeds; anything else falls
+through to the Python backend unchanged. `P100_BACKEND=python` forces the old path for
+debugging, and Settings → Developer → Native backend (or **F3**) toggles it at runtime.
 
-HTTP requests to YouTube Music are bounded (8 s default, Settings → Tunables) because
-ytmusicapi's own default is 30 s: one stalled request used to freeze the serial command pipe
-for half a minute. **Low memory mode** (Settings → Power) runs only the concurrent main
-backend instead of four processes.
+The native resolver is intentionally small:
 
-**Prefetch the world** (Settings → YouTube Music) warms the whole visible list on the meta
-channel instead of only the hovered row, so clicks and the search hero start instantly. It
-is off by default because it uses more bandwidth and can trip YouTube rate limits; the
-depth is tunable in Settings → Tunables.
+1. `GET https://www.youtube.com/watch?v=<id>` once per session to collect cookies and
+   `VISITOR_DATA`.
+2. `POST youtubei/v1/player` with the **VISIONOS** client: no signature challenge, no
+   `deno`, no PoToken, plain `googlevideo.com` URLs.
+3. Pick the best opus/m4a audio, or a video + audio pair for video mode.
 
-Optional workers are supervised: if one dies (crash, OOM, or a wedged command past its
-deadline), its channel is marked unusable so commands fall through to the next one, and it
-is restarted on demand. A prefetch batch also has a hard deadline and returns partial
-results, so a single stuck extraction cannot wedge the channel. **F2** opens the backend
-debug window: per-channel pending queue, last/max latency, and every command with its queue
-wait, duration and error text. `backend.log` mirrors the important lines
-(`[main] search_all my query 508ms ok`, `[lyrics] … ytm-timed 402ms hit`).
+The session is reused for three hours, and browse/search do not need it at all — they go
+straight to `music.youtube.com/youtubei/v1/*` with the `WEB_REMIX` client. That is why a
+warm resolve is ~120 ms and the first browse is not stuck behind a watch-page fetch.
+
+Auth uses the same `browser.json` the Python backend imports: cookies are sent as-is and a
+fresh `SAPISIDHASH` is computed from `SAPISID`/`__Secure-3PAPISID` for every request, so an
+imported session keeps working after the stored hash expires. The Python backend now
+refreshes the same hash at startup.
+
+The four Python channels are still started and still supervised: the concurrent main
+channel (id-tagged replies, four workers), the play channel, prefetch and meta. They handle
+the commands that are not ported yet (Spotify import, `analyze`, `videosync`) and every
+native failure. Optional workers are marked unusable if they die and restarted on demand.
+
+**F2** shows the Python channel log. **F3** opens the native page: session state, TLS
+availability, resolve counters, total/player p50/p95, and a table of recent requests (time,
+id, status, itag, kbps, warm/cold, page/player/total ms, host) with error reasons, a session
+reset and “copy traces as JSON”. A typical trace row is
+`03:03:15 kaYeZqw6dU OK 251 168 warm 0 310 311 https://rr2---sn-...`.
 
 A typical click:
 
 1. The UI sets a flag in `AppState` (`pending_*`, `next_requested`, …).
 2. The main loop picks it up and spawns a detached thread for network work.
-3. The thread calls the backend, parses the JSON, and publishes the result under
-   `g_data_mutex` / atomics.
+3. The thread resolves natively (or calls the fallback backend), parses the JSON, and
+   publishes the result under `g_data_mutex` / atomics.
 4. The next frame renders it; a repaint is requested so the UI does not wait for the idle
    tick.
 
 ### Cache
 
 `mpv`'s `stream-record` writes bytes to `audio_cache/` while you listen. When playback ends,
-the recording is validated, moved into place, and a `.meta.json` sidecar is written. The
-cache has a configurable cap; eviction removes the least-listened tracks first and never
-touches the currently playing one. Stream URLs themselves are cached for 2 hours
-(`_STREAM_TTL`) and probed before reuse.
+the recording is validated, moved into place, and a `.meta.json` sidecar is written. Explicit
+“Download” actions go through the native resolver and remux with `ffmpeg -c:a copy`; if that
+fails, the old yt-dlp path is still tried. The cache has a configurable cap; eviction removes
+the least-listened tracks first and never touches the currently playing one. Stream URLs
+themselves are cached for two hours (`_STREAM_TTL`) and probed before reuse.
+
+Offline behavior was tested with external network access blocked at the syscall level: a
+track whose audio is cached still reaches `EVENT loaded`, while the backend’s network calls
+fail fast in the background.
 
 ### Search, lyrics, and thumbnails
 
-- **Search** runs its sub-queries in parallel (4 workers), caches results for 15 minutes,
-  warms the intent match ("Top result") first on the priority channel, then the first 10
-  rows in the background.
-- **Lyrics** cascade: YouTube Music native timed → LRCLIB → NetEase → Kugou → lyrics.ovh →
-  YouTube Music plain. The first timestamped result wins, with normalized title/artist/
-  duration matching so the wrong song's lyrics are never shown. The cascade runs on the
-  meta channel with a per-provider timeout and a total deadline, so it can never hold up a
-  search; each provider's timing is logged in `backend.log` (`[lyrics] … 402ms hit`).
+- **Search** is one native `search` request with the songs filter; `search_all` adds the
+  default search for the **Top result** card and the album/artist shelves. Results are
+  cached for 15 minutes by the existing C++ layer.
+- **Lyrics** cascade: YouTube Music native timed (public `ANDROID_MUSIC` browse) → LRCLIB
+  (synced first) → lyrics.ovh. The first timestamped result wins; a plain result is kept
+  only if nothing synced exists. The Python backend still has NetEase/Kugou for the rare
+  miss and is used automatically when the native providers find nothing.
 - **Thumbnails** load asynchronously: curl download → stb_image decode → GPU upload on the
   main thread, with a 60-second backoff for failed URLs.
 
@@ -1192,6 +1159,10 @@ cat ~/.config/crossfade/audio_cache/<videoId>.meta.json
 - Public party links require a locally installed `cloudflared`; Quick Tunnel addresses change each start, and Cloudflare relays the traffic. Same-Wi-Fi mode stays fully local.
 - No Flathub package yet; AppImage, deb, rpm and AUR are the current channels.
 - Two instances using the same config can briefly contend on the SQLite database.
+- The native backend covers playback, search, browse, radio, lyrics, podcasts and account
+  writes. Spotify import, `analyze` and `videosync` still use the Python/ffmpeg helpers.
+- YouTube changes its clients regularly. If the native path breaks, the app falls back to
+  the Python backend; `P100_BACKEND=python` makes that explicit.
 
 ## Contributing
 
@@ -1201,6 +1172,8 @@ Issues and pull requests are welcome.
 ./mk            # build + run from build/
 ```
 
+- Native changes should keep the Python fallback working: the router claims a command only
+  on success, and `P100_BACKEND=python` must always reproduce the old behavior.
 - Keep the backend protocol line-based and update both backend scripts together.
 - Keep user data in the config directory and out of git.
 - Match the existing C++/ImGui patterns; no new dependencies without discussion.
@@ -1208,7 +1181,7 @@ Issues and pull requests are welcome.
 
 ## License
 
-[MIT](LICENSE) — free to use, modify, and share.
+[GPL-3.0](LICENSE) — free to use, modify, and share under the same license.
 
 **Not affiliated with or endorsed by Google/YouTube.** Use your own account and respect
 YouTube's terms of service.
@@ -1216,19 +1189,26 @@ YouTube's terms of service.
 ## Acknowledgments
 
 - [ytmusicapi](https://github.com/sigma67/ytmusicapi) — the reverse-engineered YouTube Music
-  API this whole thing runs on
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — stream extraction
+  API, still the fallback backend and the reference for the native browse shapes
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — the JSLess `VISIONOS` client path that proved
+  plain URLs were possible, and the download fallback
+- [ytm-rs](https://github.com/grapedjuice/ytm-rs) — the native client whose `visionOS`
+  player proved this approach; the backend idea started there
+- [cpp-httplib](https://github.com/yhirose/cpp-httplib) — native HTTP (shared with the party server)
 - [mpv](https://mpv.io/) / libmpv — playback, crossfade, `stream-record`
 - [Dear ImGui](https://github.com/ocornut/imgui) · [SDL2](https://www.libsdl.org/) ·
   [stb_image](https://github.com/nothings/stb) · [GLib](https://docs.gtk.org/glib/)
-- [cpp-httplib](https://github.com/yhirose/cpp-httplib) — local party HTTP server
 - [QR Code generator](https://github.com/nayuki/QR-Code-generator) by Nayuki — QR
   rendering for the party link
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=XBoom31/crossfade&type=Date)](https://star-history.com/#XBoom31/crossfade&Date)
 
 ---
 
 <div align="center">
 <i>Built for personal use, shared in case it's useful.</i>
 
-If crossfade replaced a browser tab for you, a star helps other people find it.
+**If crossfade saves you a browser tab, a ⭐ helps other people find it.**
 </div>

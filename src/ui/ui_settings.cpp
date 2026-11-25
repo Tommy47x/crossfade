@@ -767,6 +767,7 @@ enum SettingsCategory
     SC_DIAGNOSTICS,
     SC_UPDATES,
     SC_TUNABLES,
+    SC_NATIVE_BACKEND,
     SC_NOTES,
     SC_DANGER,
     SC_COUNT
@@ -1242,6 +1243,7 @@ static const SettingsNavEntry kSettingsNav[] = {
     {SC_DIAGNOSTICS, UiIcon::Stats, "Diagnostics", nullptr},
     {SC_UPDATES, UiIcon::Refresh, "Updates", nullptr},
     {SC_TUNABLES, UiIcon::Settings, "Tunables", "DEVELOPER"},
+    {SC_NATIVE_BACKEND, UiIcon::Stats, "Native backend", nullptr},
     {SC_NOTES, UiIcon::Settings, "Notes", nullptr},
     {SC_DANGER, UiIcon::Close, "Danger Zone", nullptr},
 };
@@ -3768,6 +3770,11 @@ void draw_settings_panel(AppState &state)
                   6.0f, "Undo", &undo_reset);
     }
     ImGui::Dummy(ImVec2(0.0f, m.space_5));
+    }
+
+    if (s_settings_category == SC_NATIVE_BACKEND)
+    {
+        draw_native_backend_panel(state);
     }
 
     if (s_settings_category == SC_TUNABLES)

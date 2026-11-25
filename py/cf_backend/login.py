@@ -287,6 +287,46 @@ def verify_auth_file(path):
     return True, "Signed in to YouTube Music (verified against the library)."
 
 
+def refresh_auth_file(path=None):
+    """Recompute browser.json's SAPISIDHASH from its cookies.
+
+    The stored ``authorization`` header embeds the timestamp used to sign it,
+    so it goes stale even while the cookies are still valid. ytmusicapi uses
+    the file verbatim, which made a working imported session look signed out
+    a day later (the native backend recomputes the hash per request, so the
+    two disagreed). Rewriting it at startup keeps the Python fallback honest.
+    """
+    path = path or auth_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    raw_cookies = data.get("cookie") or ""
+    if not raw_cookies:
+        return False
+    cookies = {}
+    for part in raw_cookies.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        cookies[name.strip()] = value.strip()
+    if not has_secure_cookie(cookies):
+        return False
+    headers = build_browser_headers(cookies, ua=data.get("user-agent"))
+    for key in ("accept", "accept-language", "origin", "referer",
+                "x-goog-authuser", "x-origin"):
+        if data.get(key):
+            headers[key] = data[key]
+    try:
+        tmp = _write_private_json(path, headers)
+        _commit(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
 def _commit(tmp, dest):
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     os.replace(tmp, dest)

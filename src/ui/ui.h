@@ -119,6 +119,10 @@ void draw_party_fullscreen(AppState &state);
 void draw_party_chip(AppState &state);
 // Semi-transparent debug window: backend channels + live command log.
 void draw_backend_debug(AppState &state);
+// Native (C++) backend: session, timings and per-resolve traces.
+void draw_native_backend_panel(AppState &state);
+// Floating F3 window wrapping the same page.
+void draw_native_backend_window(AppState &state);
 
 // Radio station page (~/.config/p100/radio_last.cache holds the last station
 // so the tab opens with content and warm stream URLs).

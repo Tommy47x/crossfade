@@ -772,9 +772,22 @@ int app_run(int argc, char **argv)
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (start_hidden)
         window_flags = (SDL_WindowFlags)(window_flags | SDL_WINDOW_HIDDEN);
+    // Optional launch size (P100_WINDOW_SIZE=1920x1080). Screenshots, tiling
+    // window managers and HiDPI laptops all want a size the fixed default
+    // cannot express; values are clamped to something usable.
+    int win_w = 1280, win_h = 820;
+    if (const char *size = getenv("P100_WINDOW_SIZE"))
+    {
+        int w = 0, h = 0;
+        if (std::sscanf(size, "%dx%d", &w, &h) == 2)
+        {
+            win_w = std::max(860, std::min(w, 7680));
+            win_h = std::max(600, std::min(h, 4320));
+        }
+    }
     SDL_Window *window = SDL_CreateWindow("crossfade",
-                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 820,
-                                          window_flags);
+                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w,
+                                          win_h, window_flags);
     if (!window)
     {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -1467,6 +1480,11 @@ int app_run(int argc, char **argv)
                     else if (hit("backend_debug"))
                     {
                         g_state.show_backend_debug = !g_state.show_backend_debug;
+                        g_state.repaint_requested = true;
+                    }
+                    else if (hit("native_backend_debug"))
+                    {
+                        g_state.show_native_backend_debug = !g_state.show_native_backend_debug;
                         g_state.repaint_requested = true;
                     }
                     else if (hit("settings"))
@@ -2772,6 +2790,7 @@ int app_run(int argc, char **argv)
             }
 
             draw_backend_debug(g_state);
+            draw_native_backend_window(g_state);
 
             // Video: the page computed the on-screen size while building the
             // UI; decode/upload the next frame now, before the ImGui draw

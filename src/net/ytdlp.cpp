@@ -1,4 +1,7 @@
 #include "ytdlp.h"
+#include "backend/native/browse.h"
+#include "backend/native/innertube.h"
+#include "backend/native/http.h"
 #include "tunables.h"
 #include "json_util.h"
 #include "paths.h"
@@ -1892,8 +1895,16 @@ static std::string send_command_job(BackendChannel &ch, const std::string &cmd)
     return response;
 }
 
+// Handled entirely in C++ when it succeeds; false means "ask Python".
+static bool native_handle_command(const std::string &cmd, std::string &out);
+
 static std::string send_command_on(BackendChannel &ch, const std::string &cmd)
 {
+    {
+        std::string native_out;
+        if (native_handle_command(cmd, native_out))
+            return native_out;
+    }
     // A command can arrive while the main worker is still importing Python
     // (session restore does exactly this). Wait on the caller's thread rather
     // than making the UI wait during startup. Optional channels are only
@@ -3568,6 +3579,55 @@ std::string playable_track_url(const std::string &id, const std::string &url)
     return url;
 }
 
+// Download the audio stream the native resolver already picked. This avoids
+// the yt-dlp/deno signature dance entirely for the common case (and keeps
+// working when the account is in the SABR experiment, where yt-dlp's web
+// clients fail). ffmpeg only remuxes; no re-encode.
+static std::string native_download_audio(const std::string &video_id,
+                                         const std::string &dir)
+{
+    if (!native_backend_enabled() || !native::http_available())
+        return "";
+    const native::StreamResult stream = native::resolve_audio(video_id);
+    if (!stream.ok || stream.url.empty())
+        return "";
+    std::string ext = "webm";
+    if (stream.mime.find("mp4") != std::string::npos)
+        ext = "m4a";
+    else if (stream.mime.find("ogg") != std::string::npos)
+        ext = "ogg";
+    const std::string path = dir + "/" + video_id + "." + ext;
+    const std::string tmp = path + ".part";
+    const char *ffmpeg_env = getenv("P100_FFMPEG");
+    const std::string ffmpeg = ffmpeg_env && *ffmpeg_env ? ffmpeg_env : "ffmpeg";
+    const std::string cmd = shell_quote(ffmpeg) + " -v error -y -user_agent " +
+                            shell_quote(native::web_user_agent()) + " -i " +
+                            shell_quote(stream.url) + " -vn -c:a copy " +
+                            shell_quote(tmp);
+    std::string output;
+    const int rc = run_capture(cmd, output);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(tmp, ec);
+    if (rc != 0 || ec || size == 0)
+    {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        return "";
+    }
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp, path, rename_ec);
+    if (rename_ec)
+    {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        return "";
+    }
+    Track t = fetch_track_metadata(video_id);
+    if (!t.title.empty())
+        save_metadata(t, path);
+    return path;
+}
+
 std::string get_cached_audio_path(const std::string &video_id)
 {
     if (video_id.empty())
@@ -3583,6 +3643,10 @@ std::string get_cached_audio_path(const std::string &video_id)
     std::string cached = find_audio_in(dir, video_id);
     if (!cached.empty())
         return cached;
+
+    if (std::string native_path = native_download_audio(video_id, dir);
+        !native_path.empty())
+        return native_path;
 
     const std::string url = "https://www.youtube.com/watch?v=" + video_id;
     const std::string output = " -o \"" + dir + "/" + video_id + ".%(ext)s\" ";
@@ -3629,10 +3693,255 @@ std::string get_cached_audio_path(const std::string &video_id)
 
 // Resolve a direct streaming URL (yt-dlp -g) so playback can start
 // almost immediately instead of waiting for a full file download.
+static std::atomic<int> g_native_backend{1};
+
+void set_native_backend_enabled(bool enabled)
+{
+    g_native_backend.store(enabled ? 1 : 0);
+}
+
+bool native_backend_enabled()
+{
+    // P100_BACKEND=python forces the old path; anything else uses the switch.
+    const char *env = getenv("P100_BACKEND");
+    if (env && *env)
+        return std::string(env) != "python";
+    return g_native_backend.load() != 0;
+}
+
+static bool native_handle_command(const std::string &cmd, std::string &out)
+{
+    if (!native_backend_enabled() || !native::http_available())
+        return false;
+    const std::size_t sp = cmd.find(' ');
+    const std::string word = cmd.substr(0, sp);
+    const std::string arg =
+        sp == std::string::npos ? std::string() : cmd.substr(sp + 1);
+    if (word == "meta" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::fetch_meta(arg, out, error))
+            return true;
+    }
+    if (word == "search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search(arg, 20, out, error))
+            return true;
+    }
+    if (word == "album_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_albums(arg, 20, out, error))
+            return true;
+    }
+    if (word == "artist_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_artists(arg, 20, out, error))
+            return true;
+    }
+    if (word == "suggest")
+    {
+        std::string error;
+        if (native::suggest(arg, out, error))
+            return true;
+    }
+    if (word == "album" && !arg.empty())
+    {
+        std::string error;
+        if (native::album(arg, out, error))
+            return true;
+    }
+    if (word == "album_of" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::album_of(arg, out, error))
+            return true;
+    }
+    if (word == "artist" && !arg.empty())
+    {
+        std::string error;
+        if (native::artist(arg, out, error))
+            return true;
+    }
+    if (word == "artist_of" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::artist_of(arg, out, error))
+            return true;
+    }
+    if (word == "artist_songs")
+    {
+        std::string id, off, cnt;
+        std::size_t a = arg.find(' ');
+        std::size_t b = a == std::string::npos ? std::string::npos : arg.find(' ', a + 1);
+        if (a != std::string::npos && b != std::string::npos)
+        {
+            id = arg.substr(0, a);
+            off = arg.substr(a + 1, b - a - 1);
+            cnt = arg.substr(b + 1);
+            std::string error;
+            if (!id.empty() &&
+                native::artist_songs(id, std::atoi(off.c_str()), std::atoi(cnt.c_str()), out,
+                                     error))
+                return true;
+        }
+    }
+    if (word == "playlist" && !arg.empty())
+    {
+        std::string error;
+        if (native::playlist(arg, out, error))
+            return true;
+    }
+    if (word == "radio" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::radio(arg, 50, out, error))
+            return true;
+    }
+    if (word == "recommendations")
+    {
+        std::string error;
+        const int limit = arg.empty() ? 40 : std::atoi(arg.c_str());
+        if (native::home(limit, out, error))
+            return true;
+    }
+    if (word == "search_all" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_all(arg, 20, out, error))
+            return true;
+    }
+    if (word == "library_playlists")
+    {
+        std::string error;
+        if (native::library_playlists(out, error))
+            return true;
+    }
+    if (word == "podcasts_library")
+    {
+        std::string error;
+        if (native::podcasts_library(out, error))
+            return true;
+    }
+    if (word == "podcasts_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::podcasts_search(arg, out, error))
+            return true;
+    }
+    if (word == "podcast" && !arg.empty())
+    {
+        std::string error;
+        if (native::podcast(arg, out, error))
+            return true;
+    }
+    if (word == "episodes_later")
+    {
+        std::string error;
+        if (native::episodes_later(out, error))
+            return true;
+    }
+    if (word == "prefetch")
+    {
+        std::vector<std::string> ids;
+        const std::string list = arg;
+        std::size_t pos = 0;
+        while (pos < list.size())
+        {
+            std::size_t end = list.find(' ', pos);
+            if (end == std::string::npos)
+                end = list.size();
+            if (end > pos)
+                ids.push_back(list.substr(pos, end - pos));
+            pos = end + 1;
+        }
+        std::string error;
+        if (!ids.empty() && native::prefetch_urls(ids, out, error))
+            return true;
+    }
+    if (word == "musicvideo" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::musicvideo(arg, out, error))
+            return true;
+    }
+    if (word == "lyrics" && arg.size() == 11)
+    {
+        std::string error;
+        if (native::lyrics(arg, out, error))
+            return true;
+    }
+    if (word == "rate_song")
+    {
+        std::string error;
+        if (native::rate_song(arg, out, error))
+            return true;
+    }
+    if (word == "create_playlist")
+    {
+        std::string error;
+        if (native::create_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "delete_playlist")
+    {
+        std::string error;
+        if (native::delete_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "edit_playlist")
+    {
+        std::string error;
+        if (native::edit_playlist(arg, out, error))
+            return true;
+    }
+    if (word == "add_playlist_items")
+    {
+        std::string error;
+        if (native::add_playlist_items(arg, out, error))
+            return true;
+    }
+    if (word == "remove_playlist_items")
+    {
+        std::string error;
+        if (native::remove_playlist_items(arg, out, error))
+            return true;
+    }
+    if (word == "play_video" || word == "play_video_fast" ||
+        word == "play_video_fresh")
+    {
+        std::string id = arg;
+        int height = 720;
+        const std::size_t sp2 = arg.find(' ');
+        if (sp2 != std::string::npos)
+        {
+            id = arg.substr(0, sp2);
+            height = std::atoi(arg.c_str() + sp2 + 1);
+        }
+        std::string error;
+        if (id.size() == 11 &&
+            native::resolve_video(id, height, word == "play_video_fresh", out, error))
+            return true;
+    }
+    return false;
+}
+
+static std::string try_native_stream(const std::string &video_id)
+{
+    if (!native_backend_enabled() || !native::http_available())
+        return "";
+    native::StreamResult r = native::resolve_audio(video_id);
+    return r.ok ? r.url : "";
+}
+
 std::string fetch_stream_url(const std::string &video_id)
 {
     if (is_local_media_id(video_id))
         return ""; // a file, not a stream
+    if (std::string native_url = try_native_stream(video_id); !native_url.empty())
+        return native_url;
     std::string response = send_play_command("play " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
@@ -3665,6 +3974,8 @@ std::string fetch_stream_url_fresh(const std::string &video_id)
 {
     if (is_local_media_id(video_id))
         return "";
+    if (std::string native_url = try_native_stream(video_id); !native_url.empty())
+        return native_url;
     std::string response = send_play_command("play_fresh " + video_id);
     if (response.find("\"error\"") != std::string::npos)
         return "";
