@@ -462,7 +462,7 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
 // too wide to lay out on one row (the caller falls back to the wrapped wipe).
 bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
                      float max_w, const RichLyricLine &line, double t,
-                     float alpha, float glow, bool focus)
+                     double next_start, float alpha, float glow, bool focus)
 {
     struct W
     {
@@ -500,6 +500,8 @@ bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
 
     const double line_start = line.start_ms / 1000.0;
     double line_end = line.end_ms / 1000.0;
+    if (line_end <= line_start && next_start > line_start)
+        line_end = next_start;
     if (line_end <= line_start)
         line_end = line_start + 4.0;
     // Line-only providers: distribute the interval over the words by length.
@@ -1415,6 +1417,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                         if (!rich.words.empty() || !rich.text.empty())
                             drew_words = draw_word_lyric(
                                 dl, font, size, line_center, max_text_w, rich, tplay,
+                                (i + 1 < (int)lx->times.size()) ? (double)lx->times[i + 1] : 0.0,
                                 alpha, is_active ? 1.0f : 0.0f, is_active);
                     }
                     if (!drew_words)
