@@ -104,22 +104,34 @@ More: [search albums](docs/screenshots/native-search-albums.jpg).
 |:---:|:---:|:---:|
 | ![Albums](docs/screenshots/albums.png) | ![Playlists](docs/screenshots/playlists.png) | ![Liked](docs/screenshots/liked.png) |
 
-## How it compares
+## Where crossfade fits
 
-| | Electron clients¹ | Native ytm-rs² | **crossfade** |
-|---|:---:|:---:|:---:|
-| Resolver | website in Chromium | Rust + yt-dlp/QuickJS | **native C++ InnerTube (VISIONOS/WEB_REMIX)** |
-| Hot-path dependencies | Node + Chromium | yt-dlp/QuickJS | **none** (Python/deno optional fallback) |
-| Warm uncached resolve | website latency | seconds | **111–126 ms** |
-| Real crossfade | ❌ | ❌ | ✅ |
-| Automatic offline cache | partial | partial | ✅ |
-| Measured room EQ | ❌ | ❌ | ✅ |
-| LAN party mode (phone queue) | ❌ | ❌ | ✅ |
-| Synced lyrics + click-to-seek | ✅ | mixed | ✅ |
-| Media keys / MPRIS / SMTC | ✅ | mixed | ✅ |
-| GPL-3.0 | mixed | ✅ | ✅ |
+Most YouTube Music desktop apps are the website running inside Electron. crossfade is a
+native C++ client: it draws its own interface and hands audio to libmpv.
 
-¹ th-ch/youtube-music, ytmdesktop · ² ytm-rs. Claims are about the default path, not what a plugin can bolt on.
+| | Electron clients¹ | **crossfade** |
+|---|:---:|:---:|
+| Resolver | website in Chromium | **native C++ InnerTube** |
+| Hot-path dependencies | Node + Chromium | **none** (Python/deno optional fallback) |
+| Cold start → window | seconds | **~0.30 s** |
+| Idle RAM | 300–600 MB | **~116 MB** |
+| Real crossfade | ❌ | ✅ |
+| Automatic offline cache | partial | ✅ |
+| Measured room EQ | ❌ | ✅ |
+| LAN party mode (phone queue) | ❌ | ✅ |
+| Synced lyrics + click-to-seek | ✅ | ✅ |
+| Media keys / MPRIS / SMTC | ✅ | ✅ |
+| GPL-3.0 | mixed | ✅ |
+
+¹ th-ch/youtube-music, ytmdesktop.
+
+**Credit where it is due:** [ytm-rs](https://github.com/grapedjuice/ytm-rs) is the other
+native YouTube Music client, and the reason this backend exists. Its work with the
+`visionOS` player showed that plain stream URLs were possible without a browser, a JS
+runtime or a signature puzzle. crossfade applies the same idea in C++ and adds a different
+set of things — two-player crossfade, phone-measured room correction, a LAN party queue and
+a native browse/lyrics/podcast layer with a Python fallback. It is also excellent; if you
+prefer Rust/egui, use it. If you want the feature set above, use crossfade.
 
 ## Common questions
 
@@ -128,6 +140,14 @@ No. Guest mode gives you public search, albums, artists, radio, podcasts, lyrics
 
 **Isn't signing in annoying?**
 One-time, about 30 seconds: import your browser session with `crossfade-login`. The app refreshes the expiring request hash from the cookies at startup; when the cookies themselves expire (weeks to months), re-importing fixes it. OAuth remains available as an experimental alternative.
+
+**How is this different from ytm-rs?**
+ytm-rs is a great native client and the direct inspiration for this backend: it showed the
+`visionOS` player could hand back plain URLs. ytm-rs is Rust/egui, with karaoke-style
+word-by-word lyrics, themes and jams. crossfade is C++/ImGui, with real two-player
+crossfade, phone-measured room EQ, a native browse/lyrics/podcast layer and a Python
+backend as a permanent fallback. Different stacks, different feature sets — use the one
+that fits you.
 
 **Is this allowed?**
 It talks to YouTube Music with your own account, using the same public web endpoints the site uses. Not affiliated with or endorsed by Google. GPL-3.0. No telemetry, no server; requests go to YouTube and nowhere else.
@@ -145,7 +165,7 @@ Both are first-class: AppImage/deb/rpm/AUR and source builds on Linux; an MSYS2 
 - [Why crossfade](#why-crossfade)
 - [Performance](#performance)
 - [Screenshots](#screenshots)
-- [How it compares](#how-it-compares)
+- [Where crossfade fits](#where-crossfade-fits)
 - [Install (Linux)](#install-linux)
 - [Install on Windows](#install-on-windows-one-click)
 - [Sign in](#sign-in)
@@ -199,14 +219,16 @@ A handful of library headers, available in every mainstream distro:
 ```bash
 # Debian / Ubuntu / Mint
 sudo apt install build-essential cmake pkg-config libsdl2-dev libgl1-mesa-dev \
-                 libmpv-dev libglib2.0-dev libnotify-dev python3 python3-venv curl
+                 libmpv-dev libglib2.0-dev libnotify-dev libssl-dev ffmpeg \
+                 python3 python3-venv curl
 
 # Arch / Manjaro
-sudo pacman -S --needed base-devel cmake sdl2 mesa mpv glib2 libnotify python curl
+sudo pacman -S --needed base-devel cmake sdl2 mesa mpv glib2 libnotify openssl ffmpeg python curl
 
 # Fedora
 sudo dnf install @development-tools cmake SDL2-devel mesa-libGL-devel \
-                 mpv-devel glib2-devel libnotify-devel python3 python3-pip curl
+                 mpv-devel glib2-devel libnotify-devel openssl-devel ffmpeg \
+                 python3 python3-pip curl
 ```
 
 `./install.sh` also provisions the JavaScript runtime yt-dlp needs for
@@ -1170,6 +1192,8 @@ YouTube's terms of service.
   API, still the fallback backend and the reference for the native browse shapes
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — the JSLess `VISIONOS` client path that proved
   plain URLs were possible, and the download fallback
+- [ytm-rs](https://github.com/grapedjuice/ytm-rs) — the native client whose `visionOS`
+  player proved this approach; the backend idea started there
 - [cpp-httplib](https://github.com/yhirose/cpp-httplib) — native HTTP (shared with the party server)
 - [mpv](https://mpv.io/) / libmpv — playback, crossfade, `stream-record`
 - [Dear ImGui](https://github.com/ocornut/imgui) · [SDL2](https://www.libsdl.org/) ·

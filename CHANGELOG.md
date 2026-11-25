@@ -2,6 +2,48 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.6.0 - 2026-11-25
+
+### The native backend
+
+Stream resolution, search, suggestions, the search Top result, album and artist pages,
+playlists (all continuation pages), radio, the personalized Home feed, lyrics, podcasts,
+library playlists, likes and playlist writes are now served by a native C++ InnerTube
+client instead of Python and yt-dlp.
+
+- `VISIONOS` player for streams: plain URLs, no JS challenge, no deno, no PoToken.
+- `WEB_REMIX` for browse/search/radio/home/suggestions, with continuation tokens so a
+  182-track playlist returns all 182 tracks in about a second.
+- Three-hour shared session; browse/search work anonymously and do not wait for it.
+- Warm resolve 111–126 ms, cold ~1.2 s. Native page on **F3** with per-request traces,
+  p50/p95, session state and copy-as-JSON.
+- The Python backend, yt-dlp and deno stay as a permanent fallback;
+  `P100_BACKEND=python` forces the old path.
+- Certificates/HTTP use the existing OpenSSL/httplib stack.
+
+### Added
+
+- Native downloads: the resolver picks the stream and `ffmpeg -c:a copy` writes the file,
+  falling back to yt-dlp. Verified in-app and with external network access blocked.
+- `P100_WINDOW_SIZE=WxH` launch size.
+- Fresh SAPISIDHASH computed per native request and at Python backend startup, so an
+  imported session no longer looks signed out when the stored hash expires.
+
+### Fixed
+
+- Album tracks showing "Unknown artist": individual album rows often omit the artist, so
+  album pages now inherit the header artist/ID (same behavior as ytmusicapi).
+- The player bar doubling in height when the window touched the bottom of the screen. The
+  inactive edge band is now reserved only on GNOME-style autohide shells and is left as
+  page background, so the bar keeps one fixed height.
+- `search_all` now returns the Top result card and correctly classifies album/artist
+  shelves instead of adding artist rows as songs.
+- The native debug window is larger and its trace table is readable.
+
+### License
+
+- GPL-3.0 with third-party notices.
+
 ## 0.5.5 - 2026-11-24
 
 ### Added
