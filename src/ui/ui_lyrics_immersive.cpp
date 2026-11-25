@@ -229,6 +229,19 @@ struct ImmersiveAnim
     double switch_start = -100.0;
     Track prev_display;
     Track current_display;
+    // Where the outgoing cover was when the song changed, and how it was
+    // drawn, so it can slide away without jumping layouts mid-flight.
+    float prev_cover_x = -1.0f;
+    bool prev_cover_card = false;
+    // Last drawn cover position/layout; captured when the song changes.
+    float cover_x = -1.0f;
+    bool cover_card = false;
+    // Timed 0..1 blend from the cover column to the window centre. Only used
+    // on split layouts; a track without lyrics settles in the centre.
+    float cover_center = 0.0f;
+    float center_goal = 0.0f;
+    float center_from = 0.0f;
+    double center_start = -100.0;
     float unsynced_scroll = 0.0f;
     float enter = 0.0f;
     float pulse = 0.0f;
@@ -880,11 +893,24 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 // fully opaque; the cover slide and background crossfade use
                 // the previous display snapshot below.
                 g_imm.prev_display = g_imm.current_display;
+                g_imm.prev_cover_x = g_imm.cover_x;
+                g_imm.prev_cover_card = g_imm.cover_card;
                 g_imm.enter = 1.0f;
                 g_imm.switch_start = now;
+                // The incoming cover always arrives in the column first; a
+                // track without lyrics glides to the centre once it lands.
+                g_imm.cover_center = 0.0f;
+                g_imm.center_goal = 0.0f;
             }
             else
+            {
                 g_imm.enter = motion ? 0.0f : 1.0f;
+                // Opening directly on a track without lyrics: start centred
+                // instead of sliding in from the empty column.
+                g_imm.cover_center = (split && no_lyrics_only) ? 1.0f : 0.0f;
+                g_imm.center_goal = g_imm.cover_center;
+            }
+            g_imm.cover_x = -1.0f;
             g_imm.view_start = now;
             g_imm.active = -2;
             g_imm.scroll = -1.0f;
@@ -915,6 +941,44 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 animating = true;
         }
         const bool transitioning = switch_p < 0.999f && !g_imm.prev_display.id.empty();
+
+        // A track with no lyrics shows the centred cover card. Move there only
+        // after the incoming cover has finished sliding up, so the hand-off
+        // reads as "slide in, then settle in the middle".
+        const float center_target = (split && no_lyrics_only) ? 1.0f : 0.0f;
+        if (!split)
+        {
+            g_imm.cover_center = 0.0f;
+            g_imm.center_goal = 0.0f;
+        }
+        else if (!motion)
+        {
+            g_imm.cover_center = center_target;
+            g_imm.center_goal = center_target;
+        }
+        else if (!transitioning || switch_p > 0.86f)
+        {
+            if (center_target != g_imm.center_goal)
+            {
+                // Re-anchor so a target change mid-glide curves from wherever
+                // the cover is now instead of snapping.
+                g_imm.center_goal = center_target;
+                g_imm.center_from = g_imm.cover_center;
+                g_imm.center_start = now;
+            }
+            const double age = now - g_imm.center_start;
+            const double glide = 0.55;
+            if (age >= glide)
+                g_imm.cover_center = center_target;
+            else if (age >= 0.0)
+            {
+                g_imm.cover_center =
+                    g_imm.center_from +
+                    (center_target - g_imm.center_from) *
+                        ease_in_out((float)(age / glide));
+                animating = true;
+            }
+        }
 
         // Seek target survives the chrome fading out mid-drag.
         static float s_seek = -1.0f;
@@ -1168,22 +1232,46 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                           96, ui_px(1.5f));
         }
 
-        if (split && !display.id.empty() && !no_lyrics_only)
+        // ---- Covers ----
+        // Split layouts keep the sharp cover in the left column; a track with
+        // no lyrics uses the larger card and glides from that column to the
+        // centre of the window. Narrow layouts only draw the card while there
+        // are no lyrics to show.
+        const float column_cx = cover_col_w * 0.5f;
+        const float centre_cx = w * 0.5f;
+        const float cover_x =
+            split ? column_cx + (centre_cx - column_cx) * clampf(g_imm.cover_center, 0.0f, 1.0f)
+                  : centre_cx;
+        const bool cover_card = no_lyrics_only || !split;
+        const bool cover_visible =
+            !display.id.empty() &&
+            (split || no_lyrics_only || !has_payload || !snap->lyrics.ok);
+        auto draw_cover_at = [&](const Track &t, bool card, float cx, float alpha,
+                                 float y_shift) {
+            if (card)
+                draw_cover_card(dl, t, ImVec2(cx, focal_y), w, h, alpha, y_shift);
+            else
+                draw_cover_column(dl, t, ImVec2(cx, h * 0.43f), cover_col_w, h, alpha,
+                                  y_shift);
+        };
+        if (cover_visible)
         {
             if (transitioning)
             {
                 // No opacity fade: the two covers travel as one vertical strip.
                 // The outgoing card leaves the top, the incoming one arrives
                 // from the bottom into exactly the same place.
-                draw_cover_column(dl, g_imm.prev_display,
-                                  ImVec2(cover_col_w * 0.5f, h * 0.43f), cover_col_w, h,
-                                  view_a, -h * switch_p);
-                draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
-                                  cover_col_w, h, view_a, h * (1.0f - switch_p));
+                const float old_x = g_imm.prev_cover_x >= 0.0f ? g_imm.prev_cover_x
+                                                               : column_cx;
+                draw_cover_at(g_imm.prev_display, g_imm.prev_cover_card, old_x,
+                              view_a, -h * switch_p);
+                draw_cover_at(display, cover_card, cover_x, view_a,
+                              h * (1.0f - switch_p));
             }
             else
-                draw_cover_column(dl, display, ImVec2(cover_col_w * 0.5f, h * 0.43f),
-                                  cover_col_w, h, view_a);
+                draw_cover_at(display, cover_card, cover_x, view_a, 0.0f);
+            g_imm.cover_x = cover_x;
+            g_imm.cover_card = cover_card;
         }
 
         // ---- Lyrics ----
@@ -1222,31 +1310,14 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (draw_cover)
         {
             const bool centered_cover = !split || no_lyrics_only;
-            const ImVec2 cover_centre = no_lyrics_only && split
-                                            ? ImVec2(w * 0.5f, focal.y)
-                                            : focal;
-            if (centered_cover)
-            {
-                if (transitioning)
-                {
-                    draw_cover_card(dl, g_imm.prev_display, cover_centre, w, h,
-                                    view_a, -h * switch_p);
-                    draw_cover_card(dl, display, cover_centre, w, h, view_a,
-                                    h * (1.0f - switch_p));
-                }
-                else
-                    draw_cover_card(dl, display, cover_centre, w, h, view_a);
-            }
+            const float note_x = centered_cover ? cover_x : focal.x;
             if (!note.empty())
             {
                 const float ns = std::max(12.0f, std::min(16.0f, h * 0.016f));
                 const float nw = measure(g_ui_fonts.body, ns, note);
-                const ImVec2 note_centre = centered_cover
-                                               ? ImVec2(w * 0.5f, focal.y)
-                                               : focal;
                 dl->AddText(g_ui_fonts.body, ns,
-                            ImVec2(note_centre.x - nw * 0.5f,
-                                   note_centre.y +
+                            ImVec2(note_x - nw * 0.5f,
+                                   focal.y +
                                        (centered_cover ? std::min(w, h) * 0.33f : 0.0f)),
                             ui_with_alpha(ui_text_dim_u32(), 0.62f * view_a), note.c_str());
             }
@@ -1260,7 +1331,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     const float ph = (float)now * 2.6f - (float)i * 0.6f;
                     const float a = 0.20f + 0.50f * (0.5f + 0.5f * std::sin(ph));
                     const float dx = ((float)i - 1.0f) * ui_px(14.0f);
-                    dl->AddCircleFilled(ImVec2(focal.x + dx, dot_y + std::sin(ph) * ui_px(2.0f)),
+                    dl->AddCircleFilled(ImVec2(note_x + dx, dot_y + std::sin(ph) * ui_px(2.0f)),
                                         ui_px(3.2f), ui_accent_u32(a * view_a), 14);
                 }
                 animating = true;
@@ -1472,6 +1543,39 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                         draw_rows(dl, font, lay, line_center,
                                   is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
                                   alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
+                }
+            }
+        }
+
+        // Narrow layouts put the lyrics across the whole window, so the cover
+        // column (and its title/artist) is not there. Keep a quiet caption at
+        // the bottom that hands over to the chrome when it appears.
+        if (!split && !draw_cover && !show_message && !display.id.empty())
+        {
+            const float cap_a = (1.0f - chrome_a) * view_a * 0.88f *
+                                (transitioning ? switch_p : 1.0f);
+            if (cap_a > 0.003f)
+            {
+                const float title_s = std::max(15.0f, std::min(20.0f, h * 0.021f));
+                const float artist_s = std::max(12.0f, title_s * 0.72f);
+                const std::string title = ui_ellipsize(
+                    g_ui_fonts.semibold, title_s,
+                    display.title.empty() ? "Nothing playing" : display.title,
+                    w - pad * 2.0f);
+                const std::string artist = ui_ellipsize(
+                    g_ui_fonts.body, artist_s, display.artist, w - pad * 2.0f);
+                const float ty = h - pad - l.bottom_safe - ui_px(40.0f);
+                const float tw = measure(g_ui_fonts.semibold, title_s, title);
+                dl->AddText(g_ui_fonts.semibold, title_s,
+                            ImVec2((w - tw) * 0.5f, ty),
+                            ui_with_alpha(ui_text_u32(), 0.82f * cap_a), title.c_str());
+                if (!artist.empty())
+                {
+                    const float aw = measure(g_ui_fonts.body, artist_s, artist);
+                    dl->AddText(g_ui_fonts.body, artist_s,
+                                ImVec2((w - aw) * 0.5f, ty + title_s * 1.32f),
+                                ui_with_alpha(ui_text_dim_u32(), 0.72f * cap_a),
+                                artist.c_str());
                 }
             }
         }

@@ -123,24 +123,26 @@ void ui_toggle_immersive_lyrics(AppState &state)
     else
     {
         const Track display = lyrics_display_track(state);
-        auto snap = std::atomic_load(&state.lyrics);
-        const bool usable = !display.id.empty() && snap &&
-                            snap->track_id == display.id &&
-                            snap->lyrics.ok && !snap->lyrics.none &&
-                            !snap->lyrics.lines.empty();
-        if (usable)
+        if (!display.id.empty())
         {
+            // The takeover works without lyrics too: it falls back to the
+            // cover/title/artist card and shows "loading" or "no lyrics".
             state.lyrics_immersive = true;
             state.settings.lyrics_panel_open = true;
             save_settings(state.settings);
+            auto snap = std::atomic_load(&state.lyrics);
+            const bool have = snap && snap->track_id == display.id && snap->lyrics.ok;
+            if (!have)
+            {
+                state.lyrics_requested_id = state.current_track_id;
+                state.lyrics_refresh_requested = true;
+            }
         }
         else
         {
-            // Let the docked panel show loading / retry / "no lyrics".
+            // Nothing playing: let the docked panel show the empty state.
             state.settings.lyrics_panel_open = true;
             save_settings(state.settings);
-            state.lyrics_requested_id = state.current_track_id;
-            state.lyrics_refresh_requested = true;
         }
     }
     state.repaint_requested = true;
