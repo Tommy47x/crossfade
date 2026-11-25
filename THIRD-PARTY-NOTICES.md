@@ -34,8 +34,9 @@ license text next to the source.
   translation/romanization flow are the reference for the native lyrics
   payload (`src/backend/native/browse.cpp`). The implementation here is C++,
   not a copy of the Rust binary; where its algorithms or constants are adapted,
-  this notice and the file headers are the attribution. Both projects are
-  GPL-3.0.
+  this notice and the file headers are the attribution. The wide-window
+  cover column in the immersive view is also inspired by ytm-rs's default
+  split layout. Both projects are GPL-3.0.
 - **[Unison](https://unison.betterlyrics.org/)** (Better Lyrics) provides the
   word/syllable-timed TTML and enhanced LRC plus the translation/romanization
   endpoint used by the native lyrics path. Lyrics remain the property of their
