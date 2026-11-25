@@ -54,6 +54,16 @@ float ease_out(float t)
     return 1.0f - (1.0f - t) * (1.0f - t);
 }
 
+// Smooth acceleration and deceleration for the song hand-off. A linear or
+// ease-out travel over a full screen height reads as a mechanical scroll;
+// this cubic gives the cover weight at both ends.
+float ease_in_out(float t)
+{
+    t = clampf(t, 0.0f, 1.0f);
+    return t < 0.5f ? 4.0f * t * t * t
+                    : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+}
+
 bool blank(const std::string &s)
 {
     for (char c : s)
@@ -894,9 +904,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (motion && g_imm.switch_start > 0.0)
         {
             const double age = now - g_imm.switch_start;
-            const double dur = 0.65;
+            const double dur = 0.80;
             if (age < dur)
-                switch_p = ease_out((float)(age / dur));
+                switch_p = ease_in_out((float)(age / dur));
             if (age < dur + 0.35)
                 animating = true;
         }
@@ -1406,10 +1416,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     if (transitioning)
                     {
                         const int order = std::max(0, i - center_idx);
-                        reveal = clampf((float)((now - g_imm.switch_start -
-                                                 (double)order * 0.045) /
-                                                0.35),
-                                        0.0f, 1.0f);
+                        reveal = ease_out(clampf(
+                            (float)((now - g_imm.switch_start -
+                                     (double)order * 0.045) /
+                                    0.35),
+                            0.0f, 1.0f));
                         alpha *= reveal;
                     }
                     const bool is_active = (!preview && i == center_idx);

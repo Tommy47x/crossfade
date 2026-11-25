@@ -2,6 +2,44 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.6.1 - 2026-11-26
+
+### Immersive lyrics
+
+- Unison/Better Lyrics provider with TTML syllable/word timings and enhanced
+  LRC, plus translations and romanization. The provider cascade still falls
+  back to YouTube timed lyrics, LRCLIB and lyrics.ovh; the payload is cached
+  with the new v2 format.
+- The active line uses the provider's word timings for a karaoke sweep in the
+  app's own typography, with a faint glow on the current letter. Line-only
+  providers use the original line renderer.
+- Split cover column on wide windows, cover/title/artist state while lyrics
+  load or when a track has none, and high-resolution cover URLs (maxres/1080)
+  with the original thumbnail as fallback.
+- Song changes now slide the outgoing cover fully off the top and the incoming
+  cover in from below, with a cubic ease-in-out, a crossfading blurred
+  backdrop and staggered lyric lines. Lyrics for the next three queue rows
+  are prefetched.
+
+### Home
+
+- Endless personalized feed: the native home continuation is followed page by
+  page, then an endless radio mix picks up when the home token chain ends.
+  The near-bottom loader appends instead of re-fetching the first page.
+
+### Auth
+
+- The Python fallback uses a private runtime auth copy instead of rewriting
+  `browser.json`; the app no longer restarts the backend in a loop. A genuine
+  sign-in keeps the current Home list while the new feed loads.
+
+### Fixed
+
+- TTML `<parameter>`/`<person>` tags are not parsed as lyric lines.
+- The word sweep starts when the word is current, not as soon as its start time
+  is reached.
+- The sweep edge line is gone.
+
 ## 0.6.0 - 2026-11-25
 
 ### The native backend
