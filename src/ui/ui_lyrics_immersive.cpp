@@ -42,6 +42,9 @@ const float kPulseDecay = 3.6f;    // higher = snappier pulse
 const float kLineEnter = 0.42f;    // active-line entrance duration
 const float kViewEnter = 0.45f;    // whole-view fade-in
 const float kViewExit = 0.30f;     // fade back to the app on close
+const double kSwitchDur = 0.80;    // cover hand-off travel
+const double kLyricReveal = 0.34;  // one lyric line's fade/rise
+const double kLyricStagger = 0.05; // delay between consecutive lines
 
 float clampf(float v, float lo, float hi)
 {
@@ -934,13 +937,20 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (motion && g_imm.switch_start > 0.0)
         {
             const double age = now - g_imm.switch_start;
-            const double dur = 0.80;
-            if (age < dur)
-                switch_p = ease_in_out((float)(age / dur));
-            if (age < dur + 0.35)
+            if (age < kSwitchDur)
+                switch_p = ease_in_out((float)(age / kSwitchDur));
+            if (age < kSwitchDur + kLyricReveal + kLyricStagger * 8.0)
                 animating = true;
         }
         const bool transitioning = switch_p < 0.999f && !g_imm.prev_display.id.empty();
+
+        // Lyrics wait for the covers to finish their trip. Starting the line
+        // fade during the slide painted text over the artwork.
+        const double switch_age =
+            g_imm.switch_start > 0.0 ? now - g_imm.switch_start : 1.0e9;
+        const bool lyric_intro = motion && switch_age >= 0.0 &&
+                                 switch_age < kSwitchDur + kLyricReveal +
+                                                    kLyricStagger * 8.0;
 
         // A track with no lyrics shows the centred cover card. Move there only
         // after the incoming cover has finished sliding up, so the hand-off
@@ -1263,7 +1273,14 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 // from the bottom into exactly the same place.
                 const float old_x = g_imm.prev_cover_x >= 0.0f ? g_imm.prev_cover_x
                                                                : column_cx;
-                draw_cover_at(g_imm.prev_display, g_imm.prev_cover_card, old_x,
+                // A centred no-lyrics card returns to the column while it
+                // leaves, so the next cover rises into a line it just left.
+                // Move left early in the trip, while the card is still on
+                // screen, then let it continue straight up in the column.
+                const float exit_p = clampf(switch_p * 3.0f, 0.0f, 1.0f);
+                const float exit_x =
+                    split ? old_x + (column_cx - old_x) * exit_p : old_x;
+                draw_cover_at(g_imm.prev_display, g_imm.prev_cover_card, exit_x,
                               view_a, -h * switch_p);
                 draw_cover_at(display, cover_card, cover_x, view_a,
                               h * (1.0f - switch_p));
@@ -1402,10 +1419,15 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             const float top = pad;
             const float bottom = h - pad;
 
+            const float intro =
+                lyric_intro
+                    ? ease_out(clampf((float)((switch_age - kSwitchDur) / kLyricReveal),
+                                      0.0f, 1.0f))
+                    : 1.0f;
             dl->PushClipRect(ImVec2(wp.x, wp.y + top), ImVec2(wp.x + w, wp.y + bottom), true);
             for (const TextRow &row : rows)
             {
-                float a = view_a * 0.86f;
+                float a = view_a * 0.86f * intro;
                 if (y < top + edge)
                     a *= clampf((y - top) / edge, 0.0f, 1.0f);
                 if (y + line_h > bottom - edge)
@@ -1503,13 +1525,13 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     float alpha =
                         (preview ? 0.60f : 1.0f) * (0.08f + 0.92f * f2) * view_a;
                     float reveal = 1.0f;
-                    if (transitioning)
+                    if (lyric_intro)
                     {
                         const int order = std::max(0, i - center_idx);
                         reveal = ease_out(clampf(
-                            (float)((now - g_imm.switch_start -
-                                     (double)order * 0.045) /
-                                    0.35),
+                            (float)((switch_age - kSwitchDur -
+                                     (double)order * kLyricStagger) /
+                                    kLyricReveal),
                             0.0f, 1.0f));
                         alpha *= reveal;
                     }
