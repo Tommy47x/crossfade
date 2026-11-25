@@ -36,14 +36,37 @@ struct Track
 // definitive "this track has no lyrics" result from the backend (cacheable).
 // `times` is parallel to `lines` and holds start times in seconds (only
 // meaningful when `synced` is true).
+struct LyricWord
+{
+    int start_ms = 0;
+    int end_ms = 0;
+    std::string text;
+};
+
+// A line with optional word/syllable timings and the extras the immersive
+// view draws underneath it. `times`/`lines` below remain the simple view used
+// by the docked panel and older cache files.
+struct RichLyricLine
+{
+    int start_ms = 0;
+    int end_ms = 0;
+    std::string text;
+    std::vector<LyricWord> words;
+    std::string translation;
+    std::string romanization;
+};
+
 struct Lyrics
 {
     bool ok = false;
     bool none = false;
     bool synced = false;
     std::string source;
+    std::string language;
+    int version = 0; // 2 = rich word timings/translations
     std::vector<int> times;
     std::vector<std::string> lines;
+    std::vector<RichLyricLine> rich;
 };
 
 // ---- Studio: waveform + beat analysis ----
@@ -183,6 +206,9 @@ BackendError take_backend_error();
 std::vector<Track> parse_track_array(const std::string &json);
 
 std::vector<Track> fetch_recommendations(bool force_fresh = false, int limit = 40);
+// Append the next page of the personalized Home feed. has_more is true while
+// YouTube still returned a continuation token.
+std::vector<Track> fetch_recommendations_more(bool &has_more);
 // Set *failed (when provided) if the backend did not answer or reported an
 // error, so callers can distinguish "no matches" from "search unavailable".
 std::vector<Track> fetch_search(const std::string &query, bool *failed = nullptr);

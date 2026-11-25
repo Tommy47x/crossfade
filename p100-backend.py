@@ -58,18 +58,19 @@ def main():
     ensure_config_dir(CONFIG_DIR)
     guest = True
     yt = None
+    auth_session_file = AUTH_FILE
     if os.path.exists(AUTH_FILE):
         secure_auth_file(AUTH_FILE)
         try:
-            # Stored SAPISIDHASH expires; recompute it from the cookies before
-            # ytmusicapi reads the file, otherwise a valid session looks
-            # signed out to the fallback backend.
+            # Stored SAPISIDHASH expires; use a private runtime copy with a
+            # fresh hash. Never rewrite browser.json here: the app watches its
+            # mtime for real sign-ins and would restart the backend in a loop.
             try:
-                from cf_backend.login import refresh_auth_file
-                refresh_auth_file(AUTH_FILE)
+                from cf_backend.login import prepare_runtime_auth
+                auth_session_file = prepare_runtime_auth(AUTH_FILE)
             except Exception:
                 pass
-            yt = YTMusic(AUTH_FILE)
+            yt = YTMusic(auth_session_file)
             # A cookie file can construct a YTMusic object and still be
             # anonymous (expired/incomplete cookies). Verify the account flag so
             # Home is not filled with a generic feed and cached as personalized.
@@ -107,7 +108,7 @@ def main():
     # Each concurrent command worker needs its own YTMusic (ytmusicapi's
     # requests session is not thread-safe). Guest workers browse anonymously.
     def _session_factory():
-        return YTMusic() if guest else YTMusic(AUTH_FILE)
+        return YTMusic() if guest else YTMusic(auth_session_file)
 
     run_command_loop(yt, guest=guest, session_factory=_session_factory)
 

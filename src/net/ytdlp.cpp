@@ -1733,6 +1733,7 @@ bool parse_lyrics_json(const std::string &json, Lyrics &out)
         return false;
 
     out.ok = true;
+    out.version = json_get_int(json, "version");
     if (json_get_bool(json, "none"))
     {
         out.none = true;
@@ -1741,6 +1742,7 @@ bool parse_lyrics_json(const std::string &json, Lyrics &out)
 
     out.synced = json_get_bool(json, "synced");
     out.source = json_get_string(json, "source");
+    out.language = json_get_string(json, "language");
 
     size_t lines_key = json.find("\"lines\":");
     if (lines_key == std::string::npos)
@@ -1762,10 +1764,62 @@ bool parse_lyrics_json(const std::string &json, Lyrics &out)
         if (end == std::string::npos)
             break;
         std::string obj = json.substr(pos, end - pos + 1);
-        out.times.push_back(json_get_int(obj, "t"));
-        std::string text = json_get_string(obj, "text");
-        normalize_lyric_text(text);
-        out.lines.push_back(std::move(text));
+        RichLyricLine rich;
+        rich.start_ms = json_get_int(obj, "t") * 1000;
+        rich.end_ms = json_get_int(obj, "end") * 1000;
+        rich.text = json_get_string(obj, "text");
+        normalize_lyric_text(rich.text);
+        rich.translation = json_get_string(obj, "translation");
+        rich.romanization = json_get_string(obj, "roman");
+        const size_t words_key = obj.find("\"words\":[");
+        if (words_key != std::string::npos)
+        {
+            size_t wpos = obj.find('[', words_key) + 1;
+            while (wpos < obj.size() && wpos != 0)
+            {
+                while (wpos < obj.size() &&
+                       (isspace((unsigned char)obj[wpos]) || obj[wpos] == ','))
+                    ++wpos;
+                if (wpos >= obj.size() || obj[wpos] != '{')
+                    break;
+                const size_t wend = json_object_end(obj, wpos);
+                if (wend == std::string::npos)
+                    break;
+                const std::string wobj = obj.substr(wpos, wend - wpos + 1);
+                LyricWord word;
+                word.start_ms = json_get_int(wobj, "s");
+                word.end_ms = json_get_int(wobj, "e");
+                word.text = json_get_string(wobj, "text");
+                if (!word.text.empty())
+                    rich.words.push_back(std::move(word));
+                wpos = wend + 1;
+            }
+        }
+        if (rich.words.empty())
+        {
+            // Some providers time the line but not its words. Split it here so
+            // the immersive view can still light words (and the docked panel
+            // keeps using the plain string).
+            std::string current;
+            for (char c : rich.text)
+            {
+                if (c == ' ' || c == '\t')
+                {
+                    if (!current.empty())
+                    {
+                        rich.words.push_back({0, 0, std::move(current)});
+                        current.clear();
+                    }
+                }
+                else
+                    current += c;
+            }
+            if (!current.empty())
+                rich.words.push_back({0, 0, std::move(current)});
+        }
+        out.times.push_back(rich.start_ms / 1000);
+        out.lines.push_back(rich.text);
+        out.rich.push_back(std::move(rich));
         pos = end + 1;
     }
     return true;
@@ -2352,6 +2406,43 @@ void save_cached_track_metadata(const Track &track, const std::string &audio_pat
 }
 
 // ------------------ Public functions ------------------
+// The personalized Home feed is paginated by a continuation token. Keep the
+// newest token here so the UI can append more rows without re-fetching the
+// first page. The token chain is per-session; it is replaced on refresh and
+// dropped when the native continuation is exhausted or fails.
+static std::mutex g_home_continuation_mutex;
+static std::string g_home_continuation;
+
+static void store_home_continuation(const std::string &continuation)
+{
+    std::lock_guard<std::mutex> lock(g_home_continuation_mutex);
+    g_home_continuation = continuation;
+}
+
+static bool parse_home_feed(const std::string &json, std::vector<Track> &out,
+                            std::string &continuation)
+{
+    out.clear();
+    continuation.clear();
+    const std::size_t first = json.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return false;
+    if (json[first] == '[')
+    {
+        // Python fallback: a plain track array, no pagination.
+        out = parse_track_array(json);
+        return true;
+    }
+    for_each_json_object(json, "tracks", [&](const std::string &obj) {
+        Track t;
+        parse_track_object(obj, t);
+        if (!t.id.empty() && !t.title.empty())
+            out.push_back(std::move(t));
+    });
+    continuation = json_get_string(json, "continuation");
+    return true;
+}
+
 std::vector<Track> fetch_recommendations(bool force_fresh, int limit)
 {
     if (limit <= 0)
@@ -2384,7 +2475,15 @@ std::vector<Track> fetch_recommendations(bool force_fresh, int limit)
                                      std::istreambuf_iterator<char>());
                     file.close();
                     if (!json.empty())
-                        return parse_track_array(json);
+                    {
+                        std::vector<Track> tracks;
+                        std::string continuation;
+                        if (parse_home_feed(json, tracks, continuation))
+                        {
+                            store_home_continuation(continuation);
+                            return tracks;
+                        }
+                    }
                 }
             }
         }
@@ -2410,7 +2509,44 @@ std::vector<Track> fetch_recommendations(bool force_fresh, int limit)
         out << response;
         out.close();
     }
-    return parse_track_array(response);
+    std::vector<Track> tracks;
+    std::string continuation;
+    if (!parse_home_feed(response, tracks, continuation))
+        return {};
+    store_home_continuation(continuation);
+    return tracks;
+}
+
+std::vector<Track> fetch_recommendations_more(bool &has_more)
+{
+    has_more = false;
+    if (!native_backend_enabled() || !native::http_available())
+        return {};
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(g_home_continuation_mutex);
+        token = g_home_continuation;
+    }
+    if (token.empty())
+        return {};
+    std::string response = send_command("home_more " + token);
+    if (response.empty() || response.find("\"error\"") != std::string::npos)
+    {
+        if (!response.empty())
+            fprintf(stderr, "Home feed error: %s\n", response.c_str());
+        store_home_continuation("");
+        return {};
+    }
+    std::vector<Track> tracks;
+    std::string continuation;
+    if (!parse_home_feed(response, tracks, continuation))
+    {
+        store_home_continuation("");
+        return {};
+    }
+    store_home_continuation(continuation);
+    has_more = !continuation.empty();
+    return tracks;
 }
 
 std::vector<Track> fetch_search(const std::string &query, bool *failed)
@@ -3806,6 +3942,17 @@ static bool native_handle_command(const std::string &cmd, std::string &out)
         const int limit = arg.empty() ? 40 : std::atoi(arg.c_str());
         if (native::home(limit, out, error))
             return true;
+    }
+    if (word == "home_more" && !arg.empty())
+    {
+        std::string error;
+        if (native::home_more(arg, 40, out, error))
+            return true;
+        // Python has no home_more command. Treat an exhausted/broken token as
+        // a definitive "no more" instead of letting it fall through and log an
+        // unknown-command error on every scroll.
+        out = "{\"tracks\":[],\"continuation\":\"\"}";
+        return true;
     }
     if (word == "search_all" && !arg.empty())
     {

@@ -1433,13 +1433,25 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
     {
         float scroll_y = ImGui::GetScrollY();
         float scroll_max = ImGui::GetScrollMaxY();
-        if (state.search_buffer[0] == '\0' && state.home_has_more && !state.home_loading_more.load() &&
+        if (state.search_buffer[0] == '\0' && state.home_has_more.load() && !state.home_loading_more.load() &&
             scroll_max > 0.0f && scroll_y >= scroll_max - (pitch * 30.0f))
         {
             state.home_loading_more = true;
-            int current_count = tracks ? (int)tracks->size() : 0;
-            tasks::spawn([&state, current_count]() {
-                auto more = fetch_recommendations(true, current_count + 40);
+            tasks::spawn([&state]() {
+                bool has_more = false;
+                auto more = fetch_recommendations_more(has_more);
+                // Home continuations end after a few pages. Seed an endless
+                // radio mix from the newest row so scrolling never dead-ends.
+                if (more.empty())
+                {
+                    auto cur = std::atomic_load(&state.recommendations);
+                    if (cur && !cur->empty())
+                    {
+                        more = fetch_radio(cur->back().id);
+                        if (!more.empty())
+                            has_more = true;
+                    }
+                }
                 prefetch_urls_for(more, 10);
                 auto cur = std::atomic_load(&state.recommendations);
                 std::vector<Track> merged = cur ? *cur : std::vector<Track>{};
@@ -1459,6 +1471,7 @@ static void draw_list_page(AppState &state, const AppLayout &layout, float width
                 {
                     std::atomic_store(&state.recommendations,
                                      std::make_shared<const std::vector<Track>>(std::move(merged)));
+                    state.home_has_more = true;
                 }
                 else
                 {

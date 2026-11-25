@@ -151,6 +151,8 @@ void load_recommendations(bool force, bool quiet)
             g_state.home_error_msg.clear();
         }
         g_state.home_refreshing = false;
+        g_state.home_loading_more = false;
+        g_state.home_has_more = false;
         g_state.repaint_requested = true;
         return;
     }
@@ -176,6 +178,8 @@ void load_recommendations(bool force, bool quiet)
         // the new recommendations are on screen, not while we warm the first
         // few URLs in the background.
         g_state.home_refreshing = false;
+        g_state.home_loading_more = false;
+        g_state.home_has_more = true;
         g_state.repaint_requested = true;
         prefetch_urls_for(*snapshot, (size_t)tunable_int("home.prefetch_count"));
     }

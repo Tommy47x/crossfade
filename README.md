@@ -35,7 +35,7 @@ Uncached tracks resolve in **~120 ms** on a warm session. Playlists, albums, rad
 - **It is genuinely fast.** A warm stream resolve is **111–126 ms** in the native backend. An album opens in **~350 ms**, 50 radio tracks in **~490 ms**, a 182-track playlist in **~1 s**. The first uncached track after a launch pays one ~1 s watch-page request and then stays warm for three hours.
 - **Native, not a browser in a trench coat.** One C++17 binary, SDL2 + OpenGL + Dear ImGui, libmpv for audio. Idle RAM is ~116 MB, not the 300–600 MB an Electron music client can occupy. No bundled Chromium, no Node runtime, no 500 MB of JavaScript.
 - **Offline is the default, not a mode.** Everything you play is cached as it streams. Explicit downloads now use the native resolver too and remux with `ffmpeg` (no yt-dlp JS dance), so an album download survives even when YouTube puts the account into its SABR-only experiment. Verified with the network fully blocked: the cached track still starts.
-- **Lyrics worth leaving on screen.** Timed YouTube Music lyrics, LRCLIB, lyrics.ovh and friends, with click-to-seek, a Spotify-style side panel, and a full-screen immersive view that uses the album art as its stage.
+- **Lyrics worth leaving on screen.** Word-by-word timing from Unison/Better Lyrics (TTML and enhanced LRC), line-timed YouTube Music/LRCLIB/lyrics.ovh as fallback, automatic translations and romanization, click-to-seek, and a full-screen immersive view with the album art as its stage. When a track has no lyrics, the takeover shows the cover and artist instead of an empty page.
 - **Room correction that actually measures your room.** Sweep with your phone, get a per-room correction curve, bind rooms to output devices, and let crossfade apply it in the player's audio chain. No extra driver, no external EQ app.
 - **Your library, actually yours.** Likes, saved albums and artists, playlists, local history, downloads and YouTube account playlists — mirrored locally, with write-back to YouTube Music.
 - **And real crossfade.** Two libmpv players blend tracks into each other — 0–20 s on natural ends, a shorter fade on skips, instant switches for uncached targets.
@@ -950,10 +950,13 @@ fail fast in the background.
 - **Search** is one native `search` request with the songs filter; `search_all` adds the
   default search for the **Top result** card and the album/artist shelves. Results are
   cached for 15 minutes by the existing C++ layer.
-- **Lyrics** cascade: YouTube Music native timed (public `ANDROID_MUSIC` browse) → LRCLIB
+- **Lyrics** cascade: Unison (word/syllable TTML or enhanced LRC, with translations and
+  romanization) → YouTube Music native timed (public `ANDROID_MUSIC` browse) → LRCLIB
   (synced first) → lyrics.ovh. The first timestamped result wins; a plain result is kept
-  only if nothing synced exists. The Python backend still has NetEase/Kugou for the rare
-  miss and is used automatically when the native providers find nothing.
+  only if nothing synced exists. The chosen payload is translated through Unison's
+  auto-detecting endpoint, so even line-only providers get translations. The Python
+  backend still has NetEase/Kugou for the rare miss and is used automatically when the
+  native providers find nothing.
 - **Thumbnails** load asynchronously: curl download → stb_image decode → GPU upload on the
   main thread, with a 60-second backoff for failed URLs.
 
@@ -1193,7 +1196,10 @@ YouTube's terms of service.
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — the JSLess `VISIONOS` client path that proved
   plain URLs were possible, and the download fallback
 - [ytm-rs](https://github.com/grapedjuice/ytm-rs) — the native client whose `visionOS`
-  player proved this approach; the backend idea started there
+  player proved this approach; the backend idea started there, and its word-by-word
+  karaoke/translation presentation is the reference for the immersive view
+- [Unison](https://unison.betterlyrics.org/) — word/syllable-timed lyrics, translations
+  and romanization
 - [cpp-httplib](https://github.com/yhirose/cpp-httplib) — native HTTP (shared with the party server)
 - [mpv](https://mpv.io/) / libmpv — playback, crossfade, `stream-record`
 - [Dear ImGui](https://github.com/ocornut/imgui) · [SDL2](https://www.libsdl.org/) ·

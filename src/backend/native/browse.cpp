@@ -1031,28 +1031,32 @@ bool radio(const std::string &video_id, int limit, std::string &json, std::strin
 
 // ----------------------------------------------------------------------- home
 
-bool home(int limit, std::string &json, std::string &error)
+std::string collect_home_rows(const jsonv::Value &root, std::size_t cap,
+                              std::vector<Row> &rows)
 {
-    const int cap = limit > 0 ? std::min(limit, 100) : 40;
-    WebReply reply;
-    if (!web_call("browse", "\"browseId\":\"FEmusic_home\"", reply, error))
-        return false;
     std::vector<const jsonv::Value *> renderers;
-    collect_all(reply.root, "musicResponsiveListItemRenderer", renderers);
-    std::vector<Row> rows;
-    util::append_tracks(renderers, rows, (std::size_t)cap);
-    // Signed-in Home renders "Quick picks", "Listen again" and the community
-    // shelf as musicTwoRowItemRenderer cards whose watchEndpoint carries the
-    // song id (albums there have a browseEndpoint instead, and are skipped).
+    collect_all(root, "musicResponsiveListItemRenderer", renderers);
+    util::append_tracks(renderers, rows, cap);
+    // Quick picks / Listen again / community cards carry the song id on the
+    // card's watchEndpoint. Album cards have a browseEndpoint instead.
     std::vector<const jsonv::Value *> cards;
-    collect_all(reply.root, "musicTwoRowItemRenderer", cards);
+    collect_all(root, "musicTwoRowItemRenderer", cards);
     for (const jsonv::Value *card : cards)
     {
-        if (rows.size() >= (std::size_t)cap)
+        if (rows.size() >= cap)
             break;
         Row t;
         t.id = (*card)["navigationEndpoint"]["watchEndpoint"].str("videoId");
         if (t.id.size() != 11)
+            continue;
+        bool dup = false;
+        for (const Row &seen : rows)
+            if (seen.id == t.id)
+            {
+                dup = true;
+                break;
+            }
+        if (dup)
             continue;
         t.title = trim(runs_text((*card)["title"]["runs"]));
         if (t.title.empty())
@@ -1070,24 +1074,93 @@ bool home(int limit, std::string &json, std::string &error)
                 t.artist = p.text;
         }
         t.thumb = util::renderer_thumb(*card);
-        bool dup = false;
-        for (const Row &seen : rows)
-            if (seen.id == t.id)
-            {
-                dup = true;
-                break;
-            }
-        if (!dup)
-            rows.push_back(std::move(t));
+        rows.push_back(std::move(t));
     }
+    return find_continuation(root);
+}
+
+std::string home_payload(const std::vector<Row> &rows, const std::string &continuation)
+{
+    return "{\"tracks\":" + util::row_array(rows) + ",\"continuation\":\"" +
+           escape(continuation) + "\"}";
+}
+
+bool home(int limit, std::string &json, std::string &error)
+{
+    const int cap = limit > 0 ? std::min(limit, 100) : 40;
+    WebReply reply;
+    if (!web_call("browse", "\"browseId\":\"FEmusic_home\"", reply, error))
+        return false;
+    std::vector<Row> rows;
+    const std::string continuation =
+        collect_home_rows(reply.root, (std::size_t)cap, rows);
     if (rows.empty())
     {
         finish_trace(reply, "HOME", 0);
         error = "No individual tracks found in the home feed.";
         return false;
     }
-    json = util::row_array(rows);
+    json = home_payload(rows, continuation);
     finish_trace(reply, "HOME", (int)rows.size());
+    return true;
+}
+
+// Next page of the personalized Home feed. YouTube sometimes answers with a
+// shelf that has no playable songs (shows, playlists); walk a few pages until
+// there is something to append or the token chain ends.
+bool home_more(const std::string &continuation, int limit, std::string &json,
+               std::string &error)
+{
+    if (continuation.empty())
+    {
+        error = "No home continuation";
+        return false;
+    }
+    const int cap = limit > 0 ? std::min(limit, 100) : 40;
+    std::vector<Row> rows;
+    std::string token = continuation;
+    WebReply last;
+    bool any_reply = false;
+    for (int page = 0; page < 4; ++page)
+    {
+        WebReply reply;
+        std::string page_error;
+        if (!web_call("browse", "\"continuation\":\"" + escape(token) + "\"", reply,
+                      page_error))
+        {
+            if (!any_reply)
+            {
+                error = page_error;
+                return false;
+            }
+            break;
+        }
+        any_reply = true;
+        last = reply;
+        const std::string next = collect_home_rows(reply.root, (std::size_t)cap, rows);
+        if (rows.size() >= (std::size_t)cap)
+        {
+            token = next;
+            break;
+        }
+        if (next.empty() || next == token)
+        {
+            token.clear();
+            break;
+        }
+        token = next;
+        if (!rows.empty())
+            break; // return what this page had; the caller asks again later
+    }
+    if (rows.empty() && token.empty())
+    {
+        finish_trace(last, "HOME", 0);
+        error = "No more home tracks";
+        return false;
+    }
+    json = home_payload(rows, token);
+    if (any_reply)
+        finish_trace(last, "HOME", (int)rows.size());
     return true;
 }
 
@@ -1724,6 +1797,9 @@ bool remove_playlist_items(const std::string &payload, std::string &json,
 
 
 // ---------------------------------------------------------------------- lyrics
+//
+// Unison/Better Lyrics word timing, enhanced LRC parsing and the translation
+// flow follow ytm-rs (GPL-3.0); the implementation is C++.
 
 namespace
 {
@@ -1985,6 +2061,515 @@ std::string lyrics_ovh(const std::string &title, const std::string &artist)
         return {};
     return lrc_payload(text, "lyrics.ovh");
 }
+
+// ------------------------------------------------------------------ Unison
+// Unison (betterlyrics.org) returns TTML or enhanced LRC with word/syllable
+// timings, plus a translation/romanization endpoint. This is the same source
+// ytm-rs uses for its word-by-word view.
+
+std::string xml_unescape(const std::string &text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();)
+    {
+        if (text[i] != '&')
+        {
+            out += text[i++];
+            continue;
+        }
+        const std::size_t semi = text.find(';', i + 1);
+        if (semi == std::string::npos || semi - i > 12)
+        {
+            out += text[i++];
+            continue;
+        }
+        const std::string ent = text.substr(i + 1, semi - i - 1);
+        if (ent == "amp")
+            out += '&';
+        else if (ent == "lt")
+            out += '<';
+        else if (ent == "gt")
+            out += '>';
+        else if (ent == "quot")
+            out += '"';
+        else if (ent == "apos")
+            out += '\'';
+        else if (!ent.empty() && ent[0] == '#')
+        {
+            const bool hex = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X');
+            const unsigned long cp = std::strtoul(ent.c_str() + (hex ? 2 : 1), nullptr, hex ? 16 : 10);
+            if (cp < 0x80)
+                out += (char)cp;
+            else if (cp < 0x800)
+            {
+                out += (char)(0xC0 | (cp >> 6));
+                out += (char)(0x80 | (cp & 0x3F));
+            }
+            else if (cp < 0x10000)
+            {
+                out += (char)(0xE0 | (cp >> 12));
+                out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                out += (char)(0x80 | (cp & 0x3F));
+            }
+            else
+            {
+                out += (char)(0xF0 | (cp >> 18));
+                out += (char)(0x80 | ((cp >> 12) & 0x3F));
+                out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                out += (char)(0x80 | (cp & 0x3F));
+            }
+        }
+        else
+            out += text.substr(i, semi - i + 1);
+        i = semi + 1;
+    }
+    return out;
+}
+
+int ttml_time_ms(const std::string &raw)
+{
+    const std::string text = trim(raw);
+    if (text.empty())
+        return 0;
+    std::vector<double> parts;
+    std::size_t pos = 0;
+    while (pos <= text.size())
+    {
+        const std::size_t dot = text.find(':', pos);
+        const std::string bit = text.substr(pos, dot == std::string::npos ? std::string::npos
+                                                                         : dot - pos);
+        parts.push_back(std::atof(bit.c_str()));
+        if (dot == std::string::npos)
+            break;
+        pos = dot + 1;
+    }
+    if (parts.size() == 1)
+        return (int)(parts[0] * 1000.0 + 0.5);
+    if (parts.size() == 2)
+        return (int)((parts[0] * 60.0 + parts[1]) * 1000.0 + 0.5);
+    return (int)((parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]) * 1000.0 + 0.5);
+}
+
+std::string attr_value(const std::string &tag, const std::string &name)
+{
+    const std::string key = name + "=\"";
+    std::size_t p = tag.find(key);
+    if (p == std::string::npos)
+        return {};
+    p += key.size();
+    const std::size_t q = tag.find('"', p);
+    return q == std::string::npos ? std::string() : tag.substr(p, q - p);
+}
+
+std::string strip_xml(const std::string &text)
+{
+    std::string out;
+    bool in_tag = false;
+    for (char c : text)
+    {
+        if (c == '<')
+            in_tag = true;
+        else if (c == '>')
+            in_tag = false;
+        else if (!in_tag)
+            out += c;
+    }
+    return xml_unescape(out);
+}
+
+struct UWord
+{
+    int start_ms = 0;
+    int end_ms = 0;
+    std::string text;
+};
+
+struct RawLyricLine
+{
+    int start_ms = 0;
+    int end_ms = 0;
+    std::string text;
+    std::vector<UWord> words;
+    std::string translation;
+    std::string romanization;
+};
+
+std::vector<RawLyricLine> parse_ttml(const std::string &xml)
+{
+    std::vector<RawLyricLine> out;
+    std::size_t pos = 0;
+    while ((pos = xml.find("<p", pos)) != std::string::npos)
+    {
+        const std::size_t tag_end = xml.find('>', pos);
+        if (tag_end == std::string::npos)
+            break;
+        const std::string tag = xml.substr(pos, tag_end - pos + 1);
+        const std::size_t close = xml.find("</p>", tag_end + 1);
+        if (close == std::string::npos)
+            break;
+        const std::string body = xml.substr(tag_end + 1, close - tag_end - 1);
+        RawLyricLine line;
+        line.start_ms = ttml_time_ms(attr_value(tag, "begin"));
+        line.end_ms = ttml_time_ms(attr_value(tag, "end"));
+        std::size_t sp = 0;
+        while ((sp = body.find("<span", sp)) != std::string::npos)
+        {
+            const std::size_t se = body.find('>', sp);
+            if (se == std::string::npos)
+                break;
+            const std::string stag = body.substr(sp, se - sp + 1);
+            const std::size_t sclose = body.find("</span>", se + 1);
+            if (sclose == std::string::npos)
+                break;
+            const std::string inner = xml_unescape(body.substr(se + 1, sclose - se - 1));
+            UWord w;
+            w.start_ms = ttml_time_ms(attr_value(stag, "begin"));
+            w.end_ms = ttml_time_ms(attr_value(stag, "end"));
+            w.text = inner;
+            if (!w.text.empty())
+            {
+                // Preserve the inter-word space TTML leaves between spans.
+                const std::size_t after = body.find('<', sclose + 7);
+                const std::string gap = body.substr(sclose + 7,
+                                                    after == std::string::npos
+                                                        ? body.size() - (sclose + 7)
+                                                        : after - (sclose + 7));
+                if (gap.find_first_of(" \t\n\r") != std::string::npos)
+                    w.text += " ";
+                line.words.push_back(std::move(w));
+            }
+            sp = sclose + 7;
+        }
+        line.text = trim(strip_xml(body));
+        if (line.text.empty() && !line.words.empty())
+        {
+            for (const UWord &w : line.words)
+                line.text += w.text;
+            line.text = trim(line.text);
+        }
+        if (line.start_ms == 0 && !line.words.empty())
+            line.start_ms = line.words.front().start_ms;
+        if (line.end_ms == 0 && !line.words.empty())
+            line.end_ms = line.words.back().end_ms;
+        if (!line.text.empty() || !line.words.empty())
+            out.push_back(std::move(line));
+        pos = close + 4;
+    }
+    for (std::size_t i = 0; i + 1 < out.size(); ++i)
+        if (out[i].end_ms <= out[i].start_ms)
+            out[i].end_ms = out[i + 1].start_ms;
+    return out;
+}
+
+std::vector<RawLyricLine> parse_rich_lrc(const std::string &lrc)
+{
+    std::vector<RawLyricLine> out;
+    std::size_t pos = 0;
+    while (pos < lrc.size())
+    {
+        std::size_t end = lrc.find('\n', pos);
+        if (end == std::string::npos)
+            end = lrc.size();
+        std::string raw = lrc.substr(pos, end - pos);
+        if (!raw.empty() && raw.back() == '\r')
+            raw.pop_back();
+        pos = end + 1;
+        if (raw.size() < 4 || raw[0] != '[')
+            continue;
+        const std::size_t close = raw.find(']');
+        if (close == std::string::npos)
+            continue;
+        const std::string tag = raw.substr(1, close - 1);
+        const std::size_t colon = tag.find(':');
+        if (colon == std::string::npos)
+            continue;
+        int minutes = std::atoi(tag.substr(0, colon).c_str());
+        const std::string rest = tag.substr(colon + 1);
+        const std::size_t dot = rest.find('.');
+        int seconds = std::atoi(rest.substr(0, dot).c_str());
+        const int start = minutes * 60000 + seconds * 1000;
+        std::string text = raw.substr(close + 1);
+        RawLyricLine line;
+        line.start_ms = start;
+        std::size_t wp = 0;
+        while ((wp = text.find('<', wp)) != std::string::npos)
+        {
+            const std::size_t wc = text.find('>', wp);
+            if (wc == std::string::npos)
+                break;
+            const std::string stag = text.substr(wp + 1, wc - wp - 1);
+            const std::size_t dot2 = stag.find('.');
+            int wm = 0, ws = 0;
+            const std::size_t colon2 = stag.find(':');
+            if (colon2 != std::string::npos)
+            {
+                wm = std::atoi(stag.substr(0, colon2).c_str());
+                ws = std::atoi(stag.substr(colon2 + 1, dot2 == std::string::npos
+                                                             ? std::string::npos
+                                                             : dot2 - colon2 - 1)
+                                   .c_str());
+            }
+            const std::size_t next = text.find('<', wc + 1);
+            std::string word = text.substr(wc + 1, next == std::string::npos
+                                                     ? std::string::npos
+                                                     : next - wc - 1);
+            line.words.push_back({wm * 60000 + ws * 1000, 0, word});
+            wp = wc + 1;
+            if (next == std::string::npos)
+                break;
+        }
+        for (std::size_t i = 0; i < line.words.size(); ++i)
+        {
+            if (line.words[i].end_ms <= line.words[i].start_ms)
+                line.words[i].end_ms = i + 1 < line.words.size()
+                                           ? line.words[i + 1].start_ms
+                                           : line.start_ms + 4000;
+        }
+        if (line.words.empty())
+            line.text = trim(text);
+        else
+        {
+            for (const UWord &w : line.words)
+                line.text += w.text;
+            line.text = trim(line.text);
+            line.start_ms = line.words.front().start_ms;
+        }
+        if (!line.text.empty())
+            out.push_back(std::move(line));
+    }
+    for (std::size_t i = 0; i + 1 < out.size(); ++i)
+        if (out[i].end_ms <= out[i].start_ms)
+            out[i].end_ms = out[i + 1].start_ms;
+    return out;
+}
+
+std::string clean_song_title(const std::string &title)
+{
+    std::string out = title;
+    static const char *suffixes[] = {
+        " (Official Audio)", " (Official Video)", " (Official Music Video)",
+        " [Official Audio]", " [Official Video]", " (Lyrics)", " (Lyric Video)",
+        " (Audio)", " (Visualizer)", " (Official Visualizer)"};
+    for (const char *suffix : suffixes)
+    {
+        const std::string s(suffix);
+        if (out.size() >= s.size() &&
+            out.compare(out.size() - s.size(), s.size(), s) == 0)
+        {
+            out.erase(out.size() - s.size());
+            break;
+        }
+    }
+    return trim(out);
+}
+
+void unison_translate(std::vector<RawLyricLine> &lines, const std::string &language)
+{
+    std::vector<std::string> unique;
+    std::vector<std::vector<std::size_t>> indices;
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        const std::string text = trim(lines[i].text);
+        if (text.empty())
+            continue;
+        std::size_t which = unique.size();
+        for (std::size_t u = 0; u < unique.size(); ++u)
+            if (unique[u] == text)
+            {
+                which = u;
+                break;
+            }
+        if (which == unique.size())
+        {
+            unique.push_back(text);
+            indices.push_back({});
+        }
+        indices[which].push_back(i);
+    }
+    if (unique.empty())
+        return;
+    std::string body = "{\"lines\":[";
+    for (std::size_t i = 0; i < unique.size(); ++i)
+    {
+        if (i)
+            body += ",";
+        body += "\"" + escape(unique[i]) + "\"";
+    }
+    body += "],\"to\":\"en\"";
+    if (!language.empty())
+        body += ",\"from\":\"" + escape(language) + "\"";
+    body += "}";
+    std::vector<HttpHeader> headers = {
+        {"User-Agent", web_user_agent()},
+        {"Accept", "application/json"},
+        {"Origin", "https://unison.betterlyrics.org"},
+    };
+    std::string jar;
+    const HttpResult res = http_post_json("https://unison.betterlyrics.org/translate", body,
+                                          headers, jar);
+    if (!res.ok)
+        return;
+    jsonv::Value root;
+    std::string parse_error;
+    if (!jsonv::Value::parse(res.body, root, parse_error))
+        return;
+    const jsonv::Value &rows = root["lines"];
+    for (std::size_t u = 0; u < indices.size() && u < rows.size(); ++u)
+    {
+        const jsonv::Value &row = rows.at(u);
+        const std::string translation = row.str("translation");
+        const std::string roman = row.str("romanization");
+        for (std::size_t idx : indices[u])
+        {
+            if (!translation.empty())
+                lines[idx].translation = translation;
+            if (!roman.empty() && roman != unique[u])
+                lines[idx].romanization = roman;
+        }
+    }
+}
+
+// Add translation/romanization to a line-level payload (YouTube timed, LRCLIB,
+// lyrics.ovh). Unison's translate endpoint auto-detects the language, so this
+// also gives English subtitles for providers that have no extras of their own.
+std::string translate_payload(const std::string &payload)
+{
+    jsonv::Value root;
+    std::string parse_error;
+    if (payload.empty() || !jsonv::Value::parse(payload, root, parse_error) ||
+        !root.is_object())
+        return payload;
+    const jsonv::Value &src = root["lines"];
+    if (!src.is_array() || src.size() == 0)
+        return payload;
+    std::vector<RawLyricLine> lines;
+    for (std::size_t i = 0; i < src.size(); ++i)
+    {
+        RawLyricLine l;
+        l.start_ms = (int)src.at(i)["t"].as_int() * 1000;
+        l.end_ms = (int)src.at(i)["end"].as_int() * 1000;
+        l.text = src.at(i).str("text");
+        lines.push_back(std::move(l));
+    }
+    const std::string language = root.str("language");
+    const bool non_latin = std::any_of(lines.begin(), lines.end(),
+                                       [](const RawLyricLine &l) {
+                                           for (unsigned char c : l.text)
+                                               if (c >= 0x80)
+                                                   return true;
+                                           return false;
+                                       });
+    if (language.empty() || language != "en" || non_latin)
+        unison_translate(lines, language);
+
+    std::string out = "{\"version\":2,\"synced\":";
+    out += root.boolean("synced") ? "true" : "false";
+    out += ",\"source\":\"" + escape(root.str("source")) + "\",\"language\":\"" +
+           escape(language) + "\",\"lines\":[";
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        if (i)
+            out += ",";
+        const RawLyricLine &l = lines[i];
+        out += "{\"t\":" + std::to_string(l.start_ms / 1000);
+        if (l.end_ms > 0)
+            out += ",\"end\":" + std::to_string(l.end_ms / 1000);
+        out += ",\"text\":\"" + escape(l.text) + "\"";
+        if (!l.translation.empty())
+            out += ",\"translation\":\"" + escape(l.translation) + "\"";
+        if (!l.romanization.empty())
+            out += ",\"roman\":\"" + escape(l.romanization) + "\"";
+        out += "}";
+    }
+    out += "]}";
+    return out;
+}
+
+std::string unison_lyrics(const std::string &video_id, const std::string &title,
+                          const std::string &artist, int duration)
+{
+    if (video_id.empty() || title.empty())
+        return {};
+    std::string url = "https://unison.betterlyrics.org/lyrics?v=" + url_encode(video_id) +
+                      "&song=" + url_encode(clean_song_title(title)) +
+                      "&artist=" + url_encode(artist) +
+                      "&duration=" + std::to_string(std::max(0, duration));
+    std::string body = get_text(url);
+    if (body.empty())
+        return {};
+    jsonv::Value root;
+    std::string parse_error;
+    if (!jsonv::Value::parse(body, root, parse_error))
+        return {};
+    const jsonv::Value &data = root["data"];
+    if (!data.is_object())
+        return {};
+    const std::string format = data.str("format");
+    const std::string raw = data.str("lyrics");
+    if (raw.empty())
+        return {};
+    const std::string language = data.str("language");
+    std::vector<RawLyricLine> lines;
+    if (format == "ttml")
+        lines = parse_ttml(raw);
+    else if (format == "lrc")
+        lines = parse_rich_lrc(raw);
+    else
+    {
+        RawLyricLine line;
+        line.text = trim(raw);
+        if (!line.text.empty())
+            lines.push_back(std::move(line));
+    }
+    if (lines.empty())
+        return {};
+    const bool synced = std::any_of(lines.begin(), lines.end(),
+                                    [](const RawLyricLine &l) { return l.start_ms > 0; });
+    const bool non_latin = std::any_of(lines.begin(), lines.end(),
+                                       [](const RawLyricLine &l) {
+                                           for (unsigned char c : l.text)
+                                               if (c >= 0x80)
+                                                   return true;
+                                           return false;
+                                       });
+    if (synced && (language.empty() || language != "en" || non_latin))
+        unison_translate(lines, language);
+    std::string out = "{\"version\":2,\"synced\":";
+    out += synced ? "true" : "false";
+    out += ",\"source\":\"Unison\",\"language\":\"" + escape(language) + "\",\"lines\":[";
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        if (i)
+            out += ",";
+        const RawLyricLine &l = lines[i];
+        out += "{\"t\":" + std::to_string(l.start_ms / 1000);
+        if (l.end_ms > 0)
+            out += ",\"end\":" + std::to_string(l.end_ms / 1000);
+        out += ",\"text\":\"" + escape(l.text) + "\"";
+        if (!l.translation.empty())
+            out += ",\"translation\":\"" + escape(l.translation) + "\"";
+        if (!l.romanization.empty())
+            out += ",\"roman\":\"" + escape(l.romanization) + "\"";
+        if (!l.words.empty())
+        {
+            out += ",\"words\":[";
+            for (std::size_t w = 0; w < l.words.size(); ++w)
+            {
+                if (w)
+                    out += ",";
+                out += "{\"s\":" + std::to_string(l.words[w].start_ms) + ",\"e\":" +
+                       std::to_string(l.words[w].end_ms) + ",\"text\":\"" +
+                       escape(l.words[w].text) + "\"}";
+            }
+            out += "]";
+        }
+        out += "}";
+    }
+    out += "]}";
+    return out;
+}
+
 } // namespace
 
 bool lyrics(const std::string &video_id, std::string &json, std::string &error)
@@ -2028,18 +2613,25 @@ bool lyrics(const std::string &video_id, std::string &json, std::string &error)
     auto synced = [](const std::string &payload) {
         return payload.find("\"synced\":true") != std::string::npos;
     };
-    std::string plain;
-    std::string result = ytm_timed(lyrics_browse_id);
+    std::string result = unison_lyrics(video_id, seed.title, seed.artist, seed.duration);
     if (synced(result))
     {
         json = result;
         return true;
     }
-    plain = result;
+    std::string plain = result;
+    result = ytm_timed(lyrics_browse_id);
+    if (synced(result))
+    {
+        json = translate_payload(result);
+        return true;
+    }
+    if (plain.empty())
+        plain = result;
     result = lrclib(seed.title, seed.artist);
     if (synced(result))
     {
-        json = result;
+        json = translate_payload(result);
         return true;
     }
     if (plain.empty())
@@ -2047,7 +2639,7 @@ bool lyrics(const std::string &video_id, std::string &json, std::string &error)
     result = lyrics_ovh(seed.title, seed.artist);
     if (synced(result))
     {
-        json = result;
+        json = translate_payload(result);
         return true;
     }
     if (plain.empty())
@@ -2057,7 +2649,7 @@ bool lyrics(const std::string &video_id, std::string &json, std::string &error)
         json = "{\"none\":true}";
         return true;
     }
-    json = plain;
+    json = translate_payload(plain);
     return true;
 }
 

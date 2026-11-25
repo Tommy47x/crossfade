@@ -29,9 +29,17 @@ license text next to the source.
 ## Inspiration and protocol references
 
 - **[ytm-rs](https://github.com/grapedjuice/ytm-rs)** (GPL-3.0) informed the
-  design of the native backend's client strategy (InnerTube client selection,
-  the JSLess `VISIONOS` path, HLS handling). No Rust code has been copied.
-  If a future change adapts a substantial portion of its implementation, the
-  adapted code will be marked here and in the file header, as GPL-3.0 allows.
+  native backend's client strategy (InnerTube client selection, the JSLess
+  `VISIONOS` path, HLS handling). Its word-by-word karaoke layout, word-timing
+  provider cascade, translation/romanization flow and immersive presentation
+  are also the reference for crossfade's immersive lyrics
+  (`src/ui/ui_lyrics_immersive.cpp`, `src/backend/native/browse.cpp`). The
+  implementation here is C++/ImGui, not a copy of the Rust binary; where its
+  algorithms or constants are adapted, this notice and the file headers are
+  the attribution. Both projects are GPL-3.0.
+- **[Unison](https://unison.betterlyrics.org/)** (Better Lyrics) provides the
+  word/syllable-timed TTML and enhanced LRC plus the translation/romanization
+  endpoint used by the native lyrics path. Lyrics remain the property of their
+  respective providers; crossfade only displays them to the user.
 - **yt-dlp** is used as a fallback process at runtime, not vendored. See its
   own license at <https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE>.

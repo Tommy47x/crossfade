@@ -2289,9 +2289,11 @@ int app_run(int argc, char **argv)
                         // previous account's playlists for the next hour.
                         clear_recommendations_cache();
                         clear_youtube_playlist_caches();
-                        std::atomic_store(
-                            &g_state.recommendations,
-                            std::make_shared<const std::vector<Track>>());
+                        // Keep the list that is already on screen. The fresh
+                        // account feed replaces it when it arrives; clearing it
+                        // here made a real sign-in (and, before the runtime-auth
+                        // fix, every auth mtime change) flash an empty
+                        // "Refreshing your feed" page.
                         {
                             std::lock_guard<std::mutex> lock(g_state.fetch_error_mutex);
                             g_state.home_failed = false;
@@ -2331,7 +2333,13 @@ int app_run(int argc, char **argv)
                     // Fresh session: pull the personalized Home feed again. Force
                     // it past the disk cache so a feed cached while the session
                     // was effectively anonymous can never survive a sign-in.
-                    g_state.home_refreshing = true;
+                    // Only show the loading placeholder when there is no list
+                    // to keep; otherwise this refresh stays invisible.
+                    const auto current_home = std::atomic_load(&g_state.recommendations);
+                    const bool have_home = current_home && !current_home->empty();
+                    g_state.home_refreshing = !have_home;
+                    g_state.home_loading_more = false;
+                    g_state.home_has_more = true;
                     tasks::spawn("recommendations",
                                  []() { load_recommendations(true, true); });
                 }

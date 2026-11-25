@@ -44,7 +44,12 @@ bool load_lyrics_cache(const std::string &video_id, Lyrics &out)
         return false;
     std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
-    return parse_lyrics_json(json, out);
+    if (!parse_lyrics_json(json, out))
+        return false;
+    // Version 1 caches predate word timings, translations and the Unison
+    // provider. Fetch once more so the immersive view can use the richer
+    // source (including tracks the old cascade had marked "none").
+    return out.version >= 2;
 }
 
 void save_lyrics_cache(const std::string &video_id, const Lyrics &lyrics)
@@ -59,18 +64,50 @@ void save_lyrics_cache(const std::string &video_id, const Lyrics &lyrics)
         return;
     if (lyrics.none)
     {
-        out << "{\"none\":true}";
+        out << "{\"version\":2,\"none\":true}";
         out.close();
         return;
     }
-    out << "{\"synced\":" << (lyrics.synced ? "true" : "false")
-        << ",\"source\":\"" << json_escape(lyrics.source) << "\",\"lines\":[";
-    for (size_t i = 0; i < lyrics.lines.size(); ++i)
+    out << "{\"version\":2,\"synced\":" << (lyrics.synced ? "true" : "false")
+        << ",\"source\":\"" << json_escape(lyrics.source) << "\",\"language\":\""
+        << json_escape(lyrics.language) << "\",\"lines\":[";
+    const size_t count = std::max(lyrics.lines.size(), lyrics.rich.size());
+    for (size_t i = 0; i < count; ++i)
     {
         if (i != 0)
             out << ",";
-        int t = i < lyrics.times.size() ? lyrics.times[i] : 0;
-        out << "{\"t\":" << t << ",\"text\":\"" << json_escape(lyrics.lines[i]) << "\"}";
+        if (i < lyrics.rich.size())
+        {
+            const RichLyricLine &l = lyrics.rich[i];
+            out << "{\"t\":" << (l.start_ms / 1000);
+            if (l.end_ms > 0)
+                out << ",\"end\":" << (l.end_ms / 1000);
+            out << ",\"text\":\"" << json_escape(l.text) << "\"";
+            if (!l.translation.empty())
+                out << ",\"translation\":\"" << json_escape(l.translation) << "\"";
+            if (!l.romanization.empty())
+                out << ",\"roman\":\"" << json_escape(l.romanization) << "\"";
+            if (!l.words.empty())
+            {
+                out << ",\"words\":[";
+                for (size_t w = 0; w < l.words.size(); ++w)
+                {
+                    if (w)
+                        out << ",";
+                    out << "{\"s\":" << l.words[w].start_ms << ",\"e\":"
+                        << l.words[w].end_ms << ",\"text\":\""
+                        << json_escape(l.words[w].text) << "\"}";
+                }
+                out << "]";
+            }
+            out << "}";
+        }
+        else
+        {
+            int t = i < lyrics.times.size() ? lyrics.times[i] : 0;
+            out << "{\"t\":" << t << ",\"text\":\"" << json_escape(lyrics.lines[i])
+                << "\"}";
+        }
     }
     out << "]}";
     out.close();

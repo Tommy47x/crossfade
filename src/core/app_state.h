@@ -116,7 +116,7 @@ struct AppState
     // True while a Home recommendation fetch/refresh is in flight; the header
     // uses it to show a spinner instead of the Refresh label.
     std::atomic<bool> home_refreshing{false};
-    bool home_has_more = true;
+    std::atomic<bool> home_has_more{true};
 
     // Playlists
     std::vector<Playlist> playlists;

@@ -19,6 +19,10 @@ bool playlist(const std::string &playlist_id, std::string &json,
 bool radio(const std::string &video_id, int limit, std::string &json,
            std::string &error);
 bool home(int limit, std::string &json, std::string &error);
+// Next page of the personalized Home feed. `json` has the same shape as
+// home(): {tracks:[...], continuation:"..."}.
+bool home_more(const std::string &continuation, int limit, std::string &json,
+               std::string &error);
 bool album_of(const std::string &video_id, std::string &json, std::string &error);
 bool artist_of(const std::string &video_id, std::string &json, std::string &error);
 bool search_all(const std::string &query, int limit, std::string &json,

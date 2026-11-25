@@ -287,24 +287,29 @@ def verify_auth_file(path):
     return True, "Signed in to YouTube Music (verified against the library)."
 
 
-def refresh_auth_file(path=None):
-    """Recompute browser.json's SAPISIDHASH from its cookies.
+def prepare_runtime_auth(path=None):
+    """Return an auth file with a fresh SAPISIDHASH, without touching the import.
 
     The stored ``authorization`` header embeds the timestamp used to sign it,
     so it goes stale even while the cookies are still valid. ytmusicapi uses
-    the file verbatim, which made a working imported session look signed out
-    a day later (the native backend recomputes the hash per request, so the
-    two disagreed). Rewriting it at startup keeps the Python fallback honest.
+    the file verbatim, which made a working imported session look signed out a
+    day later (the native backend recomputes the hash per request, so the two
+    disagreed).
+
+    Do not rewrite browser.json itself: the app watches its mtime to detect a
+    real sign-in and restarts the backend when it changes. Rewriting it on
+    every backend start caused an endless restart/refresh loop. The refreshed
+    copy lives beside it in a private runtime file that nothing watches.
     """
     path = path or auth_path()
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return False
+        return path
     raw_cookies = data.get("cookie") or ""
     if not raw_cookies:
-        return False
+        return path
     cookies = {}
     for part in raw_cookies.split(";"):
         part = part.strip()
@@ -313,18 +318,19 @@ def refresh_auth_file(path=None):
         name, _, value = part.partition("=")
         cookies[name.strip()] = value.strip()
     if not has_secure_cookie(cookies):
-        return False
+        return path
     headers = build_browser_headers(cookies, ua=data.get("user-agent"))
     for key in ("accept", "accept-language", "origin", "referer",
                 "x-goog-authuser", "x-origin"):
         if data.get(key):
             headers[key] = data[key]
+    dest = os.path.join(os.path.dirname(path) or ".", ".runtime-auth.json")
     try:
-        tmp = _write_private_json(path, headers)
-        _commit(tmp, path)
-        return True
+        tmp = _write_private_json(dest, headers)
+        _commit(tmp, dest)
+        return dest
     except Exception:
-        return False
+        return path
 
 
 def _commit(tmp, dest):

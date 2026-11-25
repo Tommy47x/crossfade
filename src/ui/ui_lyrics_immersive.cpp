@@ -14,7 +14,12 @@
 #include <vector>
 
 // ----------------------------------------------------------------------
-// Full-window lyrics takeover
+// Full-window lyrics takeover.
+//
+// Word/syllable timing, the per-word karaoke treatment, translation and
+// romanization rows, and the artwork-only no-lyrics state are adapted from
+// ytm-rs (GPL-3.0, https://github.com/grapedjuice/ytm-rs). The renderer here is
+// ImGui, not a copy of its Rust code.
 //
 // Entered from the bottom-bar expand button. The docked panel stays the
 // everyday view; this is the performance view: one huge active line held at a
@@ -42,6 +47,12 @@ const float kPulseDecay = 3.6f;    // higher = snappier pulse
 const float kLineEnter = 0.42f;    // active-line entrance duration
 const float kViewEnter = 0.45f;    // whole-view fade-in
 const float kViewExit = 0.30f;     // fade back to the app on close
+
+// The default immersive theme takes its lyric accent from the cover. These are
+// set once per frame before the text helpers run; 0 falls back to the app
+// accent for tracks without artwork.
+ImU32 g_lyric_accent = 0;
+ImU32 g_lyric_glow = 0;
 
 float clampf(float v, float lo, float hi)
 {
@@ -374,7 +385,7 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
     const float line_h = lay.line_h * scale;
     const float total_h = (float)lay.rows.size() * line_h;
     float y = center.y - total_h * 0.5f;
-    const ImU32 glow_col = ui_accent_text_u32();
+    const ImU32 glow_col = g_lyric_glow ? g_lyric_glow : ui_accent_text_u32();
     // Un-sung text stays readable but recedes; the accent "fills" it in as the
     // line plays, like a karaoke wipe.
     const ImU32 unsung = ui_with_alpha(ui_text_dim_u32(), alpha * 0.80f);
@@ -443,6 +454,214 @@ void draw_rows(ImDrawList *dl, ImFont *font, const TextLayout &lay, ImVec2 cente
                 dl->AddText(font, size, ImVec2(x, y), ui_with_alpha(col, alpha), row.text.c_str());
         }
         y += line_h;
+    }
+}
+
+// Draw one rich lyric line word by word: the active word lights up, sung words
+// stay accent-coloured, future words recede. Returns false when the line is
+// too wide to lay out on one row (the caller falls back to the wrapped wipe).
+bool draw_word_lyric(ImDrawList *dl, ImFont *font, float size, ImVec2 center,
+                     float max_w, const RichLyricLine &line, double t,
+                     float alpha, float glow, bool focus)
+{
+    struct W
+    {
+        std::string text;
+        double start;
+        double end;
+    };
+    std::vector<W> words;
+    if (!line.words.empty())
+    {
+        for (const LyricWord &w : line.words)
+            words.push_back({w.text, w.start_ms / 1000.0, w.end_ms / 1000.0});
+    }
+    else
+    {
+        std::string cur;
+        for (char c : line.text)
+        {
+            if (c == ' ' || c == '\t')
+            {
+                if (!cur.empty())
+                {
+                    words.push_back({cur, 0.0, 0.0});
+                    cur.clear();
+                }
+            }
+            else
+                cur += c;
+        }
+        if (!cur.empty())
+            words.push_back({cur, 0.0, 0.0});
+    }
+    if (words.empty())
+        return false;
+
+    const double line_start = line.start_ms / 1000.0;
+    double line_end = line.end_ms / 1000.0;
+    if (line_end <= line_start)
+        line_end = line_start + 4.0;
+    // Line-only providers: distribute the interval over the words by length.
+    if (words.size() > 1 && words.front().start <= 0.0)
+    {
+        double total = 0.0;
+        for (const W &w : words)
+            total += std::max(1, (int)w.text.size());
+        double at = line_start;
+        for (W &w : words)
+        {
+            const double share = (line_end - line_start) *
+                                 (std::max(1, (int)w.text.size()) / total);
+            w.start = at;
+            w.end = at + share;
+            at += share;
+        }
+    }
+    for (std::size_t i = 0; i < words.size(); ++i)
+    {
+        if (words[i].start <= 0.0)
+            words[i].start = line_start;
+        if (words[i].end <= words[i].start)
+            words[i].end = i + 1 < words.size() ? words[i + 1].start
+                                                : std::max(line_start + 0.4, words[i].start + 0.4);
+    }
+
+    float total_w = 0.0f;
+    for (const W &w : words)
+        total_w += measure(font, size, w.text);
+    if (total_w > max_w)
+        return false;
+
+    float x = center.x - total_w * 0.5f;
+    const float y = center.y - size * 0.5f;
+    const ImU32 sung_col = ui_with_alpha(g_lyric_accent ? g_lyric_accent : ui_accent_text_u32(),
+                                          alpha * 0.96f);
+    const ImU32 future_col = ui_with_alpha(ui_text_dim_u32(), alpha * 0.72f);
+    const ImU32 glow_col = g_lyric_glow ? g_lyric_glow : ui_accent_text_u32();
+    for (const W &w : words)
+    {
+        const bool past = focus && t >= w.end;
+        const bool current = focus && !past && t >= w.start;
+        float draw_size = size;
+        float dy = 0.0f;
+        if (current)
+        {
+            draw_size = size * 1.035f;
+            dy = -size * 0.015f;
+        }
+        const ImU32 col = !focus ? future_col
+                                 : (past ? sung_col
+                                         : (current ? ui_with_alpha(sung_col, alpha) : future_col));
+        if (current && glow > 0.01f)
+        {
+            const float o = (1.2f + 1.6f * glow) * std::max(1.0f, size / 36.0f);
+            const float a = alpha * 0.10f * glow;
+            dl->AddText(font, draw_size, ImVec2(x - o, y + dy), ui_with_alpha(glow_col, a), w.text.c_str());
+            dl->AddText(font, draw_size, ImVec2(x + o, y + dy), ui_with_alpha(glow_col, a), w.text.c_str());
+            dl->AddText(font, draw_size, ImVec2(x, y + dy - o), ui_with_alpha(glow_col, a), w.text.c_str());
+            dl->AddText(font, draw_size, ImVec2(x, y + dy + o), ui_with_alpha(glow_col, a), w.text.c_str());
+        }
+        dl->AddText(font, draw_size, ImVec2(x, y + dy), col, w.text.c_str());
+        x += measure(font, size, w.text);
+    }
+
+    // Translation and romanization, dim and smaller under the line.
+    float deco_y = center.y + size * 0.56f;
+    if (!line.romanization.empty())
+    {
+        const float rs = std::max(13.0f, size * 0.30f);
+        const float rw = measure(g_ui_fonts.body, rs, line.romanization);
+        dl->AddText(g_ui_fonts.body, rs,
+                    ImVec2(center.x - rw * 0.5f, deco_y),
+                    ui_with_alpha(ui_text_dim_u32(), alpha * 0.72f),
+                    line.romanization.c_str());
+        deco_y += rs * 1.25f;
+    }
+    if (!line.translation.empty())
+    {
+        const float ts = std::max(14.0f, size * 0.34f);
+        const float tw = measure(g_ui_fonts.body, ts, line.translation);
+        dl->AddText(g_ui_fonts.body, ts,
+                    ImVec2(center.x - tw * 0.5f, deco_y),
+                    ui_with_alpha(ui_text_dim_u32(), alpha * 0.82f),
+                    line.translation.c_str());
+    }
+    return true;
+}
+
+void draw_translation(ImDrawList *dl, const RichLyricLine &line, ImVec2 center,
+                      float size, float alpha)
+{
+    if (!line.translation.empty())
+    {
+        const float ts = std::max(12.0f, size * 0.34f);
+        const float tw = measure(g_ui_fonts.body, ts, line.translation);
+        dl->AddText(g_ui_fonts.body, ts, ImVec2(center.x - tw * 0.5f, center.y),
+                    ui_with_alpha(ui_text_dim_u32(), alpha * 0.55f),
+                    line.translation.c_str());
+    }
+    if (!line.romanization.empty())
+    {
+        const float rs = std::max(11.0f, size * 0.29f);
+        const float rw = measure(g_ui_fonts.body, rs, line.romanization);
+        dl->AddText(g_ui_fonts.body, rs,
+                    ImVec2(center.x - rw * 0.5f,
+                           center.y + (line.translation.empty() ? 0.0f : size * 0.38f)),
+                    ui_with_alpha(ui_text_dim_u32(), alpha * 0.48f),
+                    line.romanization.c_str());
+    }
+}
+
+void draw_cover_card(ImDrawList *dl, const Track &display, ImVec2 focal,
+                     float w, float h, float alpha, float glow)
+{
+    if (alpha <= 0.003f)
+        return;
+    const float s = std::min(w, h);
+    const float art = std::min(s * 0.48f, std::min(w * 0.44f, 520.0f));
+    const float x = focal.x - art * 0.5f;
+    const float y = focal.y - art * 0.62f;
+    const ImVec2 p0(x, y);
+    const ImVec2 p1(x + art, y + art);
+    const float rounding = std::max(8.0f, art * 0.035f);
+    dl->AddRectFilled(ImVec2(p0.x + 8.0f, p0.y + 14.0f), ImVec2(p1.x + 8.0f, p1.y + 14.0f),
+                      ui_with_alpha(IM_COL32(0, 0, 0, 255), 0.30f * alpha), rounding);
+    TextureInfo ti = texture_info(display.thumbnail_url);
+    if (ti.id != 0)
+    {
+        float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+        if (cover_uv(ti, art, art, u0, v0, u1, v1))
+            dl->AddImageRounded((ImTextureID)(intptr_t)ti.id, p0, p1, ImVec2(u0, v0),
+                                ImVec2(u1, v1), ui_with_alpha(IM_COL32_WHITE, alpha),
+                                rounding);
+    }
+    else
+    {
+        dl->AddRectFilled(p0, p1, ui_with_alpha(ui_accent_u32(0.22f), alpha), rounding);
+        dl->AddRect(p0, p1, ui_with_alpha(ui_accent_u32(0.35f), alpha), rounding, 0, 1.0f);
+    }
+    if (glow > 0.01f)
+        dl->AddRect(p0, p1, ui_with_alpha(ui_accent_u32(0.22f * glow), alpha), rounding, 0,
+                    std::max(1.0f, ui_px(1.0f)));
+
+    const float tx = focal.x;
+    float ty = p1.y + std::max(18.0f, art * 0.06f);
+    const float title_size = std::max(22.0f, std::min(38.0f, art * 0.09f));
+    const std::string title = ui_ellipsize(g_ui_fonts.semibold, title_size,
+                                           display.title.empty() ? "Nothing playing" : display.title,
+                                           w * 0.78f);
+    const float tw = measure(g_ui_fonts.semibold, title_size, title);
+    dl->AddText(g_ui_fonts.semibold, title_size, ImVec2(tx - tw * 0.5f, ty),
+                ui_with_alpha(ui_text_u32(), 0.94f * alpha), title.c_str());
+    ty += title_size * 1.35f;
+    if (!display.artist.empty())
+    {
+        const float as = std::max(14.0f, title_size * 0.52f);
+        const std::string ar = ui_ellipsize(g_ui_fonts.body, as, display.artist, w * 0.72f);
+        const float aw = measure(g_ui_fonts.body, as, ar);
+        dl->AddText(g_ui_fonts.body, as, ImVec2(tx - aw * 0.5f, ty),
+                    ui_with_alpha(ui_text_dim_u32(), 0.80f * alpha), ar.c_str());
     }
 }
 
@@ -735,8 +954,26 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         // is computed once when the cover is decoded; invalid bands fall back
         // to the dominant tint, and a touch of the theme accent keeps the
         // gradient in the same family as the rest of the UI.
-        TextureColor palette[3];
-        if (texture_cover_palette(display.thumbnail_url, palette))
+        TextureColor palette[3]{};
+        const bool have_palette = texture_cover_palette(display.thumbnail_url, palette);
+        g_lyric_accent = ui_accent_text_u32();
+        g_lyric_glow = g_lyric_accent;
+        if (have_palette)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                if (!palette[i].valid)
+                    continue;
+                ImVec4 c = ImVec4(palette[i].r, palette[i].g, palette[i].b, 1.0f);
+                const float lum = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+                if (lum < 0.55f)
+                    c = mix4(c, ImVec4(1.0f, 1.0f, 1.0f, 1.0f), (0.55f - lum) * 0.7f);
+                g_lyric_accent = ui_col(c);
+                g_lyric_glow = ui_col(mix4(c, ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 0.15f));
+                break;
+            }
+        }
+        if (have_palette)
         {
             const ImVec2 spots[3] = {
                 ImVec2(wp.x + w * 0.28f, wp.y + focal.y * 0.94f),
@@ -839,7 +1076,9 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                                          h * 0.16f);
 
         bool show_message = false;
+        bool draw_cover = false;
         std::string message;
+        std::string note;
 
         if (display.id.empty())
         {
@@ -848,31 +1087,38 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         }
         else if (!has_payload)
         {
-            show_message = true;
-            message = state.lyrics_loading.load() ? "Loading lyrics" : "Lyrics not loaded.";
+            // Start on the artwork, like the native player: the lyrics fade in
+            // over it when the provider answers.
+            draw_cover = true;
+            if (state.lyrics_loading.load())
+                note = "Loading lyrics";
         }
         else if (!snap->lyrics.ok)
         {
-            show_message = true;
-            message = "Couldn't load lyrics.";
+            draw_cover = true;
+            note = "Couldn't load lyrics";
         }
         else if (snap->lyrics.none || snap->lyrics.lines.empty())
         {
-            show_message = true;
-            message = "No lyrics found for this track.";
+            draw_cover = true;
         }
 
         const Lyrics *lx = has_payload ? &snap->lyrics : nullptr;
 
-        if (show_message)
+        if (draw_cover)
         {
-            TextLayout msg = layout_text(font, message, max_text_w * 0.8f,
-                                         active_pref * 0.46f, 20.0f);
-            draw_rows(dl, font, msg, focal,
-                      ui_text_dim_u32(), 0.85f * view_a, 1.0f, 0.0f);
+            draw_cover_card(dl, display, focal, w, h, view_a, g_imm.pulse);
+            if (!note.empty())
+            {
+                const float ns = std::max(12.0f, std::min(16.0f, h * 0.016f));
+                const float nw = measure(g_ui_fonts.body, ns, note);
+                dl->AddText(g_ui_fonts.body, ns,
+                            ImVec2(focal.x - nw * 0.5f, focal.y + std::min(w, h) * 0.33f),
+                            ui_with_alpha(ui_text_dim_u32(), 0.62f * view_a), note.c_str());
+            }
             if (state.lyrics_loading.load() && motion)
             {
-                const float dot_y = focal.y + msg.height * 0.5f + ui_px(24.0f);
+                const float dot_y = focal.y + std::min(w, h) * 0.37f;
                 for (int i = 0; i < 3; ++i)
                 {
                     const float ph = (float)now * 2.6f - (float)i * 0.6f;
@@ -883,6 +1129,13 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 }
                 animating = true;
             }
+        }
+        else if (show_message)
+        {
+            TextLayout msg = layout_text(font, message, max_text_w * 0.8f,
+                                         active_pref * 0.46f, 20.0f);
+            draw_rows(dl, font, msg, focal,
+                      ui_text_dim_u32(), 0.85f * view_a, 1.0f, 0.0f);
         }
         else if (!lx->synced)
         {
@@ -1020,6 +1273,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
 
                 const float pitch = active_pref * 1.92f;
                 const float up_floor = std::max(15.0f, active_pref * 0.34f);
+                const double tplay = lyrics_playback_time(state, player) -
+                                     state.settings.lyrics_offset;
                 const int lo = std::max(0, (int)std::floor(g_imm.scroll) - 3);
                 const int hi = std::min((int)lx->lines.size() - 1,
                                         (int)std::ceil(g_imm.scroll) + 3);
@@ -1051,9 +1306,28 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                                          ? cap_lay
                                          : layout_text(font, lx->lines[i], max_text_w, size,
                                                        std::max(13.0f, size * 0.5f));
-                    draw_rows(dl, font, lay, ImVec2(focal.x, focal.y + d * pitch),
-                              is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
-                              alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
+                    bool drew_words = false;
+                    const ImVec2 line_center(focal.x, focal.y + d * pitch);
+                    if (i < (int)lx->rich.size())
+                    {
+                        const RichLyricLine &rich = lx->rich[(size_t)i];
+                        if (!rich.words.empty() || !rich.text.empty())
+                            drew_words = draw_word_lyric(
+                                dl, font, size, line_center, max_text_w, rich, tplay,
+                                alpha, is_active ? 1.0f : 0.0f, is_active);
+                    }
+                    if (!drew_words)
+                    {
+                        draw_rows(dl, font, lay, line_center,
+                                  is_active ? ui_accent_text_u32() : ui_text_dim_u32(),
+                                  alpha, 1.0f, 0.0f, is_active ? karaoke : -1.0f);
+                        if (i < (int)lx->rich.size())
+                            draw_translation(dl, lx->rich[(size_t)i],
+                                             ImVec2(focal.x,
+                                                    focal.y + d * pitch + lay.height * 0.5f +
+                                                        size * 0.55f),
+                                             size, alpha);
+                    }
                 }
             }
         }
