@@ -249,8 +249,33 @@ void save_settings(const Settings &settings)
     out << "],\"rq_q\":[";
     for (size_t i = 0; i < settings.room_eq_bands.size(); ++i)
         out << (i ? "," : "") << settings.room_eq_bands[i].q;
-    out << "]"
-        << ",\"discord_client_id\":\"" << settings.discord_client_id << "\""
+    out << "]";
+    {
+        auto write_floats = [&out](const char *key, const std::vector<float> &v) {
+            out << ",\"" << key << "\":[";
+            for (size_t i = 0; i < v.size(); ++i)
+                out << (i ? "," : "") << v[i];
+            out << "]";
+        };
+        const RoomEqCurve &c = settings.room_eq_curve;
+        write_floats("rq_curve_hz", c.hz);
+        write_floats("rq_curve_measured", c.measured_db);
+        write_floats("rq_curve_target", c.target_db);
+        write_floats("rq_curve_corrected", c.corrected_db);
+        out << ",\"rq_curve_valid\":[";
+        for (size_t i = 0; i < c.valid.size(); ++i)
+            out << (i ? "," : "") << (c.valid[i] ? 1 : 0);
+        out << "]"
+            << ",\"rq_curve_mic\":\"" << json_escape(c.mic) << "\""
+            << ",\"rq_curve_before\":" << c.residual_before_db
+            << ",\"rq_curve_after\":" << c.residual_after_db
+            << ",\"rq_curve_lo\":" << c.correct_lo_hz
+            << ",\"rq_curve_hi\":" << c.correct_hi_hz
+            << ",\"rq_curve_content_hi\":" << c.content_hi_hz
+            << ",\"rq_curve_max_bands\":" << c.max_bands
+            << ",\"rq_curve_rate\":" << c.sample_rate;
+    }
+    out << ",\"discord_client_id\":\"" << settings.discord_client_id << "\""
         << ",\"server_sync\":" << (settings.server_sync ? "true" : "false")
         << ",\"notes\":\"" << json_escape(settings.notes) << "\""
         << ",\"party\":{"
@@ -349,7 +374,8 @@ Settings load_settings()
         if (json.find("\"eq_preset\"") != std::string::npos)
             s.eq_preset = std::max(0, std::min(5, (int)std::lround(get_float("eq_preset"))));
         {
-            auto parse_float_array = [&](const char *key, std::vector<float> &out) {
+            auto parse_float_array = [&](const char *key, std::vector<float> &out,
+                                         size_t cap = 64) {
                 const std::string needle = std::string("\"") + key + "\":";
                 size_t at = json.find(needle);
                 if (at == std::string::npos)
@@ -358,7 +384,7 @@ Settings load_settings()
                 if (arr == std::string::npos)
                     return false;
                 size_t pos = arr + 1;
-                while (pos < json.size() && out.size() < 64)
+                while (pos < json.size() && out.size() < cap)
                 {
                     while (pos < json.size() && (json[pos] == ' ' || json[pos] == ','))
                         ++pos;
@@ -430,6 +456,33 @@ Settings load_settings()
                       [](const EqBand &a, const EqBand &b) { return a.freq < b.freq; });
             if (s.room_eq_bands.size() > 32)
                 s.room_eq_bands.resize(32);
+
+            // Curves behind the applied correction, used for the Room EQ
+            // response graph after a restart or room switch.
+            RoomEqCurve &c = s.room_eq_curve;
+            parse_float_array("rq_curve_hz", c.hz, 512);
+            parse_float_array("rq_curve_measured", c.measured_db, 512);
+            parse_float_array("rq_curve_target", c.target_db, 512);
+            parse_float_array("rq_curve_corrected", c.corrected_db, 512);
+            std::vector<float> cv;
+            if (parse_float_array("rq_curve_valid", cv, 512))
+            {
+                c.valid.reserve(cv.size());
+                for (float v : cv)
+                    c.valid.push_back(v > 0.5f ? 1 : 0);
+            }
+            c.mic = get_str("rq_curve_mic");
+            c.residual_before_db = get_float("rq_curve_before");
+            c.residual_after_db = get_float("rq_curve_after");
+            c.correct_lo_hz = get_float("rq_curve_lo");
+            c.correct_hi_hz = get_float("rq_curve_hi");
+            c.content_hi_hz = get_float("rq_curve_content_hi");
+            c.max_bands = (int)std::lround(get_float("rq_curve_max_bands"));
+            c.sample_rate = (int)std::lround(get_float("rq_curve_rate"));
+            if (c.sample_rate <= 0)
+                c.sample_rate = 48000;
+            if (c.empty() || c.valid.size() != c.hz.size())
+                c.valid.assign(c.hz.size(), 1);
         }
         if (json.find("\"rq_enabled\"") != std::string::npos)
             s.room_eq_enabled = get_bool("rq_enabled");

@@ -321,7 +321,13 @@ void draw_room_eq_panel(AppState &state)
 {
     const UiMetrics &m = ui_m();
     Settings &st = state.settings;
-    const roomeq::Status status = roomeq::status();
+    roomeq::Status status = roomeq::status();
+    // The applied correction's curves are persisted, so the response graph is
+    // available after a restart or a saved-room switch, not only right after
+    // a calibration.
+    if (!status.has_result && !st.room_eq_curve.empty() &&
+        roomeq::restore_saved(state))
+        status = roomeq::status();
 
     ImGui::PushID("room_eq");
     room_help("Measure how your speakers actually sound where you sit, then let crossfade "
@@ -376,10 +382,17 @@ void draw_room_eq_panel(AppState &state)
             if (ImGui::Selectable(room_ptrs[i], selected))
             {
                 if (i == 0)
+                {
                     rooms::deactivate(state.settings);
+                    roomeq::reset_result();
+                }
                 else
+                {
                     rooms::activate(state.settings, s_rooms[(std::size_t)i - 1].id);
+                    roomeq::restore_saved(state);
+                }
                 save_settings(state.settings);
+                status = roomeq::status();
             }
             if (selected)
                 ImGui::SetItemDefaultFocus();
@@ -396,8 +409,10 @@ void draw_room_eq_panel(AppState &state)
         {
             rooms::remove(active.id);
             rooms::deactivate(state.settings);
+            roomeq::reset_result();
             save_settings(state.settings);
             s_rooms = rooms::list();
+            status = roomeq::status();
         }
     }
     if (ImGui::Checkbox("Switch rooms with the output device", &st.room_eq_auto_room))

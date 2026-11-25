@@ -758,6 +758,7 @@ int app_run(int argc, char **argv)
     party_init();
     party_set_wake(party_wake_event);
     roomeq::init();
+    roomeq::restore_saved(g_state);
     roomeq::set_wake(party_wake_event);
     updater::init(party_wake_event,
                   []() { g_state.quit_requested.store(true); },

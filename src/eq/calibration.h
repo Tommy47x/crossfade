@@ -85,6 +85,10 @@ void reset_result();
 // Re-fits the current measurement with the settings' filter ceiling. No new
 // measurement needed; cheap enough for the main thread.
 bool redesign(AppState &state);
+// Restores the curves of the applied correction from the settings, so the
+// response graph and the target/strength controls keep working after a restart
+// or a saved-room switch. Returns false when there is nothing to restore.
+bool restore_saved(AppState &state);
 // Closes the phone page but keeps the current result on screen.
 void close_page();
 // Persists a REW-style .cal file and selects it as the microphone profile.

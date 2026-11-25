@@ -591,7 +591,10 @@ void tick(AppState &state, const MpvPlayer &player)
                     rooms::match_device(dev, state.settings.room_eq_active_id);
                 if (!id.empty() && id != state.settings.room_eq_active_id &&
                     rooms::activate(state.settings, id))
+                {
                     save_settings(state.settings);
+                    restore_saved(state);
+                }
             }
         }
     }
@@ -840,6 +843,56 @@ bool redesign(AppState &state)
     return true;
 }
 
+bool restore_saved(AppState &state)
+{
+    const RoomEqCurve &c = state.settings.room_eq_curve;
+    if (c.empty())
+    {
+        reset_result();
+        return false;
+    }
+    const dsp::Grid grid = default_grid();
+    if (c.hz.size() != grid.hz.size())
+    {
+        reset_result();
+        return false;
+    }
+    for (std::size_t i = 0; i < grid.hz.size(); ++i)
+        if (std::fabs((double)c.hz[i] - grid.hz[i]) > 0.5)
+        {
+            reset_result();
+            return false;
+        }
+
+    reset_result();
+    g_grid = grid;
+    g_smooth.assign(c.measured_db.begin(), c.measured_db.end());
+    g_meas.valid = c.valid;
+    if (g_meas.valid.size() != g_smooth.size())
+        g_meas.valid.assign(g_smooth.size(), 1);
+    g_meas.content_hi_hz = c.content_hi_hz;
+    g_effective_mic = c.mic;
+    g_spec.sample_rate = c.sample_rate > 0 ? c.sample_rate : 48000;
+    g_max_bands = c.max_bands;
+    g_correct_lo_hz = c.correct_lo_hz;
+    g_correct_hi_hz = c.correct_hi_hz;
+    g_has_result = true;
+
+    if (!redesign(state))
+    {
+        // The fit needs the measured curve; keep the stored display curves if
+        // it cannot run for any reason.
+        g_target.assign(c.target_db.begin(), c.target_db.end());
+        g_corrected.assign(c.corrected_db.begin(), c.corrected_db.end());
+        g_design.bands.clear();
+        for (const EqBand &b : state.settings.room_eq_bands)
+            g_design.bands.push_back({(double)b.freq, (double)b.gain, (double)b.q});
+        g_design.residual_rms_db = c.residual_after_db;
+        g_before_db = c.residual_before_db;
+    }
+    return true;
+}
+
 void close_page()
 {
     if (eqserver::running())
@@ -860,6 +913,38 @@ bool apply(AppState &state)
     st.room_eq_residual_db = (float)g_design.residual_rms_db;
     st.room_eq_label = timestamp_label();
     st.room_eq_enabled = !st.room_eq_bands.empty();
+
+    // Keep the curves behind this correction so the response graph can be
+    // drawn after a restart or a saved-room switch, not only during the
+    // calibration session.
+    RoomEqCurve c;
+    const std::size_t n = g_grid.hz.size();
+    if (g_smooth.size() == n)
+    {
+        c.hz.resize(n);
+        c.measured_db.resize(n);
+        c.target_db.resize(n);
+        c.corrected_db.resize(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            c.hz[i] = (float)g_grid.hz[i];
+            c.measured_db[i] = (float)g_smooth[i];
+            c.target_db[i] = (float)g_target[i];
+            c.corrected_db[i] = (float)g_corrected[i];
+        }
+        c.valid = g_meas.valid;
+        if (c.valid.size() != n)
+            c.valid.assign(n, 1);
+        c.mic = g_effective_mic;
+        c.residual_before_db = (float)g_before_db;
+        c.residual_after_db = (float)g_design.residual_rms_db;
+        c.correct_lo_hz = (float)g_correct_lo_hz;
+        c.correct_hi_hz = (float)g_correct_hi_hz;
+        c.content_hi_hz = (float)g_meas.content_hi_hz;
+        c.max_bands = g_max_bands;
+        c.sample_rate = g_spec.sample_rate;
+    }
+    st.room_eq_curve = std::move(c);
     save_settings(st);
     return true;
 }
@@ -873,6 +958,7 @@ void forget(AppState &state)
     st.room_eq_preamp = 0.0f;
     st.room_eq_label.clear();
     st.room_eq_residual_db = 0.0f;
+    st.room_eq_curve = RoomEqCurve{};
     save_settings(st);
 }
 

@@ -17,6 +17,14 @@ All notable changes to crossfade are documented here.
 - Lyric lines now wait until the cover hand-off has finished before their
   staggered entrance, so text never paints over the artwork.
 
+### Room correction
+
+- The measured, target and corrected response graph is saved with the applied
+  correction (and with each saved room). It is no longer limited to the live
+  calibration session: reopening the page, switching rooms or restarting the
+  app still shows the graph, and the target/strength/filter-detail controls
+  keep re-fitting it.
+
 ### Playlists
 
 - Native playlist replies use the `id` field while the parser only understood

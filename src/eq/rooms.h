@@ -24,6 +24,9 @@ struct Profile
     std::string label;
     double residual_db = 0.0;
     long long saved_at = 0;
+    // Response curves that produced this correction (empty in profiles saved
+    // before the graph was persisted).
+    RoomEqCurve curve;
 };
 
 void init();

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -59,7 +60,7 @@ void parse_float_array(const std::string &json, const char *key, std::vector<dou
     if (at == std::string::npos)
         return;
     std::size_t pos = at + 1;
-    while (pos < json.size() && out.size() < 64)
+    while (pos < json.size() && out.size() < 512)
     {
         while (pos < json.size() && (json[pos] == ' ' || json[pos] == ','))
             ++pos;
@@ -216,6 +217,7 @@ bool load(const std::string &id, Profile &out)
         return false;
     const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     out.id = id;
+    out.curve = RoomEqCurve{};
     out.name = jsonutil::get_string(json, "name", id);
     out.device = jsonutil::get_string(json, "device");
     out.preamp = (float)jsonutil::get_double(json, "preamp");
@@ -240,6 +242,35 @@ bool load(const std::string &id, Profile &out)
         b.q = (float)std::max(0.1, std::min(10.0, i < q.size() ? q[i] : 1.0));
         out.bands.push_back(b);
     }
+
+    RoomEqCurve &c = out.curve;
+    std::vector<double> chz, cmeas, ctarg, ccorr, cvalid;
+    parse_float_array(json, "curve_hz", chz);
+    parse_float_array(json, "curve_measured", cmeas);
+    parse_float_array(json, "curve_target", ctarg);
+    parse_float_array(json, "curve_corrected", ccorr);
+    parse_float_array(json, "curve_valid", cvalid);
+    c.hz.assign(chz.begin(), chz.end());
+    c.measured_db.assign(cmeas.begin(), cmeas.end());
+    c.target_db.assign(ctarg.begin(), ctarg.end());
+    c.corrected_db.assign(ccorr.begin(), ccorr.end());
+    c.valid.reserve(cvalid.size());
+    for (double v : cvalid)
+        c.valid.push_back(v > 0.5 ? 1 : 0);
+    c.mic = jsonutil::get_string(json, "curve_mic");
+    c.residual_before_db = (float)jsonutil::get_double(json, "curve_before");
+    c.residual_after_db = (float)jsonutil::get_double(json, "curve_after");
+    c.correct_lo_hz = (float)jsonutil::get_double(json, "curve_lo");
+    c.correct_hi_hz = (float)jsonutil::get_double(json, "curve_hi");
+    c.content_hi_hz = (float)jsonutil::get_double(json, "curve_content_hi");
+    c.max_bands = (int)std::lround(jsonutil::get_double(json, "curve_max_bands"));
+    c.sample_rate = (int)std::lround(jsonutil::get_double(json, "curve_rate"));
+    if (c.sample_rate <= 0)
+        c.sample_rate = 48000;
+    if (c.valid.size() != c.hz.size())
+        c.valid.assign(c.hz.size(), 1);
+    if (c.empty())
+        c = RoomEqCurve{};
     return true;
 }
 
@@ -276,7 +307,33 @@ bool save_profile(const Profile &profile, std::string &error)
     out << "],\"q\":[";
     for (std::size_t i = 0; i < p.bands.size(); ++i)
         out << (i ? "," : "") << p.bands[i].q;
-    out << "]}";
+    out << "]";
+    {
+        auto write_floats = [&out](const char *key, const std::vector<float> &v) {
+            out << ",\"" << key << "\":[";
+            for (std::size_t i = 0; i < v.size(); ++i)
+                out << (i ? "," : "") << v[i];
+            out << "]";
+        };
+        const RoomEqCurve &c = p.curve;
+        write_floats("curve_hz", c.hz);
+        write_floats("curve_measured", c.measured_db);
+        write_floats("curve_target", c.target_db);
+        write_floats("curve_corrected", c.corrected_db);
+        out << ",\"curve_valid\":[";
+        for (std::size_t i = 0; i < c.valid.size(); ++i)
+            out << (i ? "," : "") << (c.valid[i] ? 1 : 0);
+        out << "]"
+            << ",\"curve_mic\":\"" << jsonutil::escape(c.mic) << "\""
+            << ",\"curve_before\":" << c.residual_before_db
+            << ",\"curve_after\":" << c.residual_after_db
+            << ",\"curve_lo\":" << c.correct_lo_hz
+            << ",\"curve_hi\":" << c.correct_hi_hz
+            << ",\"curve_content_hi\":" << c.content_hi_hz
+            << ",\"curve_max_bands\":" << c.max_bands
+            << ",\"curve_rate\":" << c.sample_rate;
+    }
+    out << "}";
     return (bool)out;
 }
 
@@ -299,6 +356,7 @@ Profile from_settings(const Settings &settings, const std::string &name)
     p.target = settings.room_eq_target;
     p.label = settings.room_eq_label;
     p.residual_db = settings.room_eq_residual_db;
+    p.curve = settings.room_eq_curve;
     return p;
 }
 
@@ -324,6 +382,7 @@ bool activate(Settings &s, const std::string &id)
     s.room_eq_label = p.label;
     s.room_eq_residual_db = (float)p.residual_db;
     s.room_eq_active_id = p.id;
+    s.room_eq_curve = p.curve;
     s.room_eq_enabled = !p.bands.empty();
     return true;
 }
@@ -333,6 +392,7 @@ void deactivate(Settings &s)
     s.room_eq_bands.clear();
     s.room_eq_enabled = false;
     s.room_eq_active_id.clear();
+    s.room_eq_curve = RoomEqCurve{};
 }
 
 std::string match_device(const std::string &device, const std::string &prefer)

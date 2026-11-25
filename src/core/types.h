@@ -163,6 +163,45 @@ inline bool operator==(const EqBand &a, const EqBand &b)
     return a.freq == b.freq && a.gain == b.gain && a.q == b.q;
 }
 
+// Curves that produced an applied room correction. They are persisted with
+// the settings (and with a saved room) so the Room EQ page can draw the
+// measured/target/corrected response after a restart or a room switch, and
+// re-fit it when the target/strength/detail controls change.
+struct RoomEqCurve
+{
+    std::vector<float> hz;
+    std::vector<float> measured_db;
+    std::vector<float> target_db;
+    std::vector<float> corrected_db;
+    std::vector<char> valid; // per point; empty means all trusted
+    std::string mic;
+    float residual_before_db = 0.0f;
+    float residual_after_db = 0.0f;
+    float correct_lo_hz = 0.0f;
+    float correct_hi_hz = 0.0f;
+    float content_hi_hz = 0.0f;
+    int max_bands = 12;
+    int sample_rate = 48000;
+
+    bool empty() const
+    {
+        return hz.empty() || measured_db.size() != hz.size() ||
+               target_db.size() != hz.size() || corrected_db.size() != hz.size();
+    }
+};
+
+inline bool operator==(const RoomEqCurve &a, const RoomEqCurve &b)
+{
+    return a.hz == b.hz && a.measured_db == b.measured_db &&
+           a.target_db == b.target_db && a.corrected_db == b.corrected_db &&
+           a.valid == b.valid && a.mic == b.mic &&
+           a.residual_before_db == b.residual_before_db &&
+           a.residual_after_db == b.residual_after_db &&
+           a.correct_lo_hz == b.correct_lo_hz && a.correct_hi_hz == b.correct_hi_hz &&
+           a.content_hi_hz == b.content_hi_hz && a.max_bands == b.max_bands &&
+           a.sample_rate == b.sample_rate;
+}
+
 struct Settings
 {
     float crossfade_duration = 5.0f;
@@ -348,6 +387,8 @@ struct Settings
     std::string room_eq_active_id;
     // Switch the saved room automatically when the output device changes.
     bool room_eq_auto_room = true;
+    // Curves behind the applied correction, for the always-visible graph.
+    RoomEqCurve room_eq_curve;
 
     // Discord Rich Presence: application client id (empty = off). Also
     // overridable via P100_DISCORD_CLIENT_ID.
@@ -413,6 +454,7 @@ struct Settings
                room_eq_residual_db == o.room_eq_residual_db &&
                room_eq_active_id == o.room_eq_active_id &&
                room_eq_auto_room == o.room_eq_auto_room &&
+               room_eq_curve == o.room_eq_curve &&
                discord_client_id == o.discord_client_id &&
                server_sync == o.server_sync && party == o.party;
     }
