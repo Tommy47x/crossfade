@@ -1203,31 +1203,64 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         else if (!lx->synced)
         {
             // ---- Unsynced fallback: a slowly read, poem-like block ----
+            // Translation and romanization rows are part of the block, so an
+            // unsynced non-English song still reads bilingually.
+            struct DecoRow
+            {
+                std::string text;
+                float size;
+                float h;
+                int kind; // 0 lyric, 1 translation, 2 romanization
+            };
             float size = clampf(active_pref * 0.55f, 18.0f, 58.0f);
             const float floor_size = std::max(13.0f, size * 0.55f);
             const float block_w = max_text_w * 0.82f;
 
             auto build = [&](float s, float &total_h) {
-                std::vector<TextRow> rows;
-                for (const std::string &line : lx->lines)
+                std::vector<DecoRow> rows;
+                const float lh = s * 1.26f;
+                for (std::size_t i = 0; i < lx->lines.size(); ++i)
                 {
+                    const std::string &line = lx->lines[i];
                     if (blank(line))
                     {
-                        rows.push_back({std::string(), 0.0f});
+                        rows.push_back({std::string(), s, lh * 0.55f, 0});
                         continue;
                     }
                     TextLayout one = layout_text(font, line, block_w, s, s);
-                    rows.insert(rows.end(), one.rows.begin(), one.rows.end());
+                    for (const TextRow &row : one.rows)
+                        rows.push_back({row.text, s, lh, 0});
+                    if (i >= lx->rich.size())
+                        continue;
+                    const RichLyricLine &rich = lx->rich[i];
+                    if (!rich.translation.empty())
+                    {
+                        const float ds = std::max(12.0f, s * 0.52f);
+                        TextLayout tr = layout_text(g_ui_fonts.body, rich.translation,
+                                                    block_w * 0.92f, ds, ds);
+                        for (const TextRow &row : tr.rows)
+                            rows.push_back({row.text, ds, ds * 1.22f, 1});
+                    }
+                    if (!rich.romanization.empty())
+                    {
+                        const float rs = std::max(11.0f, s * 0.46f);
+                        TextLayout ro = layout_text(g_ui_fonts.body, rich.romanization,
+                                                    block_w * 0.92f, rs, rs);
+                        for (const TextRow &row : ro.rows)
+                            rows.push_back({row.text, rs, rs * 1.20f, 2});
+                    }
                 }
-                total_h = (float)rows.size() * (s * 1.26f);
+                total_h = 0.0f;
+                for (const DecoRow &row : rows)
+                    total_h += row.h;
+                if (!rows.empty())
+                    total_h += (rows.size() - 1) * std::max(2.0f, s * 0.06f);
                 return rows;
             };
 
             float total_h = 0.0f;
-            std::vector<TextRow> rows = build(size, total_h);
+            std::vector<DecoRow> rows = build(size, total_h);
             const float avail_h = h - pad * 2.0f;
-            // With motion off, shrink a little first so most unsynced blocks
-            // still fit without any scrolling at all.
             if (!motion)
             {
                 while (total_h > avail_h && size > floor_size)
@@ -1237,7 +1270,6 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 }
             }
 
-            const float line_h = size * 1.26f;
             const bool overflow = total_h > avail_h;
             float scroll = 0.0f;
             if (overflow && motion)
@@ -1252,22 +1284,28 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             const float edge = std::max(ui_px(42.0f), h * 0.09f);
             const float top = pad;
             const float bottom = h - pad;
+            const float gap = std::max(2.0f, size * 0.06f);
 
             dl->PushClipRect(ImVec2(wp.x, wp.y + top), ImVec2(wp.x + w, wp.y + bottom), true);
-            for (const TextRow &row : rows)
+            for (std::size_t r = 0; r < rows.size(); ++r)
             {
-                float a = view_a * 0.86f;
+                const DecoRow &row = rows[r];
+                float a = view_a * (row.kind == 0 ? 0.86f : 0.62f);
                 if (y < top + edge)
                     a *= clampf((y - top) / edge, 0.0f, 1.0f);
-                if (y + line_h > bottom - edge)
-                    a *= clampf((bottom - (y + line_h)) / edge, 0.0f, 1.0f);
+                if (y + row.h > bottom - edge)
+                    a *= clampf((bottom - (y + row.h)) / edge, 0.0f, 1.0f);
                 if (a > 0.001f && !row.text.empty())
                 {
-                    const float tw = measure(font, size, row.text);
-                    dl->AddText(font, size, ImVec2(w * 0.5f - tw * 0.5f, y),
-                                ui_with_alpha(ui_text_dim_u32(), a), row.text.c_str());
+                    ImFont *rf = row.kind == 0 ? font : g_ui_fonts.body;
+                    const float tw = measure(rf, row.size, row.text);
+                    dl->AddText(rf, row.size, ImVec2(focal.x - tw * 0.5f, y),
+                                ui_with_alpha(row.kind == 0 ? ui_text_dim_u32()
+                                                            : ui_text_dim_u32(),
+                                              a),
+                                row.text.c_str());
                 }
-                y += line_h;
+                y += row.h + gap;
             }
             dl->PopClipRect();
         }
