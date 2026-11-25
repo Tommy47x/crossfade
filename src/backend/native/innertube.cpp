@@ -488,8 +488,8 @@ StreamResult resolve_audio(const std::string &video_id)
     return out;
 }
 
-bool search(const std::string &query, int limit, std::string &json,
-            std::string &error)
+bool search_root(const std::string &query, const std::string &params,
+                 jsonv::Value &root, ResolveTrace &trace, std::string &error)
 {
     if (query.empty())
     {
@@ -501,24 +501,18 @@ bool search(const std::string &query, int limit, std::string &json,
         error = "native backend needs TLS (OpenSSL)";
         return false;
     }
-    ResolveTrace trace;
     trace.client = "WEB_REMIX";
     trace.epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     const auto start = std::chrono::steady_clock::now();
-    if (!session_fresh(g_session))
+    if (!session_fresh(g_session) && !refresh_session(trace))
     {
-        if (!refresh_session(trace))
-        {
-            error = trace.error;
-            record(trace);
-            return false;
-        }
+        error = trace.error;
+        record(trace);
+        return false;
     }
-    else
-        trace.session_hit = true;
-
+    trace.session_hit = true;
     std::string cookies, visitor;
     {
         std::lock_guard<std::mutex> lock(g_session_mutex);
@@ -529,10 +523,10 @@ bool search(const std::string &query, int limit, std::string &json,
     body += "{\"context\":{\"client\":{";
     body += "\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20241104.01.00\",";
     body += "\"hl\":\"en\",\"gl\":\"US\",\"visitorData\":\"" + visitor + "\"";
-    body += "}},\"query\":\"" + json_escape(query) + "\",";
-    // Songs filter (ytmusicapi's "songs" params).
-    body += "\"params\":\"EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D\"}";
-
+    body += "}},\"query\":\"" + json_escape(query) + "\"";
+    if (!params.empty())
+        body += ",\"params\":\"" + params + "\"";
+    body += "}";
     std::vector<HttpHeader> headers = {
         {"User-Agent", kPageUa},
         {"X-YouTube-Client-Name", "67"},
@@ -554,7 +548,6 @@ bool search(const std::string &query, int limit, std::string &json,
         record(trace);
         return false;
     }
-    jsonv::Value root;
     std::string parse_error;
     if (!jsonv::Value::parse(res.body, root, parse_error))
     {
@@ -563,6 +556,19 @@ bool search(const std::string &query, int limit, std::string &json,
         record(trace);
         return false;
     }
+    trace.total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    return true;
+}
+
+bool search(const std::string &query, int limit, std::string &json,
+            std::string &error)
+{
+    jsonv::Value root;
+    ResolveTrace trace;
+    if (!search_root(query, "EgWKAQIIAWoMEA4QChADEAQQCRAF", root, trace, error))
+        return false;
     std::vector<const jsonv::Value *> rows;
     collect_rows(root, rows, 0);
 
@@ -575,9 +581,7 @@ bool search(const std::string &query, int limit, std::string &json,
         if (found >= cap)
             break;
         const std::string id = trim_str(row->get("playlistItemData").str("videoId"));
-        if (id.size() != 11)
-            continue;
-        if (std::find(seen.begin(), seen.end(), id) != seen.end())
+        if (id.size() != 11 || std::find(seen.begin(), seen.end(), id) != seen.end())
             continue;
         const std::string title = row_title(*row);
         if (title.empty())
@@ -602,9 +606,101 @@ bool search(const std::string &query, int limit, std::string &json,
     out += "]";
     trace.status = "SEARCH";
     trace.formats = found;
-    trace.total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count();
+    record(trace);
+    if (found == 0)
+    {
+        error = "No results";
+        return false;
+    }
+    json = out;
+    return true;
+}
+
+bool search_albums(const std::string &query, int limit, std::string &json,
+                   std::string &error)
+{
+    jsonv::Value root;
+    ResolveTrace trace;
+    if (!search_root(query, "EgWKAQIYAWoMEA4QChADEAQQCRAF", root, trace, error))
+        return false;
+    std::vector<const jsonv::Value *> rows;
+    collect_rows(root, rows, 0);
+    std::string out = "[";
+    int found = 0;
+    std::vector<std::string> seen;
+    const int cap = limit > 0 ? std::min(limit, 50) : 20;
+    for (const jsonv::Value *row : rows)
+    {
+        if (found >= cap)
+            break;
+        const std::string id =
+            trim_str(row->get("navigationEndpoint")["browseEndpoint"].str("browseId"));
+        const std::string title = row_title(*row);
+        if (id.empty() || title.empty() ||
+            std::find(seen.begin(), seen.end(), id) != seen.end())
+            continue;
+        const std::vector<std::string> sub = row_subtitle(*row);
+        // "Album | Daft Punk | 2013"
+        const std::string artist = sub.size() > 1 ? sub[1] : std::string();
+        const std::string year = sub.size() > 2 ? sub[2] : std::string();
+        seen.push_back(id);
+        if (found++)
+            out += ",";
+        out += "{\"browse_id\":\"" + json_escape(id) + "\",\"title\":\"" +
+               json_escape(title) + "\",\"artist\":\"" + json_escape(artist) +
+               "\",\"year\":\"" + json_escape(year) + "\",\"thumbnail_url\":\"" +
+               json_escape(row_thumb(*row)) + "\",\"track_count\":0}";
+    }
+    out += "]";
+    trace.status = "SEARCH";
+    trace.formats = found;
+    record(trace);
+    if (found == 0)
+    {
+        error = "No results";
+        return false;
+    }
+    json = out;
+    return true;
+}
+
+bool search_artists(const std::string &query, int limit, std::string &json,
+                    std::string &error)
+{
+    jsonv::Value root;
+    ResolveTrace trace;
+    if (!search_root(query, "EgWKAQIgAWoMEA4QChADEAQQCRAF", root, trace, error))
+        return false;
+    std::vector<const jsonv::Value *> rows;
+    collect_rows(root, rows, 0);
+    std::string out = "[";
+    int found = 0;
+    std::vector<std::string> seen;
+    const int cap = limit > 0 ? std::min(limit, 50) : 20;
+    for (const jsonv::Value *row : rows)
+    {
+        if (found >= cap)
+            break;
+        const std::string id =
+            trim_str(row->get("navigationEndpoint")["browseEndpoint"].str("browseId"));
+        const std::string name = row_title(*row);
+        if (id.empty() || name.empty() ||
+            std::find(seen.begin(), seen.end(), id) != seen.end())
+            continue;
+        const std::vector<std::string> sub = row_subtitle(*row);
+        // "Artist | 65M monthly audience"
+        const std::string subscribers = sub.size() > 1 ? sub[1] : std::string();
+        seen.push_back(id);
+        if (found++)
+            out += ",";
+        out += "{\"browse_id\":\"" + json_escape(id) + "\",\"name\":\"" +
+               json_escape(name) + "\",\"thumbnail_url\":\"" +
+               json_escape(row_thumb(*row)) + "\",\"subscribers\":\"" +
+               json_escape(subscribers) + "\"}";
+    }
+    out += "]";
+    trace.status = "SEARCH";
+    trace.formats = found;
     record(trace);
     if (found == 0)
     {

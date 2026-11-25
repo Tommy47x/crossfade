@@ -3675,6 +3675,18 @@ static bool native_handle_command(const std::string &cmd, std::string &out)
         if (native::search(arg, 20, out, error))
             return true;
     }
+    if (word == "album_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_albums(arg, 20, out, error))
+            return true;
+    }
+    if (word == "artist_search" && !arg.empty())
+    {
+        std::string error;
+        if (native::search_artists(arg, 20, out, error))
+            return true;
+    }
     return false;
 }
 

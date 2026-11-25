@@ -61,6 +61,10 @@ StreamResult resolve_audio(const std::string &video_id);
 // artist, album, thumbnail_url, duration_sec, url). Returns false to fall back.
 bool search(const std::string &query, int limit, std::string &json,
             std::string &error);
+bool search_albums(const std::string &query, int limit, std::string &json,
+                   std::string &error);
+bool search_artists(const std::string &query, int limit, std::string &json,
+                    std::string &error);
 
 // Metadata-only lookup (title/artist/duration/thumbnail) from the same player
 // response, no stream selection. Produces the Python backend's "meta" JSON
