@@ -2,6 +2,41 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.6.2 - 2026-11-26
+
+### Immersive lyrics
+
+- Unsynced lyrics no longer scroll on a timer. The mouse wheel moves the block
+  at the listener's pace and the position resets on a track change.
+- The immersive takeover can be entered without lyrics. It shows the
+  cover/title/artist card with a loading or "no lyrics" state and keeps the
+  title and artist visible on narrow layouts while the chrome is hidden.
+- A track with no lyrics is centred. On a song change its cover first slides
+  up, then glides to the middle; when leaving it, the centred cover returns to
+  the cover column, exits upward, and only then does the next cover rise in.
+- Lyric lines now wait until the cover hand-off has finished before their
+  staggered entrance, so text never paints over the artwork.
+
+### Playlists
+
+- Native playlist replies use the `id` field while the parser only understood
+  ytmusicapi's `videoId`; every native playlist was rejected as unreadable and
+  never cached. Both shapes now parse, the playlist's own top-level id is
+  skipped, and successful loads are written to the per-playlist cache.
+- Playlist rows and continuations come only from the page's main track shelf.
+  Following the first continuation on the page could append an unrelated
+  start-radio/recommendation list (a one-track playlist grew to hundreds of
+  rows).
+
+### Playback
+
+- Previous/Next now use a linear in-memory navigation history with a cursor
+  instead of the de-duplicated History list, which could only bounce between
+  the last two songs. Next walks the forward branch before the queue.
+- At the beginning of the navigation history, Previous steps to the preceding
+  row of the active list when it still contains the current track, and
+  otherwise restarts the song.
+
 ## 0.6.1 - 2026-11-26
 
 ### Immersive lyrics
