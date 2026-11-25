@@ -404,6 +404,15 @@ struct AppState
     std::vector<Track> play_queue;
     std::vector<Track> queue_cycle;
     std::atomic<bool> queue_dirty{false};
+    // Linear playback navigation: every track that became current, with a
+    // cursor. playback_history is de-duplicated for the History tab, so using
+    // it for Previous only ever bounced between the last two songs. This one
+    // keeps the actual order and supports back and forward.
+    std::vector<Track> nav_history;
+    int nav_pos = -1;
+    // The track a Previous/Next press is navigating to; the start path sees
+    // it and does not append a duplicate navigation entry.
+    std::string nav_pending_id;
     // Set by the Queue panel to start a specific queue row now.
     int queue_play_index = -1;
     // Set by a UI play action: rebuild the global queue from the active source

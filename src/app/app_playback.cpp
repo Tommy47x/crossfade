@@ -1490,6 +1490,122 @@ void replay_current_track()
     begin_play_track(t, g_state.current_track_index);
 }
 
+static Track current_track_snapshot()
+{
+    Track t;
+    t.id = g_state.current_track_id;
+    t.title = g_state.current_title;
+    t.artist = g_state.current_artist;
+    t.artist_id = g_state.current_artist_id;
+    t.album_id = g_state.current_album_id;
+    t.thumbnail_url = g_state.current_thumbnail_url;
+    t.url = g_state.current_track_url;
+    if (t.id == g_state.pending_video_id)
+        t.duration_sec = g_state.pending_play_duration_sec;
+    return t;
+}
+
+void note_playback_navigation()
+{
+    static std::string s_last_id;
+    const std::string &id = g_state.current_track_id;
+    if (id.empty())
+    {
+        s_last_id.clear();
+        return;
+    }
+    if (id == s_last_id)
+    {
+        // A navigation press that landed on the current track has nothing to
+        // consume (and must not leave a stale pending id behind).
+        if (g_state.nav_pending_id == id)
+            g_state.nav_pending_id.clear();
+        return;
+    }
+    s_last_id = id;
+
+    if (g_state.nav_pending_id == id)
+    {
+        // Previous/Next already moved the cursor and inserted the entry.
+        g_state.nav_pending_id.clear();
+        return;
+    }
+    // Any other track change is a new play: it discards the forward branch.
+    if (!g_state.nav_pending_id.empty())
+        g_state.nav_pending_id.clear();
+
+    if (g_state.nav_pos >= 0 &&
+        g_state.nav_pos + 1 < (int)g_state.nav_history.size())
+        g_state.nav_history.resize((std::size_t)g_state.nav_pos + 1);
+    if (g_state.nav_pos >= 0 && g_state.nav_pos < (int)g_state.nav_history.size() &&
+        g_state.nav_history[(std::size_t)g_state.nav_pos].id == id)
+        return; // replay/restart of the entry already under the cursor
+
+    g_state.nav_history.push_back(current_track_snapshot());
+    if (g_state.nav_history.size() > 200)
+        g_state.nav_history.erase(g_state.nav_history.begin());
+    g_state.nav_pos = (int)g_state.nav_history.size() - 1;
+}
+
+static bool start_nav_track(const Track &t)
+{
+    if (t.id.empty())
+        return false;
+    g_state.nav_pending_id = t.id;
+    if (!try_start_manual_crossfade(t, -1))
+        begin_play_track(t, -1);
+    g_state.repaint_requested = true;
+    return true;
+}
+
+void play_previous_track()
+{
+    if (g_state.current_track_id.empty())
+        return;
+    if (g_state.nav_pos > 0 &&
+        g_state.nav_pos <= (int)g_state.nav_history.size())
+    {
+        const Track target = g_state.nav_history[(std::size_t)g_state.nav_pos - 1];
+        --g_state.nav_pos;
+        start_nav_track(target);
+        return;
+    }
+
+    // Start of the in-memory history: step to the previous row of the active
+    // list (when that list still contains the current track).
+    auto playlist = get_playlist(g_state);
+    const int idx = g_state.current_track_index;
+    if (playlist && idx > 0 && idx < (int)playlist->size() &&
+        (*playlist)[(std::size_t)idx].id == g_state.current_track_id)
+    {
+        const Track target = (*playlist)[(std::size_t)idx - 1];
+        if (g_state.nav_history.empty())
+            g_state.nav_history.push_back(current_track_snapshot());
+        const int at = std::max(0, g_state.nav_pos);
+        // Insert ahead of the current entry: the cursor lands on the list row
+        // and the track we came from remains as the forward entry.
+        g_state.nav_history.insert(g_state.nav_history.begin() + at, target);
+        g_state.nav_pos = at;
+        start_nav_track(target);
+        return;
+    }
+
+    replay_current_track();
+}
+
+void play_next_track()
+{
+    if (g_state.nav_pos >= 0 &&
+        g_state.nav_pos + 1 < (int)g_state.nav_history.size())
+    {
+        const Track target = g_state.nav_history[(std::size_t)g_state.nav_pos + 1];
+        ++g_state.nav_pos;
+        start_nav_track(target);
+        return;
+    }
+    advance_playback(true);
+}
+
 
 
 bool maybe_start_endless_refill()

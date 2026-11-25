@@ -2082,34 +2082,21 @@ int app_run(int argc, char **argv)
                 g_state.repaint_requested = true;
             }
 
-            // Next / Prev
+            // Next / Prev. Both walk the linear back/forward history; Next
+            // falls through to the queue once there is no forward entry.
             if (g_state.next_requested)
             {
                 g_state.next_requested = false;
-                advance_playback(true);
+                play_next_track();
             }
             if (g_state.prev_requested)
             {
                 g_state.prev_requested = false;
-                // Previous walks actual playback history now that the queue
-                // is the only ordering source. The current track sits at the
-                // front of that history, so play the first different entry.
-                Track prev;
-                bool found = false;
-                for (const Track &h : g_state.playback_history)
-                {
-                    if (h.id.empty() || h.id == g_state.current_track_id)
-                        continue;
-                    prev = h;
-                    found = true;
-                    break;
-                }
-                if (found)
-                {
-                    if (!try_start_manual_crossfade(prev, -1))
-                        begin_play_track(prev, -1);
-                }
+                play_previous_track();
             }
+            // Track changes can come from a click, a crossfade, the queue or
+            // the navigation above; record them in one place.
+            note_playback_navigation();
 
             // Refresh
             if (g_state.refresh_requested)

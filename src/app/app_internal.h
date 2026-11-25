@@ -112,6 +112,14 @@ void discard_recording();
 void commit_play_count();
 void begin_play_track(const Track &t, int index);
 void replay_current_track();
+// Record a track change in the linear back/forward history. Safe to call
+// every frame; it only acts when current_track_id changed.
+void note_playback_navigation();
+// Previous/Next with real history. Previous falls back to the active list's
+// preceding row (then a restart) when the in-memory history has no earlier
+// entry; Next walks the forward branch before touching the queue.
+void play_previous_track();
+void play_next_track();
 bool maybe_start_endless_refill();
 void consume_endless_results();
 void refill_queue_from_cycle();
