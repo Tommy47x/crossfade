@@ -29,9 +29,11 @@ int direct_capture(const std::string &command_line, std::string &output);
 
 // argv variants for code that already has an argument vector. Hidden and
 // waited-for, or hidden and detached (for the import helper that has to
-// outlive the app).
+// outlive the app). `hidden=false` leaves the child's first top-level window
+// visible (STARTF_USESHOWWINDOW would otherwise force pywebview's sign-in
+// window to open hidden).
 int run_argv_hidden(const std::vector<std::string> &args);
-bool spawn_argv_hidden(const std::vector<std::string> &args);
+bool spawn_argv_hidden(const std::vector<std::string> &args, bool hidden = true);
 
 // popen("r")/pclose equivalents. Only read modes are supported. The returned
 // FILE* must be closed with pclose_hidden(); that waits for the child and

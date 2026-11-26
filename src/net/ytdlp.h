@@ -446,6 +446,10 @@ struct SpotifyImportResult
     std::string name;
     std::string error;
     std::vector<Track> tracks;
+    // "Title - Artist" entries the matcher refused (wrong artist, cover,
+    // karaoke, live version, ...). Shown to the user instead of importing
+    // whatever the search happened to return first.
+    std::vector<std::string> unmatched;
     int skipped = 0;
     int total = 0;
 };

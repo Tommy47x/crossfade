@@ -10,10 +10,13 @@
 #include "tasks.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <thread>
 
 #ifdef P100_WINDOWS
 #include "win_process.h"
@@ -64,6 +67,7 @@ static void export_playlist_file(const Playlist &pl, const std::string &path_raw
 
 static char s_spotify_url[512] = "";
 static bool s_spotify_import_complete = false;
+static std::vector<std::string> s_spotify_unmatched;
 
 static void begin_spotify_import(AppState &state)
 {
@@ -72,6 +76,7 @@ static void begin_spotify_import(AppState &state)
     const std::string link = s_spotify_url;
     if (link.empty())
         return;
+    s_spotify_unmatched.clear();
     state.spotify_import_running = true;
     std::atomic_store(&state.spotify_import_result,
                       std::shared_ptr<const SpotifyImportResult>());
@@ -105,11 +110,106 @@ static void finish_spotify_import(AppState &state)
     wb_sync_playlist(unique, result->tracks);
     state.selected_playlist_index = (int)state.playlists.size() - 1;
     state.current_playlist_source = PlaylistSource::PLAYLIST;
-    ui_notify(UiNotifyType::Success, "Spotify playlist imported",
-              std::to_string(result->tracks.size()) + " tracks added as \"" + unique + "\".",
-              6.0f);
+    s_spotify_unmatched = result->unmatched;
+    std::string detail =
+        std::to_string(result->tracks.size()) + " of " +
+        std::to_string(result->total > 0 ? result->total : (int)result->tracks.size()) +
+        " tracks added as \"" + unique + "\".";
+    if (!result->unmatched.empty())
+        detail += "\n" + std::to_string(result->unmatched.size()) +
+                  " track(s) had no confident match and were left out.";
+    ui_notify(UiNotifyType::Success, "Spotify playlist imported", detail, 7.0f);
     std::atomic_store(&state.spotify_import_result,
                       std::shared_ptr<const SpotifyImportResult>());
+}
+
+static void finish_spotify_login(AppState &state, int rc)
+{
+    state.spotify_login_running = false;
+    if (rc == 0)
+    {
+        state.spotify_library_loaded = false;
+        state.spotify_open_import_requested = true;
+        ui_notify(UiNotifyType::Success, "Spotify connected",
+                  "Your playlists are ready to import.", 5.0f);
+    }
+    else
+    {
+        const std::string detail =
+            rc == 3 ? "No sign-in window could open (pywebview is "
+                      "not installed). Paste a playlist link instead."
+                    : "The Spotify window was closed before sign-in finished.";
+        ui_notify(UiNotifyType::Error, "Spotify sign-in failed", detail, 7.0f);
+    }
+    state.repaint_requested = true;
+}
+
+static void start_spotify_login(AppState &state)
+{
+    if (state.spotify_login_running.exchange(true))
+        return;
+    const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(script, ec))
+    {
+        state.spotify_login_running = false;
+        ui_notify(UiNotifyType::Error, "Sign-in helper missing",
+                  "The Spotify sign-in helper was not found next to the app "
+                  "files.", 8.0f);
+        return;
+    }
+    AppState *sp = &state;
+    const std::string result = p100_config_path("spotify-login-result.txt");
+    std::filesystem::remove(result, ec);
+
+#ifdef P100_WINDOWS
+    // Same detached spawn as the YouTube browser sign-in, but with the child's
+    // first window allowed to show: STARTF_USESHOWWINDOW/SW_HIDE made
+    // pywebview open the Spotify window invisible. The old `cmd /c "<python>"
+    // "<script>" --spotify` line also lost its quoting around paths with
+    // spaces, so the helper never started at all.
+    if (!winproc::spawn_argv_hidden({backend_python_path(), script, "--spotify",
+                                     "--result-file", result}, false))
+    {
+        state.spotify_login_running = false;
+        ui_notify(UiNotifyType::Error, "Could not start Spotify sign-in",
+                  "The sign-in helper could not be launched.", 7.0f);
+        return;
+    }
+    tasks::spawn("spotify-login", [sp, result]() {
+        int rc = -1;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::minutes(15);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            std::ifstream in(result);
+            if (in)
+            {
+                std::string text;
+                std::getline(in, text);
+                try
+                {
+                    rc = std::stoi(text);
+                }
+                catch (...)
+                {
+                    rc = -1;
+                }
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        std::error_code rm_ec;
+        std::filesystem::remove(result, rm_ec);
+        finish_spotify_login(*sp, rc);
+    });
+#else
+    tasks::spawn([sp, script]() {
+        const std::string cmd = "python3 \"" + script + "\" --spotify";
+        const int rc = std::system(cmd.c_str());
+        finish_spotify_login(*sp, rc);
+    });
+#endif
 }
 
 struct SpotifyProgress
@@ -448,6 +548,20 @@ void draw_playlists_panel(AppState &state)
         auto result = std::atomic_load(&state.spotify_import_result);
         if (result && !result->error.empty())
             ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "%s", result->error.c_str());
+        if (!state.spotify_import_running.load() && !s_spotify_unmatched.empty())
+        {
+            ImGui::Dummy(ImVec2(0.0f, m.space_2));
+            ImGui::TextColored(ui_c().text_muted,
+                               "%d track(s) could not be matched confidently:",
+                               (int)s_spotify_unmatched.size());
+            const size_t shown = std::min<size_t>(s_spotify_unmatched.size(), 6);
+            for (size_t i = 0; i < shown; ++i)
+                ImGui::TextColored(ui_c().text_muted, "- %s",
+                                   s_spotify_unmatched[i].c_str());
+            if (s_spotify_unmatched.size() > shown)
+                ImGui::TextColored(ui_c().text_muted, "...and %d more",
+                                   (int)(s_spotify_unmatched.size() - shown));
+        }
         if (!state.spotify_import_running.load() &&
             ui_primary_button("Import link", ImVec2(140.0f * m.layout_scale, m.control_h)))
             begin_spotify_import(state);
@@ -455,34 +569,7 @@ void draw_playlists_panel(AppState &state)
         if (!state.spotify_login_running.load() &&
             ui_ghost_button(spotify_connected ? "Reconnect Spotify" : "Sign in to Spotify",
                             ImVec2(176.0f * m.layout_scale, m.control_h)))
-        {
-            const std::string script = p100_share_dir() + "/scripts/crossfade-login-helper.py";
-            state.spotify_login_running = true;
-            AppState *sp = &state;
-            tasks::spawn([sp, script]() {
-#ifdef P100_WINDOWS
-                const std::string cmd = "\"" + backend_pythonw_path() + "\" \"" + script + "\" --spotify";
-                const int rc = winproc::system_hidden(cmd);
-#else
-                const std::string cmd = "python3 \"" + script + "\" --spotify";
-                const int rc = std::system(cmd.c_str());
-#endif
-                sp->spotify_login_running = false;
-                if (rc == 0)
-                {
-                    sp->spotify_library_loaded = false;
-                    sp->spotify_open_import_requested = true;
-                    ui_notify(UiNotifyType::Success, "Spotify connected",
-                              "Your playlists are ready to import.", 5.0f);
-                }
-                else
-                {
-                    ui_notify(UiNotifyType::Error, "Spotify sign-in failed",
-                              "The Spotify window was closed before it finished.", 6.0f);
-                }
-                sp->repaint_requested = true;
-            });
-        }
+            start_spotify_login(state);
         if (state.spotify_login_running.load())
             ImGui::TextColored(ui_c().text_muted, "Waiting for Spotify sign-in...");
         ImGui::EndPopup();

@@ -123,7 +123,7 @@ int system_hidden_capture(const std::string &command, std::string &output)
     return pclose_hidden(pipe);
 }
 
-bool spawn_argv_hidden(const std::vector<std::string> &args)
+bool spawn_argv_hidden(const std::vector<std::string> &args, bool hidden)
 {
     if (args.empty())
         return false;
@@ -137,7 +137,7 @@ bool spawn_argv_hidden(const std::vector<std::string> &args)
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    si.wShowWindow = SW_HIDE;
+    si.wShowWindow = hidden ? SW_HIDE : SW_SHOWNORMAL;
     si.hStdInput = nul_in;
     si.hStdOutput = nul_out;
     si.hStdError = nul_out;
