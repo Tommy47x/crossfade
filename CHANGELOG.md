@@ -2,6 +2,36 @@
 
 All notable changes to crossfade are documented here.
 
+## 0.6.3 - 2026-11-26
+
+### Spotify import
+
+- The importer no longer takes the first YouTube search hit. It searches the
+  title plus primary artist, scores candidates on title, artist and duration,
+  and rejects karaoke, covers, sped-up, live and other variants when the
+  Spotify title does not name them. Tracks below the confidence gate are
+  reported in the UI instead of silently importing the wrong song, and the
+  rejected candidates are written to `spotify_match_debug.json` for tuning.
+- The Windows Spotify sign-in helper is spawned detached with a result file
+  and can show its pywebview window, instead of being run through `cmd.exe`
+  with a hidden window.
+
+### Immersive lyrics
+
+- A no-lyrics track followed by another no-lyrics track now slides both
+  centred cover cards straight up and down. The staged left → up → in path is
+  reserved for a no-lyrics card followed by a track with lyrics. The incoming
+  track's cached lyrics state is checked at the switch, with a short fallback
+  when the payload arrives late.
+
+### Room correction
+
+- Corrections applied before the response curves were persisted now show the
+  summed EQ response of their applied bands instead of leaving the Room EQ
+  page blank. New calibrations store the measured, target and corrected
+  curves with the settings and with each saved room, so the full graph
+  survives restarts and saved-room switches.
+
 ## 0.6.2 - 2026-11-26
 
 ### Immersive lyrics
