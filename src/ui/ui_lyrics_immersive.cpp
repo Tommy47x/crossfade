@@ -240,6 +240,11 @@ struct ImmersiveAnim
     float prev_cover_x = -1.0f;
     bool prev_cover_card = false;
     bool switch_from_center = false;
+    bool switch_both_cards = false;
+    // The incoming track is known (from the lyrics cache) to have no lyrics.
+    // Used until the live payload confirms it, so the card does not briefly
+    // flash as a column while the cache is loaded.
+    bool switch_next_card = false;
     // Last drawn cover position/layout; captured when the song changes.
     float cover_x = -1.0f;
     bool cover_card = false;
@@ -902,14 +907,41 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                 g_imm.prev_display = g_imm.current_display;
                 g_imm.prev_cover_x = g_imm.cover_x;
                 g_imm.prev_cover_card = g_imm.cover_card;
-                // A centred card needs the staged left -> up -> in trip.
-                g_imm.switch_from_center = split && g_imm.prev_cover_card;
+
+                // If both tracks have no lyrics, both cards stay centred and
+                // simply slide past each other. Only a centred card followed
+                // by a lyrics track needs the staged left -> up -> in trip.
+                bool next_known = false;
+                bool next_has_lyrics = false;
+                if (!display.id.empty())
+                {
+                    Lyrics cached;
+                    if (load_lyrics_cache(display.id, cached))
+                    {
+                        next_known = true;
+                        next_has_lyrics = cached.ok && !cached.none &&
+                                          !cached.lines.empty();
+                    }
+                    else if (has_payload)
+                    {
+                        next_known = true;
+                        next_has_lyrics = snap->lyrics.ok && !snap->lyrics.none &&
+                                          !snap->lyrics.lines.empty();
+                    }
+                }
+                const bool next_card = split && next_known && !next_has_lyrics;
+                g_imm.switch_next_card = next_card;
+                g_imm.switch_both_cards =
+                    split && g_imm.prev_cover_card && next_card;
+                g_imm.switch_from_center =
+                    split && g_imm.prev_cover_card && !next_card;
                 g_imm.enter = 1.0f;
                 g_imm.switch_start = now;
-                // The incoming cover always arrives in the column first; a
-                // track without lyrics glides to the centre once it lands.
-                g_imm.cover_center = 0.0f;
-                g_imm.center_goal = 0.0f;
+                // The incoming cover normally arrives in the column first; a
+                // track without lyrics glides to the centre once it lands. A
+                // card-to-card change starts and stays centred.
+                g_imm.cover_center = g_imm.switch_both_cards ? 1.0f : 0.0f;
+                g_imm.center_goal = g_imm.cover_center;
             }
             else
             {
@@ -939,6 +971,19 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         if (!motion)
             g_imm.enter = 1.0f;
         const float view_a = ease_out(g_imm.enter) * exit_a;
+        // The lyrics payload can arrive a frame or two after the track id.
+        // If a just-started centred-card exit turns out to lead to another
+        // card, restart it as a centred conveyor before it has moved far.
+        if (g_imm.switch_from_center && no_lyrics_only &&
+            g_imm.switch_start > 0.0 && now - g_imm.switch_start < 0.12)
+        {
+            g_imm.switch_from_center = false;
+            g_imm.switch_both_cards = true;
+            g_imm.switch_next_card = true;
+            g_imm.cover_center = 1.0f;
+            g_imm.center_goal = 1.0f;
+            g_imm.switch_start = now;
+        }
         const double switch_age =
             g_imm.switch_start > 0.0 ? now - g_imm.switch_start : 1.0e9;
         double switch_total = kSwitchDur;
@@ -974,6 +1019,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const bool transitioning = switch_age < switch_total &&
                                    !g_imm.prev_display.id.empty();
 
+        // The cache hint is only needed until the real payload arrives. If the
+        // payload has lyrics, the incoming cover belongs in the column.
+        if (has_payload && !no_lyrics_only)
+            g_imm.switch_next_card = false;
+
         // Lyrics wait for the covers to finish their trip. Starting the line
         // fade during the slide painted text over the artwork.
         const bool lyric_intro = motion && switch_age >= 0.0 &&
@@ -983,7 +1033,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         // A track with no lyrics shows the centred cover card. Move there only
         // after the incoming cover has finished sliding up, so the hand-off
         // reads as "slide in, then settle in the middle".
-        const float center_target = (split && no_lyrics_only) ? 1.0f : 0.0f;
+        const float center_target =
+            (split && (no_lyrics_only || g_imm.switch_next_card)) ? 1.0f : 0.0f;
         if (!split)
         {
             g_imm.cover_center = 0.0f;
@@ -1280,10 +1331,11 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
         const float cover_x =
             split ? column_cx + (centre_cx - column_cx) * clampf(g_imm.cover_center, 0.0f, 1.0f)
                   : centre_cx;
-        const bool cover_card = no_lyrics_only || !split;
+        const bool cover_card = no_lyrics_only || g_imm.switch_next_card || !split;
         const bool cover_visible =
             !display.id.empty() &&
-            (split || no_lyrics_only || !has_payload || !snap->lyrics.ok);
+            (split || no_lyrics_only || g_imm.switch_next_card || !has_payload ||
+             !snap->lyrics.ok);
         auto draw_cover_at = [&](const Track &t, bool card, float cx, float alpha,
                                  float y_shift) {
             if (card)
