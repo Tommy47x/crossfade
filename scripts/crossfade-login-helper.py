@@ -9,7 +9,7 @@ Modes:
   --import-cookies NAME   import an existing browser session (explicit only)
   --import-firefox        alias for --import-cookies firefox
   --google                alias for --signin auto
-  --spotify               Spotify sp_dc sign-in (WebKitGTK)
+  --spotify               Spotify sp_dc sign-in (WebKitGTK / WebView2)
 
 Engines run in-process when the current interpreter has them, otherwise the
 helper re-execs itself with a system Python that does. Cookie extraction and
@@ -663,7 +663,7 @@ def _cookie_map(cookies):
     return mapping
 
 
-def run_webview2(out_path):
+def run_webview2(out_path, site="google"):
     if sys.platform != "win32":
         return EXIT_NO_ENGINE, "WebView2 is only available on Windows"
     try:
@@ -674,10 +674,14 @@ def run_webview2(out_path):
     if window_cls is None or not hasattr(window_cls, "get_cookies"):
         return EXIT_NO_ENGINE, "The installed pywebview cannot read cookies"
 
+    spotify = site == "spotify"
+    start = SPOTIFY_START if spotify else START_URL
+    required = "sp_dc" if spotify else "__Secure-3PAPISID"
+    target = os.path.join(login.config_dir(), "spotify.json") if spotify else out_path
+    title = "Sign in to Spotify" if spotify else "Sign in to crossfade"
     state = {"ok": False, "closed": False, "error": "",
              "read_error": "", "seen": ""}
-    window = webview.create_window("Sign in to crossfade", START_URL,
-                                   width=580, height=860)
+    window = webview.create_window(title, start, width=580, height=860)
 
     def on_closed():
         state["closed"] = True
@@ -710,9 +714,13 @@ def run_webview2(out_path):
                     state["seen"] = names
                     log(f"WebView2 cookies seen: {names}")
                 last_seen = time.time()
-            if mapping.get("__Secure-3PAPISID"):
+            if mapping.get(required):
                 try:
-                    _write_cookies(out_path, mapping)
+                    if spotify:
+                        _write_cookies(target, {"sp_dc": mapping["sp_dc"]},
+                                       filter_auth=False)
+                    else:
+                        _write_cookies(target, mapping)
                     state["ok"] = True
                 except Exception as e:
                     state["error"] = str(e)
@@ -729,18 +737,24 @@ def run_webview2(out_path):
 
     try:
         webview.start(worker, window, gui="edgechromium", private_mode=False,
-                      storage_path=os.path.join(login.config_dir(), "login-webview2"))
+                      storage_path=os.path.join(
+                          login.config_dir(),
+                          "login-spotify" if spotify else "login-webview2"))
     except Exception as e:
         return EXIT_NO_ENGINE, f"WebView2 could not start: {e}"
 
     if state["ok"]:
-        return EXIT_OK, "WebView2 sign-in completed"
+        return EXIT_OK, ("Spotify sign-in completed" if spotify
+                         else "WebView2 sign-in completed")
     if state["closed"]:
         return EXIT_CANCELLED, "Sign-in window closed"
     if state["error"]:
         return EXIT_REJECTED, state["error"]
     if state["read_error"]:
         return EXIT_REJECTED, f"WebView2 cookies could not be read: {state['read_error']}"
+    if spotify:
+        return EXIT_REJECTED, ("No Spotify sign-in cookie appeared. Spotify may "
+                               "have blocked the embedded browser.")
     return EXIT_REJECTED, ("No Google sign-in cookie appeared. Google may have "
                            "blocked the embedded browser.")
 
@@ -894,7 +908,12 @@ def _dispatch(args):
     if args.import_firefox:
         return cmd_import_cookies("firefox")
     if args.spotify:
-        rc, detail = run_webkit(None, site="spotify")
+        # WebKitGTK is Linux-only; Windows signs in through the WebView2
+        # wrapper (pywebview) that the Google flow already uses.
+        if sys.platform == "win32":
+            rc, detail = run_webview2(None, site="spotify")
+        else:
+            rc, detail = run_webkit(None, site="spotify")
         log(detail)
         return rc
     if args.signin:

@@ -3183,6 +3183,13 @@ SpotifyImportResult fetch_spotify_import(const std::string &link)
     out.name = json_get_string(response, "name");
     out.skipped = json_get_int(response, "skipped");
     out.total = json_get_int(response, "total");
+    for_each_json_object(response, "unmatched", [&](const std::string &obj) {
+        const std::string title = json_get_string(obj, "title");
+        const std::string artist = json_get_string(obj, "artist");
+        if (title.empty())
+            return;
+        out.unmatched.push_back(artist.empty() ? title : title + " - " + artist);
+    });
     size_t key = response.find("\"tracks\":");
     if (key != std::string::npos)
         out.tracks = parse_track_array(response.substr(key));

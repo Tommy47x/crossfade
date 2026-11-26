@@ -7,6 +7,7 @@ cannot work in one backend and silently fail in the other.
 
 import array
 import base64
+import difflib
 import glob
 import json
 import math
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import html as _html
@@ -1052,6 +1054,23 @@ def _spotify_progress(phase, done, total, name):
         pass
 
 
+def _spotify_match_debug(name, total, rejects):
+    """Write the rejected candidates so strictness can be tuned against real
+    playlists. Values are only track metadata, never account data."""
+    path = os.path.join(_config_dir(), "spotify_match_debug.json")
+    payload = {"name": name, "total": int(total),
+               "unmatched": int(len(rejects)),
+               "rejected": rejects[:100]}
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(_config_dir(), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _spotify_get(url, headers=None, timeout=30):
     req = urllib.request.Request(url, headers=headers or {})
     return urllib.request.urlopen(req, timeout=timeout).read()
@@ -1336,6 +1355,140 @@ def _spotify_entity(link):
     raise RuntimeError(f"Could not read the Spotify playlist: {last or 'no track data'}")
 
 
+# ---------------------------------------------------------------------------
+# Spotify -> YouTube Music matching
+#
+# Taking the first search hit imported karaoke tracks, covers, sped-up edits
+# and unrelated songs by the same artist. A candidate now has to agree with
+# Spotify on the title *and* the artist; the duration breaks ties and rejects
+# live/extended versions. Anything below the confidence gate is reported back
+# as "unmatched" instead of being added to the playlist.
+# ---------------------------------------------------------------------------
+
+_MATCH_NOISE = ("karaoke", "instrumental", "cover", "sped up", "speed up",
+                "slowed", "nightcore", "8d", "reverb", "ringtone", "mashup",
+                "tribute", "in the style of", "made famous")
+_MATCH_VARIANTS = ("remix", "live", "acoustic", "demo", "extended", "edit",
+                   "reprise", "orchestral", "piano", "8 bit")
+
+
+def _match_text(value):
+    """Case/diacritic/punctuation-insensitive form used for comparisons."""
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.casefold().replace("&", " and ")
+    text = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
+    text = re.sub(r"\b(feat|featuring|ft|with)\b.*$", " ", text)
+    text = re.sub(r"[^0-9a-z]+", " ", text)
+    return " ".join(text.split())
+
+
+def _match_artists(value):
+    """Split "A, B & C" into normalised artist names ("A - Topic" stripped)."""
+    parts = re.split(r"\s*(?:,|&|/| feat\.? | featuring | with | x )\s*", value or "")
+    names = []
+    for part in parts:
+        name = _match_text(part)
+        if name.endswith(" topic"):
+            name = name[: -len(" topic")]
+        name = re.sub(r"^the ", "", name)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _match_title_ratio(source, candidate):
+    if not source or not candidate:
+        return 0.0
+    if source == candidate:
+        return 1.0
+    ratio = difflib.SequenceMatcher(None, source, candidate).ratio()
+    short, long_ = (source, candidate) if len(source) <= len(candidate) else (candidate, source)
+    # "Song" vs "Song remastered 2011": containment keeps a strong score.
+    if short in long_ and len(short) >= 0.6 * len(long_):
+        ratio = max(ratio, 0.9)
+    return ratio
+
+
+def _match_artist_agreement(source, candidate):
+    best = 0.0
+    for want in _match_artists(source):
+        want_tokens = want.split()
+        for got in _match_artists(candidate):
+            if want == got:
+                return 1.0
+            got_tokens = got.split()
+            if not want_tokens or not got_tokens:
+                continue
+            common = len(set(want_tokens) & set(got_tokens))
+            overlap = common / max(len(want_tokens), len(got_tokens))
+            if overlap >= 0.999:
+                best = max(best, 1.0)
+            elif overlap >= 0.5 or \
+                    difflib.SequenceMatcher(None, want, got).ratio() >= 0.88:
+                best = max(best, 0.7)
+    return best
+
+
+def _match_loose(value):
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^0-9a-z]+", " ", text.casefold())
+    return " " + " ".join(text.split()) + " "
+
+
+def _match_variant_factor(source_title, candidate_title):
+    """1.0 when both titles name the same version, 0.0 for a different cut.
+
+    A karaoke/cover upload, or a live/remix/acoustic take the Spotify title
+    does not name, is a different recording: adding it is worse than skipping
+    the track.
+    """
+    source = _match_loose(source_title)
+    candidate = _match_loose(candidate_title)
+    for phrase in _MATCH_NOISE + _MATCH_VARIANTS:
+        if " %s " % phrase in candidate and " %s " % phrase not in source:
+            return 0.0
+    return 1.0
+
+
+def _match_duration_factor(source_sec, candidate_sec):
+    """None when either side has no duration; 0.0 when clearly another cut."""
+    if not source_sec or not candidate_sec:
+        return None
+    diff = abs(int(source_sec) - int(candidate_sec))
+    if diff <= 5:
+        return 1.0
+    if diff <= 12:
+        return 0.8
+    if diff <= max(20, int(source_sec) * 0.04):
+        return 0.4
+    return 0.0
+
+
+def _spotify_match_score(item, candidate):
+    """Confidence that a YouTube Music search hit is the Spotify track."""
+    factor = _match_variant_factor(item.get("title"), candidate.get("title"))
+    if factor <= 0.0:
+        return 0.0
+    duration = _match_duration_factor(item.get("duration_sec"),
+                                      candidate.get("duration_sec"))
+    if duration == 0.0:
+        return 0.0
+    title = _match_title_ratio(_match_text(item.get("title")),
+                               _match_text(candidate.get("title")))
+    artist = _match_artist_agreement(item.get("subtitle"), candidate.get("artist"))
+    # Both signals must agree: the right title on someone else's track (a
+    # cover, a re-upload, a different artist with the same song name) is
+    # exactly what used to end up in the playlist.
+    if title < 0.78 or artist < 0.7:
+        return 0.0
+    score = (0.60 * title + 0.40 * artist) * factor
+    if duration is not None:
+        score *= 0.85 + 0.15 * duration
+    return score
+
+
 def import_spotify(yt, link):
     _spotify_progress("loading", 0, 0, "")
     try:
@@ -1353,47 +1506,78 @@ def import_spotify(yt, link):
         # Last-resort public embed reader (100 tracks, no sign-in needed).
         try:
             name, embed_items = _spotify_entity(link)
-            parsed = [{"title": (x.get("title") or "").strip(),
-                       "subtitle": (x.get("subtitle") or "").strip(),
-                       "duration_sec": 0, "thumbnail_url": ""}
-                      for x in embed_items if (x.get("title") or "").strip()]
+            parsed = []
+            for x in embed_items:
+                title = (x.get("title") or "").strip()
+                if not title:
+                    continue
+                try:
+                    duration = int(x.get("duration") or 0) // 1000
+                except (TypeError, ValueError):
+                    duration = 0
+                parsed.append({"title": title,
+                               "subtitle": (x.get("subtitle") or "").strip(),
+                               "duration_sec": duration, "thumbnail_url": ""})
         except Exception:
             return _err(str(e))
 
     total = len(parsed)
     if not total:
         return _err("That Spotify playlist has no playable songs")
-    if len(parsed) < len(items):
-        _spotify_progress("matching", 0, total, name)
-    else:
-        _spotify_progress("matching", 0, total, name)
+    _spotify_progress("matching", 0, total, name)
 
     def match(item):
-        query = f"{item['title']} {item['subtitle']}".strip()
+        artists = _match_artists(item.get("subtitle"))
+        query = " ".join((item.get("title") or "").split())
+        if artists:
+            query = (query + " " + artists[0]).strip()
         try:
-            found = search_tracks(yt, query, limit=3)
+            found = search_tracks(yt, query, limit=8)
         except Exception:
-            return None
+            return None, []
         if isinstance(found, dict) and "error" in found:
-            return None
-        return found[0] if found else None
+            return None, []
+        scored = [(_spotify_match_score(item, candidate), candidate)
+                  for candidate in (found or [])]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        best = scored[0][1] if scored and scored[0][0] > 0.0 else None
+        return best, scored[:3]
 
     tracks = [None] * total
+    rejects = []
     done = 0
     workers = 4 if total >= 8 else 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for index, found in enumerate(pool.map(match, parsed)):
+        for index, (found, candidates) in enumerate(pool.map(match, parsed)):
             tracks[index] = found
+            if not found:
+                item = parsed[index]
+                rejects.append({
+                    "title": item.get("title") or "",
+                    "artist": item.get("subtitle") or "",
+                    "duration_sec": item.get("duration_sec") or 0,
+                    "candidates": [
+                        {"title": c.get("title") or "",
+                         "artist": c.get("artist") or "",
+                         "duration_sec": c.get("duration_sec") or 0,
+                         "score": round(score, 3)}
+                        for score, c in candidates],
+                })
             done += 1
             if done % 5 == 0 or done == total:
                 _spotify_progress("matching", done, total, name)
 
     matched = [t for t in tracks if t]
+    unmatched = [{"title": item.get("title") or "",
+                  "artist": item.get("subtitle") or ""}
+                 for item, track in zip(parsed, tracks) if not track]
     _spotify_progress("done", total, total, name)
+    if rejects:
+        _spotify_match_debug(name, total, rejects)
     if not matched:
         return _err("No Spotify tracks could be matched on YouTube Music")
     return {"name": name, "tracks": matched, "skipped": total - len(matched),
-            "total": total}
+            "total": total, "unmatched": unmatched}
 
 def get_episodes_later(yt):
     try:
