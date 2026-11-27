@@ -114,10 +114,11 @@ float am_envelope(float u, float phase, float seed)
 // Carrier riding inside that envelope. Two close harmonics keep the signal
 // crisp like an AM waveform, but the slower one dominates so it still reads as
 // a smooth curve rather than a jagged analyser trace.
-float am_carrier(float u, float phase, float seed, float layer)
+float am_carrier(float u, float phase, float seed, float layer,
+                 float freq_scale = 1.0f)
 {
     const float p = phase + seed * 1.4f + layer * 0.73f;
-    const float scale = 1.0f + 0.12f * layer;
+    const float scale = (1.0f + 0.12f * layer) * freq_scale;
     const float c1 =
         std::sin(u * 6.4f * scale * 6.2831853f + p * 1.35f);
     const float c2 =
@@ -349,6 +350,7 @@ struct ImmersiveAnim
     // this instead of an absolute level, so they do not look inert next to a
     // much louder, drum-heavy song.
     double energy_inst_ref = 0.18;
+    float energy_held_density = 0.0f;
     float energy_held_beat = 0.0f;
     float energy_held_pluck = 0.0f;
 };
@@ -1155,6 +1157,7 @@ struct EnergyLoader
     float mid = 0.0f;
     float treble = 0.0f;
     float instrument = 0.0f;
+    float density = 0.0f;
     float beat = 0.0f;
     float pluck = 0.0f;
 };
@@ -1173,6 +1176,7 @@ EnergyLoader prepare_energy_loader(const AppState &state, MpvPlayer &player,
                                    float &energy_held_treble,
                                    float &energy_held_instrument,
                                    double &energy_inst_ref,
+                                   float &energy_held_density,
                                    float &energy_held_beat,
                                    float &energy_held_pluck, double now,
                                    bool motion)
@@ -1234,6 +1238,11 @@ EnergyLoader prepare_energy_loader(const AppState &state, MpvPlayer &player,
         energy_held_instrument +=
             (norm_instrument - energy_held_instrument) *
             clampf((float)dt * 7.0f, 0.0f, 1.0f);
+        const float raw_density =
+            au.active ? clampf(au.density, 0.0f, 1.0f) : 0.0f;
+        energy_held_density +=
+            (raw_density - energy_held_density) *
+            clampf((float)dt * 8.0f, 0.0f, 1.0f);
         energy_held_beat = au.active ? clampf(au.beat, 0.0f, 1.0f) : 0.0f;
         energy_held_pluck = au.active ? clampf(au.pluck, 0.0f, 1.0f) : 0.0f;
         // Overall loudness stays only a modest input. Without this, a loud
@@ -1254,6 +1263,7 @@ EnergyLoader prepare_energy_loader(const AppState &state, MpvPlayer &player,
     out.mid = energy_held_mid;
     out.treble = energy_held_treble;
     out.instrument = energy_held_instrument;
+    out.density = energy_held_density;
     out.beat = energy_held_beat;
     out.pluck = energy_held_pluck;
     out.phase = (float)std::fmod(energy_phase, 100000.0);
@@ -1408,7 +1418,15 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
     const float instrument = loader.instrument;
     const float beat = loader.beat;
     const float pluck = loader.pluck;
+    const float density = loader.density;
     const float phase = loader.phase;
+    // Height comes from stable absolute loudness/density, not the per-track
+    // normalised instrument level. That normaliser rises during a loader and
+    // would otherwise make the waves shrink as the axis grows. Spectrum keeps
+    // its own bar math.
+    const float wave_level =
+        clampf(std::max(energy * 1.6f, density * 1.15f), 0.0f, 1.0f);
+    const float gate = smooth_unit((wave_level - 0.03f) / 0.22f);
 
     // Frosted-glass rail. It belongs to the live loader only: once the gap
     // finishes, the container must vanish instead of lingering over the next
@@ -1542,23 +1560,44 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
         {
             // Waves AM variant: a slim accent-tinted carrier rides the shared
             // amplitude envelope, with two quieter carrier layers behind it.
-            // It reads like the AM signal rather than a generic sine ribbon.
-            const int samples = 128;
+            // Loudness opens the waveform and waveform density sets how many
+            // low-to-high points it draws; near silence collapses to a still
+            // line instead of carrying on with a fixed decorative sine.
+            const int samples = 192;
             ImVec2 spine[samples + 1];
             float thick[samples + 1];
             ImVec2 points[samples + 1];
             const float low = clampf(bass * 1.8f, 0.0f, 1.0f);
             const float middle = clampf(mid * 1.8f, 0.0f, 1.0f);
             const float high = clampf(treble * 1.8f, 0.0f, 1.0f);
-            const float guitar = clampf(instrument * 1.7f, 0.0f, 1.0f);
-            const float kick = 0.13f * beat;
-            const float strum = 0.22f * pluck;
+            const float detail =
+                clampf(0.42f * wave_level + 0.58f * density, 0.0f, 1.0f);
+            // The carrier is drawn in a local 0..1 coordinate behind the
+            // front dot, which stretches a fixed number of peaks as the bar
+            // grows. Drive the peak count from the actual filled pixel width
+            // instead, so a longer axis literally has more waves. Audio only
+            // adds a modest density/bass multiplier on top of that width.
+            const float filled_px = span * p;
+            const float base_cycles = clampf(
+                filled_px / std::max(1.0f, ui_px(34.0f)), 3.0f, 32.0f);
+            const float audio_cycles =
+                0.85f + 0.25f * detail + 0.30f * low + 0.25f * beat;
+            const float carrier_scale =
+                std::min(4.0f, base_cycles * audio_cycles / 6.4f);
+            // Bring back a gentle bass-driven bounce: enough to feel alive,
+            // far below the old kick/pluck spikes that made the line jump.
+            const float wave_phase = phase * 0.30f;
+            const float bounce = 0.10f * low + 0.12f * beat;
             const float amps[kWaveLayers] = {
-                half * (0.24f + 0.48f * low + 0.34f * guitar + kick),
-                half * (0.18f + 0.28f * middle + 0.50f * guitar + strum),
-                half * (0.14f + 0.24f * high + 0.44f * guitar + strum),
-                half * (0.10f + 0.24f * middle + 0.16f * high + strum),
-                half * (0.06f + 0.20f * high + 0.24f * pluck)};
+                half * gate * (0.40f + 0.10f * low + 0.38f * wave_level + bounce),
+                half * gate * (0.28f + 0.20f * middle + 0.36f * wave_level +
+                               0.85f * bounce),
+                half * gate * (0.22f + 0.16f * high + 0.34f * wave_level +
+                               0.70f * bounce),
+                half * gate * (0.16f + 0.24f * middle + 0.14f * high +
+                               0.55f * bounce),
+                half * gate * (0.10f + 0.20f * high + 0.16f * density +
+                               0.40f * bounce)};
 
             // The front dot is the pen that draws the ribbon. Work in a
             // coordinate measured back from that dot so the AM shape stays
@@ -1566,7 +1605,8 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
             const float front_span = std::max(0.001f, p);
             const float front_pad = std::max(0.02f, p * 0.18f);
             const float front_carrier =
-                am_carrier(0.0f, phase, loader.seed, 0.0f);
+                am_carrier(0.0f, wave_phase, loader.seed, 0.0f,
+                           carrier_scale);
 
             int count = 0;
             for (int s = 0; s <= samples; ++s)
@@ -1579,18 +1619,20 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
                 const float left_fade =
                     smooth_unit(u / std::max(0.001f, p * 0.10f));
                 const float breathe =
-                    0.88f + 0.12f * std::sin(phase * 0.43f + local * 1.6f +
-                                             loader.seed);
+                    0.90f + 0.10f * std::sin(wave_phase * 0.70f +
+                                             local * 1.6f + loader.seed);
                 const float envelope = anchor * left_fade * breathe;
                 // Subtracting the carrier at the front pins the line to the
                 // circle's centre; the surrounding samples still move on Y.
                 const float wave =
-                    am_carrier(local, phase, loader.seed, 0.0f) - front_carrier;
+                    am_carrier(local, wave_phase, loader.seed, 0.0f,
+                               carrier_scale) -
+                    front_carrier;
                 spine[count] = ImVec2(x0 + span * u,
                                       rail_y + wave * amps[0] * envelope);
                 thick[count] =
-                    half * (0.11f + 0.08f * low + 0.06f * guitar +
-                            0.06f * pluck + 0.04f * beat) *
+                    half * gate *
+                    (0.10f + 0.05f * low + 0.06f * wave_level) *
                     envelope;
                 ++count;
             }
@@ -1606,8 +1648,9 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
                     ImVec2(spine[k].x, spine[k].y + thick[k]),
                     ImVec2(spine[k - 1].x, spine[k - 1].y + thick[k - 1]),
                     ui_with_alpha(ui_accent_text_u32(),
-                                  (0.10f + 0.09f * front + 0.05f * guitar +
-                                   0.06f * pluck + 0.04f * beat) * view_a),
+                                  (0.10f + 0.09f * front +
+                                   0.07f * wave_level) *
+                                      view_a),
                     ui_accent_u32((0.008f + 0.018f * energy) * view_a));
             }
 
@@ -1630,15 +1673,16 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
             if (count >= 2)
                 dl->AddPolyline(spine, count,
                                 ui_with_alpha(ui_accent_text_u32(),
-                                              (0.24f + 0.10f * guitar +
-                                               0.10f * pluck + 0.10f * beat) *
+                                              (0.12f + 0.12f * gate +
+                                               0.10f * wave_level) *
                                                   view_a),
                                 ui_px(1.8f));
 
             for (int layer = 1; layer < kWaveLayers; ++layer)
             {
                 const float layer_front =
-                    am_carrier(0.0f, phase, loader.seed, (float)layer);
+                    am_carrier(0.0f, wave_phase, loader.seed, (float)layer,
+                               carrier_scale);
                 int n = 0;
                 for (int s = 0; s <= samples; ++s)
                 {
@@ -1650,10 +1694,12 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
                     const float left_fade =
                         smooth_unit(u / std::max(0.001f, p * 0.10f));
                     const float breathe =
-                        0.88f + 0.12f * std::sin(phase * 0.43f + local * 1.6f +
-                                                 loader.seed + (float)layer);
+                        0.90f + 0.10f * std::sin(wave_phase * 0.70f +
+                                                 local * 1.6f + loader.seed +
+                                                 (float)layer);
                     const float wave =
-                        am_carrier(local, phase, loader.seed, (float)layer) -
+                        am_carrier(local, wave_phase, loader.seed, (float)layer,
+                                   carrier_scale) -
                         layer_front;
                     points[n++] =
                         ImVec2(x0 + span * u,
@@ -1662,17 +1708,17 @@ void draw_energy_ribbon(ImDrawList *dl, const EnergyLoader &loader,
                 }
                 if (n >= 2)
                     dl->AddPolyline(points, n,
-                                    ui_accent_u32((0.13f - 0.02f * (float)layer +
-                                                   0.06f * guitar +
-                                                   0.08f * pluck +
-                                                   0.08f * beat) * view_a),
+                                    ui_accent_u32((0.06f + 0.06f * gate -
+                                                   0.015f * (float)layer +
+                                                   0.07f * wave_level) *
+                                      view_a),
                                     ui_px(1.3f));
             }
         }
 
         soft_glow(dl, ImVec2(fx, rail_y), half * 1.25f, accent,
-                  (0.055f + 0.045f * energy + 0.045f * instrument +
-                   0.055f * pluck + 0.055f * beat) * view_a, 4, 24);
+                  (0.035f + 0.055f * gate + 0.035f * instrument +
+                   0.045f * pluck + 0.045f * beat) * view_a, 4, 24);
         dl->AddLine(ImVec2(fx, rail_y - half * 0.88f),
                     ImVec2(fx, rail_y + half * 0.88f),
                     ui_with_alpha(ui_accent_text_u32(),
@@ -1855,6 +1901,7 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
             g_imm.energy_held_treble = 0.0f;
             g_imm.energy_held_instrument = 0.0f;
             g_imm.energy_inst_ref = 0.18;
+            g_imm.energy_held_density = 0.0f;
             g_imm.energy_held_beat = 0.0f;
             g_imm.energy_held_pluck = 0.0f;
             if (had_track)
@@ -2586,8 +2633,8 @@ void draw_lyrics_immersive(AppState &state, MpvPlayer &player)
                     g_imm.energy_held_rms,
                     g_imm.energy_held_bass, g_imm.energy_held_mid,
                     g_imm.energy_held_treble, g_imm.energy_held_instrument,
-                    g_imm.energy_inst_ref, g_imm.energy_held_beat,
-                    g_imm.energy_held_pluck,
+                    g_imm.energy_inst_ref, g_imm.energy_held_density,
+                    g_imm.energy_held_beat, g_imm.energy_held_pluck,
                     now, motion);
 
                 // Style 2 turns the whole intro/gap effect off: no rail, no
